@@ -16,7 +16,7 @@ jobs:
           - os: macos-latest
             arch: arm64
             artifact: codeclaw-darwin-arm64
-          - os: macos-13
+          - os: macos-15
             arch: x86_64
             artifact: codeclaw-darwin-x86_64
           - os: ubuntu-latest
