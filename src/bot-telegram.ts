@@ -382,37 +382,56 @@ export class TelegramBot extends Bot {
     if (!this.token) throw new Error('Missing token. Set CODECLAW_TOKEN or TELEGRAM_BOT_TOKEN');
   }
 
-  private static readonly MENU_COMMANDS = [
-    { command: 'sessions', description: 'List / switch sessions' },
-    { command: 'agents', description: 'List / switch agents' },
-    { command: 'models', description: 'List / switch models' },
-    { command: 'status', description: 'Bot status' },
-    { command: 'host', description: 'Host machine info' },
-    { command: 'switch', description: 'Switch working directory' },
-    { command: 'restart', description: 'Restart with latest version' },
-  ];
+  private static buildMenuCommands(agentCount: number) {
+    const commands = [
+      { command: 'sessions', description: 'List / switch sessions' },
+    ];
+
+    // Only show agents in normal position if there are multiple agents
+    if (agentCount > 1) {
+      commands.push({ command: 'agents', description: 'List / switch agents' });
+    }
+
+    commands.push(
+      { command: 'switch', description: 'Switch working directory' },
+      { command: 'models', description: 'List / switch models' },
+      { command: 'status', description: 'Bot status' },
+      { command: 'host', description: 'Host machine info' },
+    );
+
+    // If only one agent, put agents at the bottom
+    if (agentCount === 1) {
+      commands.push({ command: 'agents', description: 'List / switch agents' });
+    }
+
+    commands.push({ command: 'restart', description: 'Restart with latest version' });
+
+    return commands;
+  }
 
   /** Register bot menu commands. Called automatically after connect. */
   async setupMenu() {
-    await this.channel.setMenu(TelegramBot.MENU_COMMANDS);
+    const res = this.fetchAgents();
+    const installedCount = res.agents.filter(a => a.installed).length;
+    const commands = TelegramBot.buildMenuCommands(installedCount);
+    await this.channel.setMenu(commands);
   }
 
   // ---- commands -------------------------------------------------------------
 
   private async cmdStart(ctx: TgContext) {
     const cs = this.chat(ctx.chatId);
-    await ctx.reply(
-      `<b>codeclaw</b> v${VERSION}\n\n` +
-      `/sessions \u2014 List / switch sessions\n` +
-      `/agents \u2014 List / switch agents\n` +
-      `/models \u2014 List / switch models\n` +
-      `/status \u2014 Bot status\n` +
-      `/host \u2014 Host machine info\n` +
-      `/switch \u2014 Switch working directory\n` +
-      `/restart \u2014 Restart with latest version\n` +
-      `\n<b>Agent:</b> ${escapeHtml(cs.agent)}  <b>Workdir:</b> <code>${escapeHtml(this.workdir)}</code>`,
-      { parseMode: 'HTML' },
-    );
+    const res = this.fetchAgents();
+    const installedCount = res.agents.filter(a => a.installed).length;
+    const commands = TelegramBot.buildMenuCommands(installedCount);
+
+    const lines = [`<b>codeclaw</b> v${VERSION}\n`];
+    for (const cmd of commands) {
+      lines.push(`/${cmd.command} \u2014 ${cmd.description}`);
+    }
+    lines.push(`\n<b>Agent:</b> ${escapeHtml(cs.agent)}  <b>Workdir:</b> <code>${escapeHtml(this.workdir)}</code>`);
+
+    await ctx.reply(lines.join('\n'), { parseMode: 'HTML' });
   }
 
   private sessionsPageSize = 5;
