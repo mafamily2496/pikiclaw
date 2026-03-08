@@ -13,7 +13,7 @@ export interface StreamOpts {
   sessionId: string | null;
   model: string | null;
   thinkingEffort: string;
-  onText: (text: string, thinking: string) => void;
+  onText: (text: string, thinking: string, activity?: string) => void;
   /** Local file paths to attach (images, documents, etc.) */
   attachments?: string[];
   // codex
@@ -61,9 +61,12 @@ function agentLog(msg: string) {
 }
 
 function computeContext(s: { inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; cacheCreationInputTokens: number | null; contextWindow: number | null }) {
-  const total = (s.inputTokens ?? 0) + (s.cachedInputTokens ?? 0) + (s.cacheCreationInputTokens ?? 0) + (s.outputTokens ?? 0);
+  // Context used = all input tokens (new + cached + cache-creation). Output tokens are separate.
+  const total = (s.inputTokens ?? 0) + (s.cachedInputTokens ?? 0) + (s.cacheCreationInputTokens ?? 0);
   const used = total > 0 ? total : null;
-  const pct = used != null && s.contextWindow ? Math.round(used / s.contextWindow * 1000) / 10 : null;
+  const pct = used != null && s.contextWindow
+    ? Math.min(99.9, Math.round(used / s.contextWindow * 1000) / 10)
+    : null;
   return { contextUsedTokens: used, contextPercent: pct };
 }
 
@@ -307,6 +310,51 @@ function mapEffort(effort: string): string {
   return EFFORT_MAP[effort] ?? effort;
 }
 
+function compactLogLine(text: string, max = 120): string {
+  const line = text.replace(/\s+/g, ' ').trim();
+  if (!line) return '';
+  if (line.length <= max) return line;
+  return `${line.slice(0, max - 3)}...`;
+}
+
+function pushRecentActivity(lines: string[], line: string, maxLines = 6) {
+  const cleaned = compactLogLine(line, 140);
+  if (!cleaned) return;
+  if (lines[lines.length - 1] === cleaned) return;
+  lines.push(cleaned);
+  if (lines.length > maxLines) lines.splice(0, lines.length - maxLines);
+}
+
+function buildCodexActivityPreview(s: {
+  recentActivity: string[];
+  commentaryByItem: Map<string, string>;
+  activeCommands: Map<string, string>;
+}): string {
+  const lines = [...s.recentActivity];
+  for (const text of s.commentaryByItem.values()) {
+    const cleaned = compactLogLine(text, 140);
+    if (cleaned) lines.push(cleaned);
+  }
+  for (const cmd of s.activeCommands.values()) {
+    lines.push(`$ ${compactLogLine(cmd, 120)}`);
+  }
+  return lines.slice(-6).join('\n');
+}
+
+export function buildCodexTurnInput(prompt: string, attachments: string[]): any[] {
+  const input: any[] = [];
+  for (const filePath of attachments) {
+    const ext = path.extname(filePath).toLowerCase();
+    if (IMAGE_EXTS.has(ext)) {
+      // Local images should use the dedicated app-server variant so Codex can
+      // serialize them into an API-ready data URL.
+      input.push({ type: 'localImage', path: filePath });
+    }
+  }
+  input.push({ type: 'text', text: prompt });
+  return input;
+}
+
 // --- codex: stream via app-server ---
 
 export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
@@ -337,7 +385,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
   // Accumulator state
   const s = {
     sessionId: opts.sessionId as string | null,
-    text: '', thinking: '', msgs: [] as string[], thinkParts: [] as string[],
+    text: '', thinking: '', activity: '', msgs: [] as string[], thinkParts: [] as string[],
     model: opts.model as string | null,
     thinkingEffort: opts.thinkingEffort,
     inputTokens: null as number | null,
@@ -348,6 +396,10 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     turnId: null as string | null,
     turnStatus: null as string | null,
     turnError: null as string | null,
+    messagePhases: new Map<string, string>(),
+    commentaryByItem: new Map<string, string>(),
+    activeCommands: new Map<string, string>(),
+    recentActivity: [] as string[],
   };
 
   // Step 1: thread/start or thread/resume
@@ -390,14 +442,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
   agentLog(`[codex-rpc] thread ready: id=${s.sessionId} model=${s.model}`);
 
   // Step 2: turn/start — send the prompt
-  const input: any[] = [];
-  if (opts.attachments?.length) {
-    for (const f of opts.attachments) {
-      // app-server accepts file:// URLs for images
-      input.push({ type: 'image', url: `file://${f}` });
-    }
-  }
-  input.push({ type: 'text', text: opts.prompt });
+  const input = buildCodexTurnInput(opts.prompt, opts.attachments || []);
 
   const turnDone = new Promise<void>((resolve) => {
     const deadline = start + opts.timeout * 1000;
@@ -411,29 +456,78 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
 
     srv.onNotification((method, params) => {
       if (Date.now() > deadline) return;
+      const emit = () => {
+        s.activity = buildCodexActivityPreview(s);
+        opts.onText(s.text, s.thinking, s.activity);
+      };
+
+      if (method === 'item/started' && params.threadId === s.sessionId) {
+        const item = params.item || {};
+        if (item.type === 'agentMessage' && item.id) {
+          const phase = item.phase || 'final_answer';
+          s.messagePhases.set(item.id, phase);
+          if (phase !== 'final_answer') {
+            s.commentaryByItem.set(item.id, item.text || '');
+            emit();
+          }
+        }
+        if (item.type === 'commandExecution' && item.id && item.command) {
+          s.activeCommands.set(item.id, item.command);
+          emit();
+        }
+      }
 
       // Streaming text deltas
       if (method === 'item/agentMessage/delta' && params.threadId === s.sessionId) {
-        s.text += params.delta || '';
-        opts.onText(s.text, s.thinking);
+        const delta = params.delta || '';
+        const phase = params.itemId ? (s.messagePhases.get(params.itemId) || 'final_answer') : 'final_answer';
+        if (phase === 'final_answer') {
+          s.text += delta;
+        } else if (params.itemId) {
+          const prev = s.commentaryByItem.get(params.itemId) || '';
+          s.commentaryByItem.set(params.itemId, prev + delta);
+        }
+        emit();
       }
 
       // Reasoning deltas
       if ((method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') && params.threadId === s.sessionId) {
         s.thinking += params.delta || '';
-        opts.onText(s.text, s.thinking);
+        emit();
       }
 
       // Item completed — collect full agent messages and reasoning
       if (method === 'item/completed' && params.threadId === s.sessionId) {
         const item = params.item || {};
-        if (item.type === 'agentMessage' && item.text?.trim()) {
-          s.msgs.push(item.text.trim());
+        if (item.type === 'agentMessage' && item.id) {
+          const phase = item.phase || s.messagePhases.get(item.id) || 'final_answer';
+          if (phase === 'final_answer') {
+            if (item.text?.trim()) s.msgs.push(item.text.trim());
+          } else {
+            const commentary = item.text?.trim() || s.commentaryByItem.get(item.id)?.trim() || '';
+            if (commentary) pushRecentActivity(s.recentActivity, commentary);
+            s.commentaryByItem.delete(item.id);
+            emit();
+          }
+          s.messagePhases.delete(item.id);
         }
         if (item.type === 'reasoning') {
           const parts = [...(item.summary || []), ...(item.content || [])];
           const text = parts.join('\n').trim();
-          if (text) s.thinkParts.push(text);
+          if (text) {
+            s.thinkParts.push(text);
+            emit();
+          }
+        }
+        if (item.type === 'commandExecution' && item.id) {
+          const cmd = item.command || s.activeCommands.get(item.id) || '';
+          s.activeCommands.delete(item.id);
+          if (cmd) {
+            const exitCode = typeof item.exitCode === 'number' ? item.exitCode : null;
+            const prefix = exitCode != null && exitCode !== 0 ? `Command failed (${exitCode}): ` : 'Ran: ';
+            pushRecentActivity(s.recentActivity, `${prefix}${cmd}`);
+          }
+          emit();
         }
       }
 
@@ -597,6 +691,14 @@ function claudeParse(ev: any, s: any) {
 
   if (t === 'stream_event') {
     const inner = ev.event || {};
+    // message_start: new API call (may follow auto-compact) — reset all token counters
+    if (inner.type === 'message_start') {
+      const u = inner.message?.usage;
+      s.inputTokens = u?.input_tokens ?? null;
+      s.cachedInputTokens = u?.cache_read_input_tokens ?? null;
+      s.cacheCreationInputTokens = u?.cache_creation_input_tokens ?? null;
+      s.outputTokens = null; // output comes later in message_delta
+    }
     if (inner.type === 'content_block_delta') {
       const d = inner.delta || {};
       if (d.type === 'thinking_delta') s.thinking += d.thinking || '';
@@ -606,7 +708,12 @@ function claudeParse(ev: any, s: any) {
       const d = inner.delta || {};
       s.stopReason = d.stop_reason ?? s.stopReason;
       const u = inner.usage;
-      if (u) { s.inputTokens = u.input_tokens ?? s.inputTokens; s.cachedInputTokens = u.cache_read_input_tokens ?? s.cachedInputTokens; s.cacheCreationInputTokens = u.cache_creation_input_tokens ?? s.cacheCreationInputTokens; s.outputTokens = u.output_tokens ?? s.outputTokens; }
+      if (u) {
+        if (u.input_tokens != null) s.inputTokens = u.input_tokens;
+        if (u.cache_read_input_tokens != null) s.cachedInputTokens = u.cache_read_input_tokens;
+        if (u.cache_creation_input_tokens != null) s.cacheCreationInputTokens = u.cache_creation_input_tokens;
+        if (u.output_tokens != null) s.outputTokens = u.output_tokens;
+      }
     }
     s.sessionId = ev.session_id ?? s.sessionId;
     s.model = ev.model ?? s.model;
@@ -628,7 +735,13 @@ function claudeParse(ev: any, s: any) {
     if (ev.result && !s.text.trim()) s.text = ev.result;
     s.stopReason = ev.stop_reason ?? s.stopReason;
     const u = ev.usage;
-    if (u) { s.inputTokens = u.input_tokens ?? s.inputTokens; s.cachedInputTokens = (u.cache_read_input_tokens ?? u.cached_input_tokens) ?? s.cachedInputTokens; s.cacheCreationInputTokens = u.cache_creation_input_tokens ?? s.cacheCreationInputTokens; s.outputTokens = u.output_tokens ?? s.outputTokens; }
+    if (u) {
+      // result event is authoritative — use direct assignment so post-compact values replace stale ones
+      s.inputTokens = u.input_tokens ?? s.inputTokens;
+      s.cachedInputTokens = (u.cache_read_input_tokens ?? u.cached_input_tokens) ?? s.cachedInputTokens;
+      s.cacheCreationInputTokens = u.cache_creation_input_tokens ?? s.cacheCreationInputTokens;
+      s.outputTokens = u.output_tokens ?? s.outputTokens;
+    }
     // Extract contextWindow from modelUsage (Claude CLI reports this in result event)
     const mu = ev.modelUsage;
     if (mu && typeof mu === 'object') {
@@ -879,7 +992,7 @@ function stripInjectedPrompts(text: string): string {
   return text;
 }
 
-function readTailLines(filePath: string, maxBytes = 64 * 1024): string[] {
+function readTailLines(filePath: string, maxBytes = 256 * 1024): string[] {
   try {
     const stat = fs.statSync(filePath);
     const size = stat.size;
@@ -1023,6 +1136,91 @@ export function listAgents(): AgentListResult {
       detectAgent('codex', 'codex'),
     ],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Skill listing — project-defined custom skills (.claude/commands/ & .claude/skills/)
+// ---------------------------------------------------------------------------
+
+export interface SkillInfo {
+  /** Skill name (directory name or filename without extension) */
+  name: string;
+  /** Short human-facing label for menus (from front-matter `label`, or first # heading) */
+  label: string | null;
+  /** Full description from front-matter (AI-facing, may be long) */
+  description: string | null;
+  /** 'commands' or 'skills' — where it was found */
+  source: 'commands' | 'skills';
+}
+
+export interface SkillListResult {
+  skills: SkillInfo[];
+  workdir: string;
+}
+
+/** Parse front-matter fields and first heading from a markdown skill file. */
+function parseSkillMeta(content: string): { label: string | null; description: string | null } {
+  let label: string | null = null;
+  let description: string | null = null;
+
+  // Parse YAML front-matter
+  const fm = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (fm) {
+    const lm = fm[1].match(/^label:\s*(.+)/m);
+    if (lm) label = lm[1].trim();
+    const dm = fm[1].match(/^description:\s*(.+)/m);
+    if (dm) description = dm[1].trim();
+  }
+
+  // Fallback: use first # heading as label
+  if (!label) {
+    const hm = content.match(/^#\s+(.+)$/m);
+    if (hm) label = hm[1].trim();
+  }
+
+  return { label, description };
+}
+
+/**
+ * List project-defined custom skills from the workdir's .claude/ directory.
+ * Scans both `.claude/commands/` (single .md files) and `.claude/skills/` (dirs with SKILL.md).
+ */
+export function listSkills(workdir: string): SkillListResult {
+  const skills: SkillInfo[] = [];
+  const claudeDir = path.join(workdir, '.claude');
+
+  // .claude/commands/*.md — each markdown file is a command
+  const commandsDir = path.join(claudeDir, 'commands');
+  try {
+    for (const entry of fs.readdirSync(commandsDir)) {
+      if (!entry.endsWith('.md')) continue;
+      const name = entry.replace(/\.md$/, '');
+      let meta = { label: null as string | null, description: null as string | null };
+      try {
+        meta = parseSkillMeta(fs.readFileSync(path.join(commandsDir, entry), 'utf-8'));
+      } catch {}
+      skills.push({ name, label: meta.label, description: meta.description, source: 'commands' });
+    }
+  } catch {}
+
+  // .claude/skills/<name>/SKILL.md — each subdirectory with a SKILL.md
+  const skillsDir = path.join(claudeDir, 'skills');
+  try {
+    for (const entry of fs.readdirSync(skillsDir)) {
+      const skillFile = path.join(skillsDir, entry, 'SKILL.md');
+      try {
+        const stat = fs.statSync(path.join(skillsDir, entry));
+        if (!stat.isDirectory()) continue;
+      } catch { continue; }
+      let meta = { label: null as string | null, description: null as string | null };
+      try {
+        meta = parseSkillMeta(fs.readFileSync(skillFile, 'utf-8'));
+      } catch {}
+      skills.push({ name: entry, label: meta.label, description: meta.description, source: 'skills' });
+    }
+  } catch {}
+
+  return { skills, workdir };
 }
 
 // ---------------------------------------------------------------------------

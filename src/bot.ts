@@ -9,13 +9,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import {
-  doStream, getSessions, getSessionTail, getUsage, listAgents, listModels,
+  doStream, getSessions, getSessionTail, getUsage, listAgents, listModels, listSkills,
   type Agent, type StreamOpts, type StreamResult, type SessionInfo, type UsageResult,
   type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult,
+  type SkillInfo, type SkillListResult,
 } from './code-agent.js';
 
-export { type Agent, type StreamResult, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult };
-export const VERSION = '0.2.12';
+export { type Agent, type StreamResult, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
+export const VERSION = '0.2.13';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -189,6 +190,10 @@ export class Bot {
 
   fetchAgents() {
     return listAgents();
+  }
+
+  fetchSkills() {
+    return listSkills(this.workdir);
   }
 
   fetchModels(agent: Agent) {

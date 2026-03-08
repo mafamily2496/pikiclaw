@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import {
   Bot, VERSION, type Agent, type StreamResult,
   fmtTokens, fmtUptime, fmtBytes, whichSync, listSubdirs, buildPrompt,
-  thinkLabel, parseAllowedChatIds, shellSplit,
+  thinkLabel, parseAllowedChatIds, shellSplit, type SkillInfo,
 } from './bot.js';
 import { getCodexUsageLive, shutdownCodexServer } from './code-agent.js';
 import { TelegramChannel, type TgContext, type TgCallbackContext, type TgMessage } from './channel-telegram.js';
@@ -95,15 +95,6 @@ function fmtSeg(t: string): string {
   t = t.replace(/~~(.+?)~~/g, '<s>$1</s>');
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
   return t;
-}
-
-function detectQuickReplies(text: string): string[] {
-  const last = text.trim().split('\n').slice(-15).join('\n');
-  if (/\?\s*$/.test(last) && /(?:should I|do you want|shall I|would you like|proceed|continue\?)/i.test(last))
-    return ['Yes', 'No'];
-  const numbered = [...last.matchAll(/^\s*(\d+)[.)]\s+(.{3,60})$/gm)];
-  if (numbered.length >= 2 && numbered.length <= 6) return numbered.map(m => `${m[1]}. ${m[2].trim().slice(0, 30)}`);
-  return [];
 }
 
 function isNpxBinary(bin: string): boolean {
@@ -234,6 +225,61 @@ export function buildArtifactSystemPrompt(artifactDir: string, manifestPath: str
 export function buildArtifactPrompt(prompt: string, artifactDir: string, manifestPath: string): string {
   const base = prompt.trim() || 'Please help with this request.';
   return base + '\n\n' + buildArtifactSystemPrompt(artifactDir, manifestPath);
+}
+
+function stripInjectedPrompts(text: string): string {
+  const markers = ['\n[Telegram Artifact Return]', '\n[Artifact Return]'];
+  for (const marker of markers) {
+    const idx = text.indexOf(marker);
+    if (idx >= 0) return text.slice(0, idx).trim();
+  }
+  return text.trim();
+}
+
+function summarizePromptForStatus(prompt: string, maxLen = 50): string {
+  const clean = stripInjectedPrompts(prompt).replace(/\s+/g, ' ').trim();
+  if (!clean) return '';
+  if (clean.length <= maxLen) return clean;
+  return clean.slice(0, Math.max(0, maxLen - 3)).trimEnd() + '...';
+}
+
+function summarizeActivityForPreview(activity: string, maxLines = 6): string {
+  const narrative: string[] = [];
+  const failures: string[] = [];
+  let activeCommands = 0;
+  let completedCommands = 0;
+
+  for (const rawLine of activity.split('\n')) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    if (line.startsWith('$ ')) {
+      activeCommands++;
+      continue;
+    }
+    if (line.startsWith('Ran: ')) {
+      completedCommands++;
+      continue;
+    }
+    const failed = line.match(/^Command failed \((\d+)\):/);
+    if (failed) {
+      failures.push(`Command failed (${failed[1]})`);
+      continue;
+    }
+    narrative.push(line);
+  }
+
+  const lines = [
+    ...narrative,
+    ...failures,
+  ];
+
+  if (activeCommands > 0) {
+    lines.push(activeCommands === 1 ? 'Running 1 command...' : `Running ${activeCommands} commands...`);
+  } else if (!narrative.length && !failures.length && completedCommands > 0) {
+    lines.push(completedCommands === 1 ? 'Executed 1 command.' : `Executed ${completedCommands} commands.`);
+  }
+
+  return lines.slice(-maxLines).join('\n');
 }
 
 function humanizeUsageStatus(status: string | null | undefined): string {
@@ -381,7 +427,6 @@ function buildDirKeyboard(browsePath: string, page: number) {
 export class TelegramBot extends Bot {
   private token: string;
   private channel!: TelegramChannel;
-  private replyCache = new Map<number, { chatId: number; quickReplies: string[] }>();
 
   constructor() {
     super();
@@ -393,7 +438,10 @@ export class TelegramBot extends Bot {
     if (!this.token) throw new Error('Missing token. Set CODECLAW_TOKEN or TELEGRAM_BOT_TOKEN');
   }
 
-  private static buildMenuCommands(agentCount: number) {
+  /** Skill command prefix used in Telegram bot commands. */
+  private static readonly SKILL_CMD_PREFIX = 'sk_';
+
+  private static buildMenuCommands(agentCount: number, skills: SkillInfo[] = []) {
     const commands = [
       { command: 'sessions', description: 'List / switch sessions' },
     ];
@@ -415,6 +463,16 @@ export class TelegramBot extends Bot {
       commands.push({ command: 'agents', description: 'List / switch agents' });
     }
 
+    // Inject project-defined skills as sk_<name> commands
+    for (const sk of skills) {
+      // Telegram commands: 1-32 chars, lowercase letters/digits/underscore only
+      const cmdName = `${TelegramBot.SKILL_CMD_PREFIX}${sk.name.toLowerCase().replace(/[^a-z0-9_]/g, '_')}`;
+      if (cmdName.length > 32) continue; // skip if too long for Telegram
+      // Use short human-facing label; fall back to capitalized skill name
+      const displayName = sk.label || sk.name.charAt(0).toUpperCase() + sk.name.slice(1);
+      commands.push({ command: cmdName, description: `⚡ ${displayName}` });
+    }
+
     commands.push({ command: 'restart', description: 'Restart with latest version' });
 
     return commands;
@@ -424,8 +482,10 @@ export class TelegramBot extends Bot {
   async setupMenu() {
     const res = this.fetchAgents();
     const installedCount = res.agents.filter(a => a.installed).length;
-    const commands = TelegramBot.buildMenuCommands(installedCount);
+    const skillRes = this.fetchSkills();
+    const commands = TelegramBot.buildMenuCommands(installedCount, skillRes.skills);
     await this.channel.setMenu(commands);
+    this.log(`menu: ${commands.length} commands (${skillRes.skills.length} skills)`);
   }
 
   // ---- commands -------------------------------------------------------------
@@ -434,11 +494,12 @@ export class TelegramBot extends Bot {
     const cs = this.chat(ctx.chatId);
     const res = this.fetchAgents();
     const installedCount = res.agents.filter(a => a.installed).length;
-    const commands = TelegramBot.buildMenuCommands(installedCount);
+    const skillRes = this.fetchSkills();
+    const commands = TelegramBot.buildMenuCommands(installedCount, skillRes.skills);
 
     const lines = [`<b>codeclaw</b> v${VERSION}\n`];
     for (const cmd of commands) {
-      lines.push(`/${cmd.command} \u2014 ${cmd.description}`);
+      lines.push(`/${cmd.command} \u2014 ${escapeHtml(cmd.description)}`);
     }
     lines.push(`\n<b>Agent:</b> ${escapeHtml(cs.agent)}  <b>Workdir:</b> <code>${escapeHtml(this.workdir)}</code>`);
 
@@ -509,7 +570,7 @@ export class TelegramBot extends Bot {
       `<b>Session:</b> ${d.sessionId ? `<code>${d.sessionId.slice(0, 16)}</code>` : '(new)'}`,
     ];
     if (d.running) {
-      lines.push(`<b>Running:</b> ${fmtUptime(Date.now() - d.running.startedAt)} - ${escapeHtml(d.running.prompt.slice(0, 50))}`);
+      lines.push(`<b>Running:</b> ${fmtUptime(Date.now() - d.running.startedAt)} - ${escapeHtml(summarizePromptForStatus(d.running.prompt))}`);
     }
     lines.push(...formatProviderUsageLines(usage), '', '<b>Bot Usage</b>', `  Turns: ${d.stats.totalTurns}`);
     if (d.stats.totalInputTokens || d.stats.totalOutputTokens) {
@@ -661,22 +722,34 @@ export class TelegramBot extends Bot {
     if (!phId) { this.log(`[handleMessage] placeholder null for chat=${ctx.chatId}`); return; }
     this.log(`[handleMessage] placeholder sent msg_id=${phId}, starting agent stream...`);
 
-    this.activeTasks.set(ctx.chatId, { prompt, startedAt: Date.now() });
+    this.activeTasks.set(ctx.chatId, { prompt: basePrompt, startedAt: Date.now() });
 
     try {
       const start = Date.now();
-      let lastEdit = 0, editCount = 0, editPending = false;
+      const streamEditIntervalMs = cs.agent === 'codex' ? 400 : 800;
+      let lastEdit = 0, editCount = 0;
+      let latestText = '', latestThinking = '', latestActivity = '';
+      let lastPreview = '';
+      let flushTimer: ReturnType<typeof setTimeout> | null = null;
+      let previewVersion = 0;
+      let editChain: Promise<void> = Promise.resolve();
 
-      const onText = (text: string, thinking: string) => {
-        const now = Date.now();
-        if ((now - lastEdit) < 1000 || editPending) return;
-        const display = text.trim(), thinkDisplay = thinking.trim();
-        if (!display && !thinkDisplay) return;
+      const renderPreview = (text: string, thinking: string, activity: string) => {
+        const display = text.trim();
+        const thinkDisplay = thinking.trim();
+        const activityDisplay = summarizeActivityForPreview(activity);
+        if (!display && !thinkDisplay && !activityDisplay) return '';
 
-        const elapsed = ((now - start) / 1000).toFixed(0);
-        const maxBody = 3200;
+        const elapsed = ((Date.now() - start) / 1000).toFixed(0);
+        const maxBody = 2400;
+        const maxActivity = 900;
         const parts: string[] = [];
         const tLabel = thinkLabel(cs.agent);
+
+        if (activityDisplay) {
+          const preview = activityDisplay.length > maxActivity ? '...\n' + activityDisplay.slice(-maxActivity) : activityDisplay;
+          parts.push(`Activity\n${preview}`);
+        }
 
         if (thinkDisplay && !display) {
           const preview = thinkDisplay.length > maxBody ? '...\n' + thinkDisplay.slice(-maxBody) : thinkDisplay;
@@ -689,16 +762,65 @@ export class TelegramBot extends Bot {
 
         const dots = '\u00b7'.repeat((editCount % 3) + 1);
         parts.push(`${cs.agent} | ${elapsed}s ${dots}`);
+        return parts.join('\n\n');
+      };
 
-        editPending = true;
-        this.channel.editMessage(ctx.chatId, phId, parts.join('\n\n'))
-          .catch(e => this.log(`stream edit err: ${e}`))
-          .finally(() => { editPending = false; });
-        lastEdit = now;
+      const queuePreviewEdit = (force = false) => {
+        const preview = renderPreview(latestText, latestThinking, latestActivity);
+        if (!preview) return;
+        if (!force && preview === lastPreview) return;
+        lastPreview = preview;
+        const version = ++previewVersion;
         editCount++;
+        lastEdit = Date.now();
+        editChain = editChain
+          .catch(() => {})
+          .then(async () => {
+            if (version !== previewVersion) return;
+            try {
+              await this.channel.editMessage(ctx.chatId, phId, preview);
+            } catch (e: any) {
+              this.log(`stream edit err: ${e?.message || e}`);
+            }
+          });
+      };
+
+      const schedulePreviewEdit = () => {
+        const wait = streamEditIntervalMs - (Date.now() - lastEdit);
+        if (wait <= 0) {
+          if (flushTimer) {
+            clearTimeout(flushTimer);
+            flushTimer = null;
+          }
+          queuePreviewEdit();
+          return;
+        }
+        if (flushTimer) return;
+        flushTimer = setTimeout(() => {
+          flushTimer = null;
+          queuePreviewEdit();
+        }, wait);
+      };
+
+      const flushPreviewEdits = async () => {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        queuePreviewEdit(true);
+        await editChain.catch(() => {});
+      };
+
+      const onText = (text: string, thinking: string, activity = '') => {
+        latestText = text;
+        latestThinking = thinking;
+        latestActivity = activity;
+        if (!text.trim() && !thinking.trim() && !activity.trim()) return;
+        schedulePreviewEdit();
       };
 
       const result = await this.runStream(prompt, cs, msg.files, onText, needsPromptFallback ? undefined : artifactSystemPrompt);
+      await flushPreviewEdits();
       const artifacts = this.collectArtifacts(artifactTurn.dir, artifactTurn.manifestPath);
 
       this.log(
@@ -788,25 +910,6 @@ export class TelegramBot extends Bot {
       tokenBlock = `\n<blockquote expandable>${tp.join('  ')}</blockquote>`;
     }
 
-    const quickReplies = result.incomplete ? [] : detectQuickReplies(result.message);
-    let keyboard: any = undefined;
-    if (quickReplies.length) {
-      const rows: { text: string; callback_data: string }[][] = [];
-      let row: { text: string; callback_data: string }[] = [];
-      for (let i = 0; i < quickReplies.length; i++) {
-        let cbData = `qr:${phId}:${i}`;
-        if (cbData.length > 64) cbData = cbData.slice(0, 64);
-        row.push({ text: quickReplies[i].slice(0, 32), callback_data: cbData });
-        if (row.length >= 3) { rows.push(row); row = []; }
-      }
-      if (row.length) rows.push(row);
-      keyboard = { inline_keyboard: rows };
-      this.replyCache.set(phId, { chatId: ctx.chatId, quickReplies });
-      if (this.replyCache.size > 100) {
-        for (const k of [...this.replyCache.keys()].slice(0, this.replyCache.size - 100)) this.replyCache.delete(k);
-      }
-    }
-
     let thinkingHtml = '';
     if (result.thinking) {
       const label = thinkLabel(agent);
@@ -833,9 +936,9 @@ export class TelegramBot extends Bot {
 
     if (fullHtml.length <= 3900) {
       try {
-        await this.channel.editMessage(ctx.chatId, phId, fullHtml, { parseMode: 'HTML', keyboard });
+        await this.channel.editMessage(ctx.chatId, phId, fullHtml, { parseMode: 'HTML' });
       } catch {
-        finalMsgId = await this.channel.send(ctx.chatId, fullHtml, { parseMode: 'HTML', replyTo: ctx.messageId, keyboard });
+        finalMsgId = await this.channel.send(ctx.chatId, fullHtml, { parseMode: 'HTML', replyTo: ctx.messageId });
       }
     } else {
       // Send full content as split plain-text messages instead of a file.
@@ -857,9 +960,9 @@ export class TelegramBot extends Bot {
       }
       const firstHtml = `${headerHtml}${firstBody}${footerHtml}`;
       try {
-        await this.channel.editMessage(ctx.chatId, phId, firstHtml, { parseMode: 'HTML', keyboard });
+        await this.channel.editMessage(ctx.chatId, phId, firstHtml, { parseMode: 'HTML' });
       } catch {
-        finalMsgId = await this.channel.send(ctx.chatId, firstHtml, { parseMode: 'HTML', replyTo: ctx.messageId, keyboard });
+        finalMsgId = await this.channel.send(ctx.chatId, firstHtml, { parseMode: 'HTML', replyTo: ctx.messageId });
       }
 
       // Send remaining body as continuation messages (split at ~3800 chars)
@@ -930,15 +1033,31 @@ export class TelegramBot extends Bot {
           { parseMode: 'HTML' },
         );
 
-        // Send the last turn as a separate message (auto-splits if too long)
+        // Send the last full turn as a separate message (auto-splits if too long)
         try {
-          const tail = await this.fetchSessionTail(cs.agent, sessionId, 10);
+          const tail = await this.fetchSessionTail(cs.agent, sessionId, 50);
           if (tail.ok && tail.messages.length) {
-            const lastUser = [...tail.messages].reverse().find(m => m.role === 'user');
-            const lastAssistant = [...tail.messages].reverse().find(m => m.role === 'assistant');
+            // Find the last user message index, then collect ALL assistant messages after it
+            const msgs = tail.messages;
+            let lastUserIdx = -1;
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].role === 'user') { lastUserIdx = i; break; }
+            }
             const parts: string[] = [];
-            if (lastUser) parts.push(`<b>You:</b>\n${escapeHtml(lastUser.text)}`);
-            if (lastAssistant) parts.push(`<b>${escapeHtml(cs.agent)}:</b>\n${escapeHtml(lastAssistant.text)}`);
+            if (lastUserIdx >= 0) {
+              parts.push(`<b>You:</b>\n${escapeHtml(msgs[lastUserIdx].text)}`);
+            }
+            // Gather all assistant messages after the last user message
+            const startIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : 0;
+            const assistantTexts: string[] = [];
+            for (let i = startIdx; i < msgs.length; i++) {
+              if (msgs[i].role === 'assistant' && msgs[i].text) {
+                assistantTexts.push(msgs[i].text);
+              }
+            }
+            if (assistantTexts.length) {
+              parts.push(`<b>${escapeHtml(cs.agent)}:</b>\n${escapeHtml(assistantTexts.join('\n\n'))}`);
+            }
             if (parts.length) {
               await ctx.reply(parts.join('\n\n'), { parseMode: 'HTML' });
             }
@@ -985,20 +1104,6 @@ export class TelegramBot extends Bot {
       return;
     }
 
-    if (data.startsWith('qr:')) {
-      const parts = data.split(':');
-      if (parts.length === 3) {
-        const cacheId = parseInt(parts[1], 10);
-        const idx = parseInt(parts[2], 10);
-        const entry = this.replyCache.get(cacheId);
-        const replyText = entry?.quickReplies?.[idx] ?? `Option ${idx + 1}`;
-        await ctx.answerCallback(`Sending: ${replyText.slice(0, 40)}`);
-        const fakeMsg: TgMessage = { text: replyText, files: [] };
-        await this.handleMessage(fakeMsg, ctx);
-      }
-      return;
-    }
-
     await ctx.answerCallback();
   }
 
@@ -1016,12 +1121,36 @@ export class TelegramBot extends Bot {
         case 'switch':   await this.cmdSwitch(ctx); return;
         case 'restart':  await this.cmdRestart(ctx); return;
         default:
+          // Intercept skill commands (sk_<name>) and route to agent
+          if (cmd.startsWith(TelegramBot.SKILL_CMD_PREFIX)) {
+            await this.cmdSkill(cmd, args, ctx);
+            return;
+          }
           await this.handleMessage({ text: `/${cmd}${args ? ' ' + args : ''}`, files: [] }, ctx);
       }
     } catch (e: any) {
       this.log(`cmd error: ${e}`);
       await ctx.reply(`Error: ${String(e).slice(0, 200)}`);
     }
+  }
+
+  /** Execute a project-defined skill by routing it to the current agent. */
+  private async cmdSkill(cmd: string, args: string, ctx: TgContext) {
+    const skillName = cmd.slice(TelegramBot.SKILL_CMD_PREFIX.length);
+    const cs = this.chat(ctx.chatId);
+    const extra = args.trim() ? ` ${args.trim()}` : '';
+
+    this.log(`skill: ${skillName} agent=${cs.agent}${extra ? ` args="${extra.trim()}"` : ''}`);
+
+    let prompt: string;
+    if (cs.agent === 'claude') {
+      prompt = `Please execute the /${skillName} skill defined in this project.${extra ? ` Additional context: ${extra.trim()}` : ''}`;
+    } else {
+      // codex — no native skill system, describe semantically
+      prompt = `In this project's .claude/skills/${skillName}/ directory (or .claude/commands/${skillName}.md), there is a custom skill definition. Please read and execute the instructions defined in that skill file.${extra ? ` Additional context: ${extra.trim()}` : ''}`;
+    }
+
+    await this.handleMessage({ text: prompt, files: [] }, ctx);
   }
 
   // ---- lifecycle ------------------------------------------------------------

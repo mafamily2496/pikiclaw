@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { TelegramBot } from '../src/bot-telegram.ts';
+import { TelegramBot, buildArtifactPrompt } from '../src/bot-telegram.ts';
 import type { TgContext } from '../src/channel-telegram.ts';
 
 function createBot() {
@@ -67,7 +67,7 @@ beforeEach(() => {
 });
 
 describe('TelegramBot.sendFinalReply', () => {
-  it('shows incomplete status and suppresses quick replies on agent error', async () => {
+  it('shows incomplete status without attaching reply buttons on agent error', async () => {
     const { bot, ctx, edits } = createBot();
 
     await (bot as any).sendFinalReply(ctx, 99, 'claude', {
@@ -116,7 +116,7 @@ describe('TelegramBot.sendFinalReply', () => {
     expect(edits[0].text).toContain('Output limit reached. Response may be truncated.');
   });
 
-  it('keeps quick replies for complete responses', async () => {
+  it('does not attach reply buttons for complete responses', async () => {
     const { bot, ctx, edits } = createBot();
 
     await (bot as any).sendFinalReply(ctx, 101, 'claude', {
@@ -136,7 +136,139 @@ describe('TelegramBot.sendFinalReply', () => {
     });
 
     expect(edits).toHaveLength(1);
-    expect(edits[0].opts?.keyboard?.inline_keyboard).toHaveLength(1);
+    expect(edits[0].opts?.keyboard).toBeUndefined();
+  });
+});
+
+describe('TelegramBot.cmdStatus', () => {
+  it('does not expose artifact system prompt in the running preview', async () => {
+    const { bot, ctx } = createBot();
+    const replies: Array<{ text: string; opts?: any }> = [];
+    ctx.reply = vi.fn(async (text: string, opts?: any) => {
+      replies.push({ text, opts });
+      return 1;
+    });
+
+    bot.activeTasks.set(ctx.chatId, {
+      prompt: buildArtifactPrompt('进度怎么样\n第二行', '/tmp/codeclaw-artifacts/turn-1', '/tmp/codeclaw-artifacts/turn-1/manifest.json'),
+      startedAt: Date.now() - 65_000,
+    });
+
+    await (bot as any).cmdStatus(ctx);
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0].text).toContain('<b>Running:</b>');
+    expect(replies[0].text).toContain('进度怎么样 第二行');
+    expect(replies[0].text).not.toContain('[Telegram Artifact Return]');
+    expect(replies[0].text).not.toContain('manifest.json');
+  });
+});
+
+describe('TelegramBot.handleMessage streaming', () => {
+  it('keeps codex commentary while hiding raw command details in the streaming preview', async () => {
+    const { bot, ctx, edits } = createBot();
+    bot.chat(ctx.chatId).agent = 'codex';
+
+    vi.spyOn(bot, 'runStream').mockImplementation(async (_prompt: string, _cs: any, _files: string[], onText: any) => {
+      onText('', '', '改动已经落下去了，现在跑相关单测确认结果\nRan: /bin/zsh -lc npm run build\nRan: /bin/zsh -lc npm test -- test/bot-telegram.unit.test.ts\n单测和 tsc 都过了，现在我再看一眼 diff');
+      return {
+        ok: true,
+        message: 'codeclaw',
+        thinking: null,
+        sessionId: 'sess-stream-1',
+        model: 'gpt-5.4',
+        thinkingEffort: 'high',
+        elapsedS: 1.2,
+        inputTokens: 9,
+        outputTokens: 3,
+        cachedInputTokens: null,
+        error: null,
+        stopReason: null,
+        incomplete: false,
+      };
+    });
+
+    await (bot as any).handleMessage({ text: 'Inspect this repo', files: [] }, ctx);
+
+    const preview = edits.find(e => !e.opts?.parseMode)?.text || '';
+    expect(preview).toContain('Activity');
+    expect(preview).toContain('改动已经落下去了，现在跑相关单测确认结果');
+    expect(preview).toContain('单测和 tsc 都过了，现在我再看一眼 diff');
+    expect(preview).not.toContain('Ran:');
+    expect(preview).not.toContain('npm run build');
+    expect(preview).not.toContain('npm test');
+    expect(edits[edits.length - 1].text).toContain('codeclaw');
+  });
+
+  it('shows an abstract command summary when codex activity only contains commands', async () => {
+    const { bot, ctx, edits } = createBot();
+    bot.chat(ctx.chatId).agent = 'codex';
+
+    vi.spyOn(bot, 'runStream').mockImplementation(async (_prompt: string, _cs: any, _files: string[], onText: any) => {
+      onText('', '', 'Ran: /bin/zsh -lc npm run build\nRan: /bin/zsh -lc npm test');
+      return {
+        ok: true,
+        message: 'done',
+        thinking: null,
+        sessionId: 'sess-stream-1b',
+        model: 'gpt-5.4',
+        thinkingEffort: 'high',
+        elapsedS: 1.2,
+        inputTokens: 9,
+        outputTokens: 3,
+        cachedInputTokens: null,
+        error: null,
+        stopReason: null,
+        incomplete: false,
+      };
+    });
+
+    await (bot as any).handleMessage({ text: 'Inspect this repo', files: [] }, ctx);
+
+    const preview = edits.find(e => !e.opts?.parseMode)?.text || '';
+    expect(preview).toContain('Activity');
+    expect(preview).toContain('Executed 2 commands.');
+    expect(preview).not.toContain('Ran:');
+    expect(preview).not.toContain('npm run build');
+    expect(preview).not.toContain('npm test');
+  });
+
+  it('waits for pending preview edits before sending the final reply', async () => {
+    const { bot, ctx, channel, edits } = createBot();
+    let previewCalls = 0;
+    channel.editMessage = vi.fn(async (_chatId: number, _msgId: number, text: string, opts?: any) => {
+      if (!opts?.parseMode) {
+        previewCalls++;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      edits.push({ text, opts });
+    });
+
+    vi.spyOn(bot, 'runStream').mockImplementation(async (_prompt: string, _cs: any, _files: string[], onText: any) => {
+      onText('Partial answer', '', 'Running...');
+      return {
+        ok: true,
+        message: 'Final answer.',
+        thinking: null,
+        sessionId: 'sess-stream-2',
+        model: 'claude-opus-4-6',
+        thinkingEffort: 'high',
+        elapsedS: 0.6,
+        inputTokens: 4,
+        outputTokens: 7,
+        cachedInputTokens: null,
+        error: null,
+        stopReason: null,
+        incomplete: false,
+      };
+    });
+
+    await (bot as any).handleMessage({ text: 'Say final answer', files: [] }, ctx);
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(previewCalls).toBeGreaterThan(0);
+    expect(edits[edits.length - 1].text).toContain('Final answer.');
+    expect(edits[edits.length - 1].opts?.parseMode).toBe('HTML');
   });
 });
 
@@ -145,8 +277,9 @@ describe('TelegramBot.handleMessage artifacts', () => {
     const { bot, ctx, channel, files, edits } = createBot();
     let artifactDir = '';
 
-    vi.spyOn(bot, 'runStream').mockImplementation(async (prompt: string) => {
-      const manifestMatch = prompt.match(/write this JSON manifest: (.+)\nFormat:/);
+    vi.spyOn(bot, 'runStream').mockImplementation(async (prompt: string, _cs: any, _files: string[], _onText: any, systemPrompt?: string) => {
+      const manifestSource = systemPrompt ?? prompt;
+      const manifestMatch = manifestSource.match(/write this JSON manifest: (.+)\nFormat:/);
       expect(manifestMatch?.[1]).toBeTruthy();
       const manifestPath = manifestMatch![1];
       artifactDir = path.dirname(manifestPath);
@@ -197,8 +330,9 @@ describe('TelegramBot.handleMessage artifacts', () => {
     const leakedPath = path.join(process.env.CODECLAW_WORKDIR!, 'secret.txt');
     fs.writeFileSync(leakedPath, 'do not leak');
 
-    vi.spyOn(bot, 'runStream').mockImplementation(async (prompt: string) => {
-      const manifestMatch = prompt.match(/write this JSON manifest: (.+)\nFormat:/);
+    vi.spyOn(bot, 'runStream').mockImplementation(async (prompt: string, _cs: any, _files: string[], _onText: any, systemPrompt?: string) => {
+      const manifestSource = systemPrompt ?? prompt;
+      const manifestMatch = manifestSource.match(/write this JSON manifest: (.+)\nFormat:/);
       const manifestPath = manifestMatch![1];
       fs.writeFileSync(manifestPath, JSON.stringify({
         files: [

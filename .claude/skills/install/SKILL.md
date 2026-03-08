@@ -1,7 +1,7 @@
 ---
 name: install
-description: This skill should be used when the user asks to "install codeclaw", "build and install", "compile the binary", "deploy locally", "update local binary", or mentions building codeclaw and putting it in ~/.local/bin.
-version: 6.0.0
+description: This skill should be used when the user asks to "install codeclaw", "build and install", "deploy locally", "update local binary", "release", or "publish".
+version: 7.0.0
 ---
 
 # Install & Publish codeclaw
@@ -11,7 +11,7 @@ Every time this skill is invoked, execute ALL steps below in order:
 ## 1. Bump patch version
 
 1. Read current version from `package.json`.
-2. Increment the **patch** number (e.g. `0.2.11` → `0.2.12`).
+2. Increment the **patch** number (e.g. `0.2.12` → `0.2.13`).
 3. Update **both** `package.json` `"version"` field and `src/bot.ts` `VERSION` constant to the new version.
 4. Update the version examples in **this file** (SKILL.md) step 1's comments to reflect the new base version.
 
@@ -30,6 +30,34 @@ Every time this skill is invoked, execute ALL steps below in order:
 4. Push: `git push origin main --tags`.
 5. Use `gh` to confirm the `Release` workflow for the pushed tag completes successfully.
 6. Use `gh` to confirm the workflow's npm publish step succeeded before considering the release done.
+
+## 4. Write release notes
+
+After CI creates the GitHub Release, update it with meaningful release notes:
+
+1. Run `git log v<previous-version>..v<new-version> --oneline --no-merges` to collect all commits since the last release.
+2. Summarize changes into categories (use only relevant ones, skip empty categories):
+   - **New Features** — new user-facing functionality
+   - **Improvements** — enhancements to existing features
+   - **Bug Fixes** — resolved issues
+   - **Internal** — refactors, dependency updates, CI changes
+3. Write concise, user-friendly descriptions (not raw commit messages).
+4. Update the GitHub Release using:
+   ```
+   gh release edit v<new-version> --notes "$(cat <<'EOF'
+   ## What's Changed
+
+   ### New Features
+   - description of feature
+
+   ### Bug Fixes
+   - description of fix
+
+   **Full Changelog**: https://github.com/xiaotonng/codeclaw/compare/v<previous-version>...v<new-version>
+   EOF
+   )"
+   ```
+5. Verify the release notes look correct: `gh release view v<new-version>`.
 
 ## Prerequisites
 

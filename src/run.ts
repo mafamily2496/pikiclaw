@@ -9,7 +9,7 @@
  */
 
 import { VERSION } from './bot.js';
-import { listAgents, listModels, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
+import { listAgents, listModels, listSkills, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
 import type { Agent, StreamOpts } from './code-agent.js';
 
 function parseArgs(argv: string[]) {
@@ -45,6 +45,7 @@ Usage:
   npm run command -- <command> [options]
 
 Commands:
+  skills          List project-defined custom skills (.claude/commands & .claude/skills)
   claude-run      Run a single Claude prompt and print the result
   codex-run       Run a single Codex prompt and print the result
   claude-status   Show Claude agent info and API usage
@@ -83,6 +84,20 @@ async function main() {
   }
 
   switch (args.command) {
+    case 'skills': {
+      const result = listSkills(workdir);
+      if (!result.skills.length) {
+        process.stdout.write(`No custom skills found in ${workdir}/.claude/\n`);
+        break;
+      }
+      process.stdout.write(`Project skills (${result.skills.length}):\n\n`);
+      for (const sk of result.skills) {
+        const src = sk.source === 'skills' ? 'skill' : 'command';
+        const desc = sk.description ? `  ${sk.description}` : '';
+        process.stdout.write(`  ${sk.name}  [${src}]${desc}\n`);
+      }
+      break;
+    }
     case 'claude-status': {
       const info = listAgents().agents.find(a => a.agent === 'claude')!;
       const mark = info.installed ? '\u2713' : '\u2717';
@@ -224,7 +239,7 @@ async function main() {
     }
     default:
       process.stderr.write(`Unknown command: ${args.command}\n`);
-      process.stderr.write(`Available commands: claude-run, codex-run, claude-status, codex-status, claude-models, codex-models, claude-sessions, codex-sessions, claude-tail, codex-tail\n`);
+      process.stderr.write(`Available commands: skills, claude-run, codex-run, claude-status, codex-status, claude-models, codex-models, claude-sessions, codex-sessions, claude-tail, codex-tail\n`);
       process.exit(1);
   }
 }

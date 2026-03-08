@@ -5,7 +5,7 @@
  * This avoids hitting real APIs while testing all parsing and control flow.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { doStream, doCodexStream, doClaudeStream, getUsage, listModels, type StreamOpts } from '../src/code-agent.ts';
+import { doStream, doCodexStream, doClaudeStream, getUsage, listModels, buildCodexTurnInput, type StreamOpts } from '../src/code-agent.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,20 @@ beforeEach(() => {
   fs.mkdirSync(fakeBin, { recursive: true });
   // Prepend fake bin to PATH so our scripts shadow real codex/claude
   process.env.PATH = `${fakeBin}:${process.env.PATH}`;
+});
+
+describe('buildCodexTurnInput', () => {
+  it('uses localImage for local image attachments', () => {
+    const imagePath = path.join(tmpDir, 'shot.png');
+    const docPath = path.join(tmpDir, 'notes.txt');
+
+    const input = buildCodexTurnInput('inspect this', [imagePath, docPath]);
+
+    expect(input).toEqual([
+      { type: 'localImage', path: imagePath },
+      { type: 'text', text: 'inspect this' },
+    ]);
+  });
 });
 
 // --- codex parsing ---
