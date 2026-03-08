@@ -1,6 +1,6 @@
 {
   "name": "codeclaw",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "The best IM-driven remote coding experience. Bridge AI coding agents to any IM.",
   "type": "module",
   "bin": {
@@ -40,5 +40,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "undici": "^7.22.0"
   }
 }

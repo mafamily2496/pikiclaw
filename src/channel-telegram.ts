@@ -54,7 +54,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
 import { Channel, BotInfo, SendOpts, splitText, sleep } from './channel-base.js';
+
+// ---------------------------------------------------------------------------
+// Proxy support — automatically respects HTTPS_PROXY / HTTP_PROXY / NO_PROXY
+// ---------------------------------------------------------------------------
+setGlobalDispatcher(new EnvHttpProxyAgent());
 
 export { TelegramChannel };
 
