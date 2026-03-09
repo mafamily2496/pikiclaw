@@ -11,6 +11,23 @@ export interface CodexCumulativeUsage {
   cached: number;
 }
 
+export interface StreamPreviewMeta {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+  contextPercent: number | null;
+}
+
+export interface StreamPreviewPlanStep {
+  step: string;
+  status: 'pending' | 'inProgress' | 'completed';
+}
+
+export interface StreamPreviewPlan {
+  explanation: string | null;
+  steps: StreamPreviewPlanStep[];
+}
+
 export interface StreamOpts {
   agent: Agent;
   prompt: string;
@@ -19,7 +36,13 @@ export interface StreamOpts {
   sessionId: string | null;
   model: string | null;
   thinkingEffort: string;
-  onText: (text: string, thinking: string, activity?: string) => void;
+  onText: (
+    text: string,
+    thinking: string,
+    activity?: string,
+    meta?: StreamPreviewMeta,
+    plan?: StreamPreviewPlan | null,
+  ) => void;
   /** Local file paths to attach (images, documents, etc.) */
   attachments?: string[];
   // codex
@@ -95,6 +118,21 @@ function buildCodexCumulativeUsage(raw: any): CodexCumulativeUsage | null {
   const cached = numberOrNull(raw.cachedInputTokens, raw.cached_input_tokens);
   if (input == null && output == null && cached == null) return null;
   return { input: input ?? 0, output: output ?? 0, cached: cached ?? 0 };
+}
+
+function buildStreamPreviewMeta(s: {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  contextWindow: number | null;
+}): StreamPreviewMeta {
+  return {
+    inputTokens: s.inputTokens,
+    outputTokens: s.outputTokens,
+    cachedInputTokens: s.cachedInputTokens,
+    contextPercent: computeContext(s).contextPercent,
+  };
 }
 
 function applyCodexTokenUsage(
@@ -190,7 +228,7 @@ async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, s: any)
         }
       }
       parseLine(ev, s);
-      opts.onText(s.text, s.thinking);
+      opts.onText(s.text, s.thinking, undefined, buildStreamPreviewMeta(s), null);
     } catch {}
   });
 
@@ -490,6 +528,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     recentNarrative: [] as string[],
     recentFailures: [] as string[],
     completedCommands: 0,
+    plan: null as StreamPreviewPlan | null,
   };
 
   // Step 1: thread/start or thread/resume
@@ -550,7 +589,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       if (Date.now() > deadline) return;
       const emit = () => {
         s.activity = buildCodexActivityPreview(s);
-        opts.onText(s.text, s.thinking, s.activity);
+        opts.onText(s.text, s.thinking, s.activity, buildStreamPreviewMeta(s), s.plan);
       };
 
       if (method === 'item/started' && params.threadId === s.sessionId) {
@@ -629,6 +668,23 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       // Token usage updates
       if (method === 'thread/tokenUsage/updated' && params.threadId === s.sessionId) {
         applyCodexTokenUsage(s, params.tokenUsage, opts.codexPrevCumulative);
+        emit();
+      }
+
+      if (method === 'turn/plan/updated' && params.threadId === s.sessionId) {
+        const rawPlan = Array.isArray(params.plan) ? params.plan : [];
+        s.plan = {
+          explanation: typeof params.explanation === 'string' ? params.explanation : null,
+          steps: rawPlan
+            .map((entry: any) => ({
+              step: typeof entry?.step === 'string' ? entry.step : '',
+              status: entry?.status === 'completed' || entry?.status === 'pending' || entry?.status === 'inProgress'
+                ? entry.status
+                : 'pending',
+            }))
+            .filter((entry: StreamPreviewPlanStep) => entry.step.trim()),
+        };
+        emit();
       }
 
       // Turn completed

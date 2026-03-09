@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
-  Bot, VERSION, type Agent, type StreamResult,
+  Bot, VERSION, type Agent, type StreamPreviewMeta, type StreamPreviewPlan, type StreamResult,
   fmtTokens, fmtUptime, fmtBytes, whichSync, listSubdirs, buildPrompt,
   thinkLabel, parseAllowedChatIds, shellSplit, type SkillInfo,
 } from './bot.js';
@@ -152,12 +152,21 @@ export interface BotArtifact {
 
 const ARTIFACT_MANIFEST = 'manifest.json';
 const ARTIFACT_ROOT = path.join(os.tmpdir(), 'codeclaw-artifacts');
+const ARTIFACT_PROMPT_ROOT = '.codeclaw/artifacts';
 const ARTIFACT_MAX_FILES = 8;
 const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
 const ARTIFACT_PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const STREAM_PREVIEW_HEARTBEAT_MS = 5_000;
 const STREAM_TYPING_HEARTBEAT_MS = 4_000;
 const STREAM_STALLED_NOTICE_MS = 15_000;
+
+interface ArtifactTurn {
+  dir: string;
+  manifestPath: string;
+  promptDir: string;
+  promptManifestPath: string;
+  aliasDir: string | null;
+}
 
 function isPhotoFilename(filename: string): boolean {
   return ARTIFACT_PHOTO_EXTS.has(path.extname(filename).toLowerCase());
@@ -245,7 +254,7 @@ export function buildArtifactSystemPrompt(artifactDir: string, manifestPath: str
     artifactDir,
     '',
     `When you want a file returned, also write this JSON manifest: ${manifestPath}`,
-    'Format:',
+    'Manifest format:',
     '{"files":[{"path":"screenshot.png","kind":"photo","caption":"optional caption"}]}',
     'Rules:',
     '- Use relative paths in "path". Never use absolute paths.',
@@ -304,9 +313,14 @@ function trimActivityForPreview(text: string, maxChars = 900): string {
   return [...head, '...', ...tail].join('\n');
 }
 
-function summarizeActivityForPreview(activity: string): string {
+function parseActivitySummary(activity: string): {
+  narrative: string[];
+  failedCommands: number;
+  completedCommands: number;
+  activeCommands: number;
+} {
   const narrative: string[] = [];
-  const failures: string[] = [];
+  let failedCommands = 0;
   let activeCommands = 0;
   let completedCommands = 0;
 
@@ -333,28 +347,95 @@ function summarizeActivityForPreview(activity: string): string {
     }
     const failed = line.match(/^Command failed \((\d+)\):/);
     if (failed) {
-      failures.push(`Command failed (${failed[1]})`);
+      failedCommands++;
       continue;
     }
     if (/^Command failed \(\d+\)$/.test(line)) {
-      failures.push(line);
+      failedCommands++;
       continue;
     }
     narrative.push(line);
   }
 
+  return { narrative, failedCommands, completedCommands, activeCommands };
+}
+
+function formatActivityCommandSummary(completedCommands: number, activeCommands: number, failedCommands = 0): string {
+  const parts: string[] = [];
+  if (failedCommands > 0) parts.push(`${failedCommands} failed`);
+  if (completedCommands > 0) parts.push(`${completedCommands} done`);
+  if (activeCommands > 0) parts.push(`${activeCommands} running`);
+  return parts.length ? `commands: ${parts.join(', ')}` : '';
+}
+
+function summarizeActivityForPreview(activity: string): string {
+  const summary = parseActivitySummary(activity);
   const lines = [
-    ...narrative,
-    ...failures,
+    ...summary.narrative,
   ];
 
-  if (completedCommands > 0) {
-    lines.push(completedCommands === 1 ? 'Executed 1 command.' : `Executed ${completedCommands} commands.`);
-  }
-  if (activeCommands > 0) {
-    lines.push(activeCommands === 1 ? 'Running 1 command...' : `Running ${activeCommands} commands...`);
-  }
+  const commandSummary = formatActivityCommandSummary(
+    summary.completedCommands,
+    summary.activeCommands,
+    summary.failedCommands,
+  );
+  if (commandSummary) lines.push(commandSummary);
 
+  return lines.join('\n');
+}
+
+function hasPreviewMeta(meta: StreamPreviewMeta | null | undefined): boolean {
+  return !!meta && (
+    meta.inputTokens != null
+    || meta.cachedInputTokens != null
+    || meta.outputTokens != null
+    || meta.contextPercent != null
+  );
+}
+
+function samePreviewMeta(a: StreamPreviewMeta | null, b: StreamPreviewMeta | null): boolean {
+  return (a?.inputTokens ?? null) === (b?.inputTokens ?? null)
+    && (a?.cachedInputTokens ?? null) === (b?.cachedInputTokens ?? null)
+    && (a?.outputTokens ?? null) === (b?.outputTokens ?? null)
+    && (a?.contextPercent ?? null) === (b?.contextPercent ?? null);
+}
+
+function formatPreviewMetaParts(meta: StreamPreviewMeta | null): string[] {
+  if (!meta) return [];
+  const parts: string[] = [];
+  if (meta.inputTokens != null) parts.push(`in:${fmtTokens(meta.inputTokens)}`);
+  if (meta.cachedInputTokens != null) parts.push(`cached:${fmtTokens(meta.cachedInputTokens)}`);
+  if (meta.outputTokens != null) parts.push(`out:${fmtTokens(meta.outputTokens)}`);
+  if (meta.contextPercent != null) parts.push(`ctx:${meta.contextPercent}%`);
+  return parts;
+}
+
+function normalizePlanStep(step: string): string {
+  return step.replace(/\s+/g, ' ').trim();
+}
+
+function samePreviewPlan(a: StreamPreviewPlan | null, b: StreamPreviewPlan | null): boolean {
+  if ((a?.explanation ?? null) !== (b?.explanation ?? null)) return false;
+  const aSteps = a?.steps ?? [];
+  const bSteps = b?.steps ?? [];
+  if (aSteps.length !== bSteps.length) return false;
+  for (let i = 0; i < aSteps.length; i++) {
+    if (aSteps[i].status !== bSteps[i].status) return false;
+    if (aSteps[i].step !== bSteps[i].step) return false;
+  }
+  return true;
+}
+
+function renderPlanForPreview(plan: StreamPreviewPlan | null): string {
+  if (!plan?.steps.length) return '';
+  const completed = plan.steps.filter(step => step.status === 'completed').length;
+  const total = plan.steps.length;
+  const lines = [`Plan ${completed}/${total}`];
+  for (const step of plan.steps.slice(0, 4)) {
+    const prefix = step.status === 'completed' ? '[x]' : step.status === 'inProgress' ? '[>]' : '[ ]';
+    lines.push(`${prefix} ${normalizePlanStep(step.step)}`);
+  }
+  if (plan.steps.length > 4) lines.push(`... +${plan.steps.length - 4} more`);
   return lines.join('\n');
 }
 
@@ -788,17 +869,17 @@ export class TelegramBot extends Bot {
 
     const cs = this.chat(ctx.chatId);
     const artifactTurn = this.createArtifactTurn(ctx.chatId);
-    const artifactSystemPrompt = buildArtifactSystemPrompt(artifactTurn.dir, artifactTurn.manifestPath);
+    const artifactSystemPrompt = buildArtifactSystemPrompt(artifactTurn.promptDir, artifactTurn.promptManifestPath);
     const basePrompt = buildPrompt(text, msg.files);
     // Codex does not reliably surface developerInstructions to the model during
     // real artifact-return turns, especially on resumed sessions. Inject the
     // artifact instructions into the turn prompt as well so the target paths
     // are visible in the actual conversation input.
     const prompt = cs.agent === 'codex'
-      ? buildArtifactPrompt(basePrompt, artifactTurn.dir, artifactTurn.manifestPath)
+      ? buildArtifactPrompt(basePrompt, artifactTurn.promptDir, artifactTurn.promptManifestPath)
       : basePrompt;
     const start = Date.now();
-    const initialPreview = `Waiting for model output...\n\n${cs.agent} | 0s ·`;
+    const initialPreview = `${cs.agent} | 0s ·`;
     this.log(`[handleMessage] chat=${ctx.chatId} agent=${cs.agent} session=${cs.sessionId || '(new)'} prompt="${basePrompt.slice(0, 100)}" files=${msg.files.length}`);
 
     const phId = await ctx.reply(initialPreview);
@@ -816,6 +897,8 @@ export class TelegramBot extends Bot {
       const streamEditIntervalMs = cs.agent === 'codex' ? 400 : 800;
       let lastEdit = 0, editCount = 0;
       let latestText = '', latestThinking = '', latestActivity = '';
+      let latestMeta: StreamPreviewMeta | null = null;
+      let latestPlan: StreamPreviewPlan | null = null;
       let lastPreview = initialPreview;
       let lastProgressAt = start;
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -833,9 +916,10 @@ export class TelegramBot extends Bot {
         }
       };
 
-      const renderPreview = (text: string, thinking: string, activity: string) => {
+      const renderPreview = (text: string, thinking: string, activity: string, meta: StreamPreviewMeta | null) => {
         const display = text.trim();
         const thinkDisplay = thinking.trim();
+        const planDisplay = renderPlanForPreview(latestPlan);
         const activityDisplay = summarizeActivityForPreview(activity);
         const now = Date.now();
         const elapsed = ((now - start) / 1000).toFixed(0);
@@ -844,6 +928,10 @@ export class TelegramBot extends Bot {
         const maxActivity = 900;
         const parts: string[] = [];
         const tLabel = thinkLabel(cs.agent);
+
+        if (planDisplay) {
+          parts.push(planDisplay);
+        }
 
         if (activityDisplay) {
           const preview = trimActivityForPreview(activityDisplay, maxActivity);
@@ -859,19 +947,17 @@ export class TelegramBot extends Bot {
           parts.push(preview);
         }
 
-        if (!display && !thinkDisplay && !activityDisplay) {
-          parts.push('Waiting for model output...');
-        } else if (idleMs >= STREAM_STALLED_NOTICE_MS) {
-          parts.push(`No new output for ${fmtUptime(idleMs)}.`);
-        }
-
-        const dots = '\u00b7'.repeat((editCount % 3) + 1);
-        parts.push(`${cs.agent} | ${elapsed}s ${dots}`);
+        const status = '.'.repeat((editCount % 3) + 1);
+        const footer = [`${cs.agent} | ${elapsed}s`];
+        footer.push(...formatPreviewMetaParts(meta));
+        if (idleMs >= STREAM_STALLED_NOTICE_MS) footer.push(`idle ${fmtUptime(idleMs)}`);
+        else footer.push(status);
+        parts.push(footer.join(' \u00b7 '));
         return parts.join('\n\n');
       };
 
       const queuePreviewEdit = (force = false) => {
-        const preview = renderPreview(latestText, latestThinking, latestActivity);
+        const preview = renderPreview(latestText, latestThinking, latestActivity, latestMeta);
         if (!preview) return;
         if (!force && preview === lastPreview) return;
         lastPreview = preview;
@@ -934,13 +1020,27 @@ export class TelegramBot extends Bot {
       typingTimer = setInterval(sendTypingPulse, STREAM_TYPING_HEARTBEAT_MS);
       typingTimer.unref?.();
 
-      const onText = (text: string, thinking: string, activity = '') => {
-        const changed = text !== latestText || thinking !== latestThinking || activity !== latestActivity;
+      const onText = (
+        text: string,
+        thinking: string,
+        activity = '',
+        meta?: StreamPreviewMeta,
+        plan?: StreamPreviewPlan | null,
+      ) => {
+        const nextMeta: StreamPreviewMeta | null = hasPreviewMeta(meta) ? meta! : null;
+        const nextPlan = plan?.steps?.length ? plan : null;
+        const changed = text !== latestText
+          || thinking !== latestThinking
+          || activity !== latestActivity
+          || !samePreviewMeta(nextMeta, latestMeta)
+          || !samePreviewPlan(nextPlan, latestPlan);
         latestText = text;
         latestThinking = thinking;
         latestActivity = activity;
+        latestMeta = nextMeta;
+        latestPlan = nextPlan;
         if (changed) lastProgressAt = Date.now();
-        if (!text.trim() && !thinking.trim() && !activity.trim()) return;
+        if (!text.trim() && !thinking.trim() && !activity.trim() && !hasPreviewMeta(nextMeta) && !nextPlan) return;
         schedulePreviewEdit();
       };
 
@@ -975,7 +1075,7 @@ export class TelegramBot extends Bot {
       if (preserveArtifacts) {
         this.log(`artifact turn preserved for retry/debugging: ${artifactTurn.dir}`);
       } else {
-        this.cleanupArtifactTurn(artifactTurn.dir);
+        this.cleanupArtifactTurn(artifactTurn);
       }
     }
   }
@@ -984,11 +1084,27 @@ export class TelegramBot extends Bot {
     const turnId = `${chatId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const dir = path.join(ARTIFACT_ROOT, String(chatId), turnId);
     fs.mkdirSync(dir, { recursive: true });
-    return { dir, manifestPath: path.join(dir, ARTIFACT_MANIFEST) };
+    const manifestPath = path.join(dir, ARTIFACT_MANIFEST);
+
+    const promptDir = path.posix.join(ARTIFACT_PROMPT_ROOT, `telegram-${chatId}`, 'current');
+    const promptManifestPath = path.posix.join(promptDir, ARTIFACT_MANIFEST);
+    const aliasDir = path.join(this.workdir, ...promptDir.split('/'));
+    const aliasParent = path.dirname(aliasDir);
+
+    try {
+      fs.mkdirSync(aliasParent, { recursive: true });
+      fs.rmSync(aliasDir, { recursive: true, force: true });
+      fs.symlinkSync(dir, aliasDir, 'dir');
+      return { dir, manifestPath, promptDir, promptManifestPath, aliasDir };
+    } catch (e) {
+      this.log(`artifact alias fallback to absolute path: ${e}`);
+      return { dir, manifestPath, promptDir: dir, promptManifestPath: manifestPath, aliasDir: null };
+    }
   }
 
-  private cleanupArtifactTurn(dirPath: string) {
-    fs.rmSync(dirPath, { recursive: true, force: true });
+  private cleanupArtifactTurn(turn: ArtifactTurn) {
+    if (turn.aliasDir) fs.rmSync(turn.aliasDir, { recursive: true, force: true });
+    fs.rmSync(turn.dir, { recursive: true, force: true });
   }
 
   private collectArtifacts(dirPath: string, manifestPath: string): BotArtifact[] {
@@ -1038,13 +1154,21 @@ export class TelegramBot extends Bot {
     }
 
     let activityHtml = '';
+    let activityNoteHtml = '';
     if (result.activity) {
-      const summary = summarizeActivityForPreview(result.activity);
-      if (summary) {
-        let display = summary;
+      const summary = parseActivitySummary(result.activity);
+      const narrative = summary.narrative.join('\n');
+      if (narrative) {
+        let display = narrative;
         if (display.length > 800) display = '...\n' + display.slice(-800);
         activityHtml = `<blockquote><b>Activity</b>\n${escapeHtml(display)}</blockquote>\n\n`;
       }
+      const commandSummary = formatActivityCommandSummary(
+        summary.completedCommands,
+        summary.activeCommands,
+        summary.failedCommands,
+      );
+      if (commandSummary) activityNoteHtml = `<i>${escapeHtml(commandSummary)}</i>\n\n`;
     }
 
     let thinkingHtml = '';
@@ -1071,7 +1195,7 @@ export class TelegramBot extends Bot {
     }
 
     const bodyHtml = mdToTgHtml(result.message);
-    const fullHtml = `${activityHtml}${statusHtml}${thinkingHtml}${bodyHtml}\n\n${meta}${tokenBlock}`;
+    const fullHtml = `${activityHtml}${activityNoteHtml}${statusHtml}${thinkingHtml}${bodyHtml}\n\n${meta}${tokenBlock}`;
     let finalMsgId: number | null = phId;
 
     if (fullHtml.length <= 3900) {
@@ -1083,7 +1207,7 @@ export class TelegramBot extends Bot {
     } else {
       // Send full content as split plain-text messages instead of a file.
       // First message: edit placeholder with meta + thinking + beginning of body.
-      const headerHtml = `${activityHtml}${statusHtml}${thinkingHtml}`;
+      const headerHtml = `${activityHtml}${activityNoteHtml}${statusHtml}${thinkingHtml}`;
       const footerHtml = `\n\n${meta}${tokenBlock}`;
       const maxFirst = 3900 - headerHtml.length - footerHtml.length;
       let firstBody: string;

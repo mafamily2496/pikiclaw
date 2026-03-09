@@ -116,6 +116,66 @@ rl.on('line', (line) => {
     const resumeCall = calls.find(call => call.method === 'thread/resume');
     expect(resumeCall?.params?.developerInstructions).toContain('[Telegram Artifact Return]');
   });
+
+  it('surfaces structured plan updates through onText callbacks', async () => {
+    const script = `#!/usr/bin/env node
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\\n');
+    return;
+  }
+
+  if (msg.method === 'thread/start') {
+    process.stdout.write(JSON.stringify({
+      id: msg.id,
+      result: { thread: { id: 'thread-plan' }, model: msg.params.model || 'gpt-5.4' },
+    }) + '\\n');
+    return;
+  }
+
+  if (msg.method === 'turn/start') {
+    process.stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-plan' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-plan',
+        turnId: 'turn-plan',
+        explanation: 'Investigating',
+        plan: [
+          { step: 'Inspect streaming paths', status: 'completed' },
+          { step: 'Thread live usage into preview', status: 'inProgress' },
+          { step: 'Update tests', status: 'pending' },
+        ],
+      },
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-plan', turn: { id: 'turn-plan', status: 'completed' } } }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ id: msg.id, error: { message: 'unexpected method' } }) + '\\n');
+});`;
+    fs.writeFileSync(path.join(fakeBin, 'codex'), script, { mode: 0o755 });
+
+    const calls: any[] = [];
+    const result = await doCodexStream(baseOpts('codex', {
+      onText: (_text, _thinking, _activity, _meta, plan) => {
+        if (plan?.steps?.length) calls.push(plan);
+      },
+    }));
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].steps).toEqual([
+      { step: 'Inspect streaming paths', status: 'completed' },
+      { step: 'Thread live usage into preview', status: 'inProgress' },
+      { step: 'Update tests', status: 'pending' },
+    ]);
+  });
 });
 
 describe.skip('codex stream (requires app-server — see e2e tests)', () => {

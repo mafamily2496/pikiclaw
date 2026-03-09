@@ -10,13 +10,13 @@ import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import {
   doStream, getSessions, getSessionTail, getUsage, listAgents, listModels, listSkills,
-  type Agent, type CodexCumulativeUsage, type StreamOpts, type StreamResult, type SessionInfo, type UsageResult,
+  type Agent, type CodexCumulativeUsage, type StreamOpts, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult,
   type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult,
   type SkillInfo, type SkillListResult,
 } from './code-agent.js';
 
-export { type Agent, type CodexCumulativeUsage, type StreamResult, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
-export const VERSION = '0.2.18';
+export { type Agent, type CodexCumulativeUsage, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
+export const VERSION = '0.2.19';
 const MACOS_USER_ACTIVITY_PULSE_INTERVAL_MS = 20_000;
 const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 
@@ -255,7 +255,7 @@ export class Bot {
 
   async runStream(
     prompt: string, cs: ChatState, attachments: string[],
-    onText: (text: string, thinking: string, activity?: string) => void,
+    onText: (text: string, thinking: string, activity?: string, meta?: StreamPreviewMeta, plan?: StreamPreviewPlan | null) => void,
     systemPrompt?: string,
   ): Promise<StreamResult> {
     this.log(`[runStream] agent=${cs.agent} session=${cs.sessionId || '(new)'} workdir=${this.workdir} timeout=${this.runTimeout}s attachments=${attachments.length}`);
