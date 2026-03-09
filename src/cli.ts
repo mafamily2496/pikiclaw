@@ -41,33 +41,34 @@ export async function main() {
 
   if (args.version) { process.stdout.write(`codeclaw ${VERSION}\n`); process.exit(0); }
 
-  const noToken = !args.token && !process.env.CODECLAW_TOKEN
-    && !process.env.TELEGRAM_BOT_TOKEN
-    && !process.env.FEISHU_APP_ID
-    && !process.env.WHATSAPP_TOKEN;
+  const channel = (args.channel || process.env.CODECLAW_CHANNEL || 'telegram').trim().toLowerCase() as Channel;
+  const noToken = channel === 'telegram'
+    ? !args.token && !process.env.CODECLAW_TOKEN && !process.env.TELEGRAM_BOT_TOKEN
+    : channel === 'feishu'
+      ? !args.token && !process.env.FEISHU_APP_ID
+      : !args.token && !process.env.CODECLAW_TOKEN && !process.env.WHATSAPP_TOKEN;
   if (args.help || noToken) {
     process.stdout.write(
-`codeclaw v${VERSION} — Bridge AI coding agents to your IM.
+`codeclaw v${VERSION} — Run local coding agents through Telegram.
 
-Run a bot that forwards messages to a local AI coding agent (Claude, Codex,
-Gemini), streams responses in real-time, and manages sessions and workdirs.
+Run a bot that forwards Telegram messages to a local AI coding agent
+(Claude Code or Codex CLI), streams responses in real-time, and manages
+sessions, models, and workdirs.
 
 Usage:
   npx codeclaw -c telegram -t <BOT_TOKEN>
   npx codeclaw -c telegram -t <BOT_TOKEN> -a codex
   npx codeclaw -c telegram -t <BOT_TOKEN> -w ~/project
-  npx codeclaw -c feishu   -t <APP_ID>:<APP_SECRET>
-  npx codeclaw -c whatsapp -t <TOKEN>
   CODECLAW_TOKEN=<TOKEN> npx codeclaw
 
 Options:
-  -c, --channel <channel>   IM channel: telegram | feishu | whatsapp  [default: telegram]
+  -c, --channel <channel>   IM channel: telegram  [default: telegram]
   -t, --token <token>       Channel auth token (env: CODECLAW_TOKEN)
-  -a, --agent <agent>       AI agent: claude | codex | gemini  [default: claude]
-  -m, --model <model>       Default model, switchable in chat via /agents
+  -a, --agent <agent>       AI agent: claude | codex  [default: claude]
+  -m, --model <model>       Default model, switchable in chat via /models
   -w, --workdir <dir>       Working directory for the agent  [default: cwd]
-  --full-access             Skip confirmation prompts  [default]
-  --safe-mode               Require confirmation before destructive actions
+  --full-access             Codex full-access + Claude bypassPermissions  [default]
+  --safe-mode               Use safer agent permission modes
   --allowed-ids <id,id>     Comma-separated chat/user ID whitelist
   --timeout <seconds>       Max seconds per agent request  [default: 900]
   -v, --version             Print version
@@ -78,14 +79,12 @@ Environment variables (general):
   DEFAULT_AGENT              Default agent (same as -a)
   CODECLAW_WORKDIR           Working directory (same as -w)
   CODECLAW_TIMEOUT           Timeout in seconds (same as --timeout)
+  CODECLAW_ALLOWED_IDS       Comma-separated chat/user ID whitelist
+  CODECLAW_FULL_ACCESS       Default full-access behavior (true/false)
 
-Environment variables (per channel):
+Environment variables (Telegram):
   TELEGRAM_BOT_TOKEN         Telegram bot token (from @BotFather)
   TELEGRAM_ALLOWED_CHAT_IDS  Comma-separated allowed Telegram chat IDs
-  FEISHU_APP_ID              Feishu/Lark app ID
-  FEISHU_APP_SECRET          Feishu/Lark app secret
-  WHATSAPP_TOKEN             WhatsApp Business API token
-  WHATSAPP_PHONE_ID          WhatsApp phone number ID
 
 Environment variables (per agent):
   CLAUDE_MODEL               Claude model name
@@ -95,25 +94,28 @@ Environment variables (per agent):
   CODEX_REASONING_EFFORT     Reasoning effort (default: xhigh)
   CODEX_FULL_ACCESS          Full-access mode (default: true)
   CODEX_EXTRA_ARGS           Extra CLI args for codex
-  GEMINI_MODEL               Gemini model name
-  GEMINI_EXTRA_ARGS          Extra CLI args for gemini
 
 Bot commands (available once running):
   /sessions   List or switch coding sessions
   /agents     List or switch AI agents
+  /models     List or switch models
   /status     Bot status, uptime, and token usage
   /host       Host machine info (CPU, memory, disk)
   /switch     Browse and change working directory
   /restart    Restart with latest version
 
-Prerequisites: Node.js >= 18, and at least one agent CLI installed (claude, codex, or gemini).
+Notes:
+  - feishu / whatsapp are planned but not implemented yet.
+  - --safe-mode delegates to the agent's own permission model; it does not add
+    a codeclaw-specific approval workflow.
+
+Prerequisites: Node.js >= 18, and at least one agent CLI installed (claude or codex).
 Docs: https://github.com/xiaotonng/codeclaw
 `);
     process.exit(0);
   }
 
   // resolve channel
-  const channel = (args.channel || process.env.CODECLAW_CHANNEL || 'telegram').trim().toLowerCase() as Channel;
   if (!VALID_CHANNELS.has(channel)) {
     process.stderr.write(`Unknown channel: ${channel}. Available: ${[...VALID_CHANNELS].join(', ')}\n`);
     process.exit(1);

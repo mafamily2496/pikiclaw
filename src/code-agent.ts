@@ -502,6 +502,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       model: opts.codexModel || null,
       approvalPolicy: opts.codexFullAccess ? 'never' : undefined,
       sandbox: opts.codexFullAccess ? 'danger-full-access' : undefined,
+      developerInstructions: opts.codexDeveloperInstructions || undefined,
     });
   } else {
     agentLog(`[codex-rpc] thread/start cwd=${opts.workdir} model=${opts.codexModel || '(default)'}`);

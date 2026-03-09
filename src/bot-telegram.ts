@@ -790,10 +790,16 @@ export class TelegramBot extends Bot {
     const artifactTurn = this.createArtifactTurn(ctx.chatId);
     const artifactSystemPrompt = buildArtifactSystemPrompt(artifactTurn.dir, artifactTurn.manifestPath);
     const basePrompt = buildPrompt(text, msg.files);
-    const prompt = basePrompt;
+    // Codex does not reliably surface developerInstructions to the model during
+    // real artifact-return turns, especially on resumed sessions. Inject the
+    // artifact instructions into the turn prompt as well so the target paths
+    // are visible in the actual conversation input.
+    const prompt = cs.agent === 'codex'
+      ? buildArtifactPrompt(basePrompt, artifactTurn.dir, artifactTurn.manifestPath)
+      : basePrompt;
     const start = Date.now();
     const initialPreview = `Waiting for model output...\n\n${cs.agent} | 0s ·`;
-    this.log(`[handleMessage] chat=${ctx.chatId} agent=${cs.agent} session=${cs.sessionId || '(new)'} prompt="${prompt.slice(0, 100)}" files=${msg.files.length}`);
+    this.log(`[handleMessage] chat=${ctx.chatId} agent=${cs.agent} session=${cs.sessionId || '(new)'} prompt="${basePrompt.slice(0, 100)}" files=${msg.files.length}`);
 
     const phId = await ctx.reply(initialPreview);
     if (!phId) { this.log(`[handleMessage] placeholder null for chat=${ctx.chatId}`); return; }
@@ -803,6 +809,9 @@ export class TelegramBot extends Bot {
 
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let typingTimer: ReturnType<typeof setInterval> | null = null;
+    let collectedArtifacts: BotArtifact[] = [];
+    let artifactDeliveryAttempted = false;
+    let artifactUploadFailed = false;
     try {
       const streamEditIntervalMs = cs.agent === 'codex' ? 400 : 800;
       let lastEdit = 0, editCount = 0;
@@ -939,6 +948,7 @@ export class TelegramBot extends Bot {
       stopWaitFeedback();
       await flushPreviewEdits();
       const artifacts = this.collectArtifacts(artifactTurn.dir, artifactTurn.manifestPath);
+      collectedArtifacts = artifacts;
 
       this.log(
         `[handleMessage] done agent=${cs.agent} ok=${result.ok} session=${result.sessionId || '?'} elapsed=${result.elapsedS.toFixed(1)}s edits=${editCount} ` +
@@ -953,13 +963,20 @@ export class TelegramBot extends Bot {
       }
 
       const finalMsgId = await this.sendFinalReply(ctx, phId, cs.agent, result);
-      await this.sendArtifacts(ctx, finalMsgId ?? phId, artifacts);
+      artifactDeliveryAttempted = true;
+      const upload = await this.sendArtifacts(ctx, finalMsgId ?? phId, artifacts);
+      artifactUploadFailed = upload.failed.length > 0;
       this.log(`[handleMessage] final reply sent to chat=${ctx.chatId}`);
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (typingTimer) clearInterval(typingTimer);
       this.activeTasks.delete(ctx.chatId);
-      this.cleanupArtifactTurn(artifactTurn.dir);
+      const preserveArtifacts = collectedArtifacts.length > 0 && (!artifactDeliveryAttempted || artifactUploadFailed);
+      if (preserveArtifacts) {
+        this.log(`artifact turn preserved for retry/debugging: ${artifactTurn.dir}`);
+      } else {
+        this.cleanupArtifactTurn(artifactTurn.dir);
+      }
     }
   }
 
@@ -979,6 +996,7 @@ export class TelegramBot extends Bot {
   }
 
   private async sendArtifacts(ctx: TgContext, replyTo: number, artifacts: BotArtifact[]) {
+    const failed: BotArtifact[] = [];
     for (const artifact of artifacts) {
       const caption = artifact.caption;
       try {
@@ -988,6 +1006,7 @@ export class TelegramBot extends Bot {
           asPhoto: artifact.kind === 'photo',
         });
       } catch (e) {
+        failed.push(artifact);
         this.log(`artifact upload failed for ${artifact.filename}: ${e}`);
         await this.channel.send(
           ctx.chatId,
@@ -996,6 +1015,7 @@ export class TelegramBot extends Bot {
         ).catch(() => {});
       }
     }
+    return { failed };
   }
 
   private async sendFinalReply(ctx: TgContext, phId: number, agent: Agent, result: StreamResult): Promise<number | null> {
@@ -1344,7 +1364,7 @@ export class TelegramBot extends Bot {
       `<b>Agent:</b> ${escapeHtml(this.defaultAgent)}\n` +
       `<b>Available:</b> ${escapeHtml(agents.join(', ') || 'none')}\n` +
       `<b>Workdir:</b> <code>${escapeHtml(this.workdir)}</code>\n\n` +
-      `<i>/help for commands</i>`;
+      `<i>/start for commands</i>`;
 
     for (const cid of targets) {
       try {

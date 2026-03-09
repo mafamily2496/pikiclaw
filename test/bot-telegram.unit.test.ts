@@ -238,15 +238,15 @@ describe('TelegramBot.handleMessage streaming', () => {
     }
   });
 
-  it('keeps artifact instructions out of the user prompt for resumed codex sessions', async () => {
+  it('injects artifact instructions into resumed codex prompts', async () => {
     const { bot, ctx } = createBot();
     const cs = bot.chat(ctx.chatId);
     cs.agent = 'codex';
     cs.sessionId = 'sess-existing';
 
     const runStream = vi.spyOn(bot, 'runStream').mockImplementation(async (prompt: string, _cs: any, _files: string[], _onText: any, systemPrompt?: string) => {
-      expect(prompt).toBe('Inspect this repo');
-      expect(prompt).not.toContain('[Telegram Artifact Return]');
+      expect(prompt).toContain('Inspect this repo');
+      expect(prompt).toContain('[Telegram Artifact Return]');
       expect(systemPrompt).toContain('[Telegram Artifact Return]');
       return {
         ok: true,
@@ -508,6 +508,51 @@ describe('TelegramBot.handleMessage artifacts', () => {
 
     expect(files).toHaveLength(0);
     expect(channel.sendFile).not.toHaveBeenCalled();
+  });
+
+  it('preserves the turn directory when artifact upload fails', async () => {
+    const { bot, ctx, channel, sends } = createBot();
+    let artifactDir = '';
+
+    vi.spyOn(bot, 'runStream').mockImplementation(async (_prompt: string, _cs: any, _files: string[], _onText: any, systemPrompt?: string) => {
+      const manifestSource = systemPrompt ?? '';
+      const manifestMatch = manifestSource.match(/write this JSON manifest: (.+)\nFormat:/);
+      const manifestPath = manifestMatch![1];
+      artifactDir = path.dirname(manifestPath);
+
+      fs.writeFileSync(path.join(artifactDir, 'shot.png'), Buffer.from('png-bytes'));
+      fs.writeFileSync(manifestPath, JSON.stringify({
+        files: [
+          { path: 'shot.png', kind: 'photo', caption: 'Screenshot' },
+        ],
+      }));
+
+      return {
+        ok: true,
+        message: 'Artifacts ready.',
+        thinking: null,
+        sessionId: 'sess-artifacts-fail',
+        model: 'claude-opus-4-6',
+        thinkingEffort: 'high',
+        elapsedS: 1.5,
+        inputTokens: 10,
+        outputTokens: 20,
+        cachedInputTokens: null,
+        error: null,
+        stopReason: null,
+        incomplete: false,
+      };
+    });
+
+    vi.mocked(channel.sendFile).mockRejectedValueOnce(new Error('telegram send failed'));
+
+    await (bot as any).handleMessage({ text: 'Take a screenshot', files: [] }, ctx);
+
+    expect(channel.sendFile).toHaveBeenCalledTimes(1);
+    expect(sends.some(entry => entry.text.includes('Artifact upload failed'))).toBe(true);
+    expect(fs.existsSync(artifactDir)).toBe(true);
+
+    fs.rmSync(artifactDir, { recursive: true, force: true });
   });
 });
 

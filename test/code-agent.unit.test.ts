@@ -5,7 +5,7 @@
  * This avoids hitting real APIs while testing all parsing and control flow.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { doStream, doCodexStream, doClaudeStream, getUsage, listModels, buildCodexTurnInput, type StreamOpts } from '../src/code-agent.ts';
+import { doStream, doCodexStream, doClaudeStream, getUsage, listModels, buildCodexTurnInput, shutdownCodexServer, type StreamOpts } from '../src/code-agent.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,7 @@ beforeEach(() => {
   fs.mkdirSync(fakeBin, { recursive: true });
   // Prepend fake bin to PATH so our scripts shadow real codex/claude
   process.env.PATH = `${fakeBin}:${process.env.PATH}`;
+  shutdownCodexServer();
 });
 
 describe('buildCodexTurnInput', () => {
@@ -57,9 +58,65 @@ describe('buildCodexTurnInput', () => {
 });
 
 // --- codex parsing ---
-// NOTE: Codex stream tests are skipped because doCodexStream now uses the
-// app-server JSON-RPC protocol instead of `codex exec --json`. These cannot
-// be unit-tested with fake shell scripts. Use e2e tests instead.
+
+describe('codex stream', () => {
+  it('passes developerInstructions when resuming a thread', async () => {
+    const callsFile = path.join(tmpDir, 'codex-rpc-calls.jsonl');
+    const script = `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const callsFile = ${JSON.stringify(callsFile)};
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  fs.appendFileSync(callsFile, JSON.stringify(msg) + '\\n');
+
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\\n');
+    return;
+  }
+
+  if (msg.method === 'thread/resume') {
+    process.stdout.write(JSON.stringify({
+      id: msg.id,
+      result: { thread: { id: msg.params.threadId }, model: msg.params.model || 'gpt-5.4' },
+    }) + '\\n');
+    return;
+  }
+
+  if (msg.method === 'turn/start') {
+    process.stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-1' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'turn/started', params: { threadId: msg.params.threadId, turn: { id: 'turn-1' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: msg.params.threadId, item: { id: 'msg-1', type: 'agentMessage', phase: 'final_answer' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: msg.params.threadId, itemId: 'msg-1', delta: 'done' } }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: msg.params.threadId, item: { id: 'msg-1', type: 'agentMessage', phase: 'final_answer', text: 'done' } } }) + '\\n');
+    process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: msg.params.threadId, turn: { id: 'turn-1', status: 'completed' } } }) + '\\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify({ id: msg.id, error: { message: 'unexpected method' } }) + '\\n');
+});`;
+    fs.writeFileSync(path.join(fakeBin, 'codex'), script, { mode: 0o755 });
+
+    const result = await doCodexStream(baseOpts('codex', {
+      sessionId: 'thread-existing',
+      codexModel: 'gpt-5.4',
+      codexDeveloperInstructions: '[Telegram Artifact Return]\\nwrite manifest',
+    }));
+
+    expect(result.ok).toBe(true);
+    expect(result.sessionId).toBe('thread-existing');
+
+    const calls = fs.readFileSync(callsFile, 'utf-8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const resumeCall = calls.find(call => call.method === 'thread/resume');
+    expect(resumeCall?.params?.developerInstructions).toContain('[Telegram Artifact Return]');
+  });
+});
 
 describe.skip('codex stream (requires app-server — see e2e tests)', () => {
   it('parses single-turn conversation with per-turn token values', async () => {
