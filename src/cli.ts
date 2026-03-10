@@ -70,7 +70,7 @@ Options:
   --full-access             Codex full-access + Claude bypassPermissions  [default]
   --safe-mode               Use safer agent permission modes
   --allowed-ids <id,id>     Comma-separated chat/user ID whitelist
-  --timeout <seconds>       Max seconds per agent request  [default: 900]
+  --timeout <seconds>       Max seconds per agent request  [default: 1800]
   -v, --version             Print version
   -h, --help                Print this help
 

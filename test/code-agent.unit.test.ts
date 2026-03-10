@@ -314,6 +314,46 @@ describe('claude stream', () => {
     expect(result.thinking).toBe('Deep thought');
   });
 
+  it('surfaces Claude tool activity through activity and onText callbacks', async () => {
+    const activities: string[] = [];
+    writeFakeScript('claude', [
+      { type: 'system', session_id: 's-tools' },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', id: 'tool-read-1', name: 'Read', input: { file_path: 'src/bot.ts' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool-read-1', content: 'file contents', is_error: false },
+          ],
+        },
+        tool_use_result: { stdout: 'file contents', stderr: '', interrupted: false, isImage: false, noOutputExpected: false },
+      },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Updated timeout.' } } },
+      { type: 'result', session_id: 's-tools' },
+    ]);
+
+    const result = await doClaudeStream(baseOpts('claude', {
+      onText: (_text, _thinking, activity) => {
+        if (activity) activities.push(activity);
+      },
+    }));
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toBe('Updated timeout.');
+    expect(result.activity).toContain('Read src/bot.ts');
+    expect(result.activity).toContain('Read src/bot.ts done');
+    expect(activities.some(activity => activity.includes('Read src/bot.ts'))).toBe(true);
+    expect(activities.some(activity => activity.includes('Read src/bot.ts done'))).toBe(true);
+  });
+
   it('retries on expired session', async () => {
     // First call: fake claude returns session-not-found error
     // The retry will call claude again (same fake script), which returns the error again.

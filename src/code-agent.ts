@@ -185,6 +185,10 @@ async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, s: any)
     cacheCreationInputTokens: null as number | null, contextWindow: null as number | null,
     codexCumulative: null as CodexCumulativeUsage | null,
     stopReason: null as string | null,
+    activity: '',
+    recentActivity: [] as string[],
+    claudeToolsById: new Map<string, { name: string; summary: string }>(),
+    seenClaudeToolIds: new Set<string>(),
   };
 
   const shellCmd = cmd.map(Q).join(' ');
@@ -228,7 +232,7 @@ async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, s: any)
         }
       }
       parseLine(ev, s);
-      opts.onText(s.text, s.thinking, undefined, buildStreamPreviewMeta(s), null);
+      opts.onText(s.text, s.thinking, s.activity, buildStreamPreviewMeta(s), null);
     } catch {}
   });
 
@@ -272,7 +276,7 @@ async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, s: any)
     error,
     stopReason: s.stopReason,
     incomplete,
-    activity: null,
+    activity: s.activity.trim() || null,
   };
 }
 
@@ -439,6 +443,108 @@ function pushRecentActivity(lines: string[], line: string, maxLines = 12) {
   if (lines[lines.length - 1] === cleaned) return;
   lines.push(cleaned);
   if (lines.length > maxLines) lines.splice(0, lines.length - maxLines);
+}
+
+function firstNonEmptyLine(text: string): string {
+  for (const line of String(text || '').split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+function shortValue(value: unknown, max = 90): string {
+  const text = typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim();
+  if (!text) return '';
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+}
+
+function summarizeClaudeToolUse(name: string, input: any): string {
+  const tool = String(name || '').trim() || 'Tool';
+  const description = shortValue(input?.description, 120);
+
+  switch (tool) {
+    case 'Read': {
+      const target = shortValue(input?.file_path || input?.path, 140);
+      return target ? `Read ${target}` : 'Read file';
+    }
+    case 'Edit': {
+      const target = shortValue(input?.file_path || input?.path, 140);
+      return target ? `Edit ${target}` : 'Edit file';
+    }
+    case 'Write': {
+      const target = shortValue(input?.file_path || input?.path, 140);
+      return target ? `Write ${target}` : 'Write file';
+    }
+    case 'Glob': {
+      const pattern = shortValue(input?.pattern || input?.glob, 120);
+      return pattern ? `List files: ${pattern}` : 'List files';
+    }
+    case 'Grep': {
+      const pattern = shortValue(input?.pattern || input?.query, 120);
+      return pattern ? `Search text: ${pattern}` : 'Search text';
+    }
+    case 'WebFetch': {
+      const url = shortValue(input?.url, 120);
+      return url ? `Fetch ${url}` : 'Fetch web page';
+    }
+    case 'WebSearch': {
+      const query = shortValue(input?.query, 120);
+      return query ? `Search web: ${query}` : 'Search web';
+    }
+    case 'TodoWrite':
+      return 'Update plan';
+    case 'Task': {
+      const prompt = shortValue(input?.description || input?.prompt, 120);
+      return prompt ? `Run task: ${prompt}` : 'Run task';
+    }
+    case 'Bash': {
+      if (description) return `Run shell: ${description}`;
+      const command = shortValue(input?.command, 120);
+      return command ? `Run shell: ${command}` : 'Run shell command';
+    }
+    default: {
+      if (description) return `${tool}: ${description}`;
+      const detail = shortValue(
+        input?.file_path || input?.path || input?.command || input?.query || input?.pattern || input?.url,
+        120,
+      );
+      return detail ? `${tool}: ${detail}` : tool;
+    }
+  }
+}
+
+function summarizeClaudeToolResult(
+  tool:
+    | {
+        name: string;
+        summary: string;
+      }
+    | undefined,
+  block: any,
+  toolUseResult: any,
+): string {
+  const summary = tool?.summary || shortValue(tool?.name || 'Tool', 120) || 'Tool';
+  const isError = !!block?.is_error;
+
+  if (isError) {
+    const detail = firstNonEmptyLine(
+      toolUseResult?.stderr || toolUseResult?.stdout || block?.content || '',
+    );
+    return detail ? `${summary} failed: ${shortValue(detail, 120)}` : `${summary} failed`;
+  }
+
+  const toolName = tool?.name || '';
+  if (toolName === 'Read' || toolName === 'Edit' || toolName === 'Write' || toolName === 'TodoWrite') {
+    return `${summary} done`;
+  }
+
+  const detail = firstNonEmptyLine(
+    toolUseResult?.stdout || block?.content || toolUseResult?.stderr || '',
+  );
+  if (!detail) return `${summary} done`;
+  return `${summary} -> ${shortValue(detail, 120)}`;
 }
 
 function buildCodexActivityPreview(s: {
@@ -870,9 +976,34 @@ function claudeParse(ev: any, s: any) {
     const contents = msg.content || [];
     const th = contents.filter((b: any) => b?.type === 'thinking').map((b: any) => b.thinking || '').join('');
     const tx = contents.filter((b: any) => b?.type === 'text').map((b: any) => b.text || '').join('');
+    const toolUses = contents.filter((b: any) => b?.type === 'tool_use');
     if (th && !s.thinking.trim()) s.thinking = th;
     if (tx && !s.text.trim()) s.text = tx;
+    for (const block of toolUses) {
+      const toolId = String(block?.id || '').trim();
+      if (!toolId || s.seenClaudeToolIds.has(toolId)) continue;
+      const tool = {
+        name: String(block?.name || 'Tool').trim() || 'Tool',
+        summary: summarizeClaudeToolUse(block?.name, block?.input || {}),
+      };
+      s.seenClaudeToolIds.add(toolId);
+      s.claudeToolsById.set(toolId, tool);
+      pushRecentActivity(s.recentActivity, tool.summary);
+    }
+    s.activity = s.recentActivity.join('\n');
     s.stopReason = msg.stop_reason ?? s.stopReason;
+  }
+
+  if (t === 'user') {
+    const msg = ev.message || {};
+    const contents = Array.isArray(msg.content) ? msg.content : [];
+    const toolResults = contents.filter((b: any) => b?.type === 'tool_result');
+    for (const block of toolResults) {
+      const toolId = String(block?.tool_use_id || '').trim();
+      const tool = toolId ? s.claudeToolsById.get(toolId) : undefined;
+      pushRecentActivity(s.recentActivity, summarizeClaudeToolResult(tool, block, ev.tool_use_result));
+    }
+    s.activity = s.recentActivity.join('\n');
   }
 
   if (t === 'result') {

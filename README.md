@@ -233,7 +233,7 @@ npx codeclaw -t $BOT_TOKEN -m claude-sonnet-4-6
 | `--safe-mode` | `false` | 危险操作前要求确认 |
 | `--full-access` | `true` | 允许 Agent 无确认执行 |
 | `--allowed-ids` | — | 限制 chat/user ID |
-| `--timeout` | `900` | 单次请求最大秒数 |
+| `--timeout` | `1800` | 单次请求最大秒数 |
 
 <details>
 <summary>环境变量</summary>
