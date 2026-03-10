@@ -355,7 +355,7 @@ class TelegramChannel extends Channel {
   }
 
   private _logOutgoingPreview(action: string, meta: string, text: string) {
-    this._log(`[send] ${action} ${meta} chars=${text.length} preview="${previewText(text, 160)}"`);
+    this._log(`[send] ${action} ${meta} chars=${text.length}`);
   }
 
   private _logOutgoingFile(action: string, meta: string) {

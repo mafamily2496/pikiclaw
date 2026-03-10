@@ -372,6 +372,21 @@ describe('TelegramChannel.editMessage', () => {
     expect(apiCalls[0].payload.message_id).toBe(99);
   });
 
+  it('logs edit updates with length only', async () => {
+    const { ch } = createTestChannel();
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+
+    try {
+      await ch.editMessage(123, 99, 'Updated text');
+      const logged = writeSpy.mock.calls.map(args => String(args[0])).join('');
+      expect(logged).toContain('[send] editMessageText chat=123 msg_id=99 chars=12');
+      expect(logged).not.toContain('preview=');
+      expect(logged).not.toContain('Updated text');
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
   it('skips empty text', async () => {
     const { ch, apiCalls } = createTestChannel();
     await ch.editMessage(123, 99, '   ');
@@ -393,6 +408,21 @@ describe('TelegramChannel.sendMessageDraft', () => {
     const { ch, apiCalls } = createTestChannel();
     await ch.sendMessageDraft(123, 5, 'Partial answer', { messageThreadId: 99 });
     expect(apiCalls[0].payload.message_thread_id).toBe(99);
+  });
+
+  it('logs draft updates with length only', async () => {
+    const { ch } = createTestChannel();
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+
+    try {
+      await ch.sendMessageDraft(123, 5, 'Partial answer');
+      const logged = writeSpy.mock.calls.map(args => String(args[0])).join('');
+      expect(logged).toContain('[send] sendMessageDraft chat=123 draft_id=5 chars=14');
+      expect(logged).not.toContain('preview=');
+      expect(logged).not.toContain('Partial answer');
+    } finally {
+      writeSpy.mockRestore();
+    }
   });
 });
 
