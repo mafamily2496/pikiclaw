@@ -8,18 +8,19 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
-import { getActiveUserConfig, onUserConfigChange, resolveUserWorkdir } from './user-config.js';
+import { getActiveUserConfig, onUserConfigChange, resolveUserWorkdir, setUserWorkdir } from './user-config.js';
 import {
   doStream, getSessions, getSessionTail, getUsage, listAgents, listModels, listSkills,
   type Agent, type CodexCumulativeUsage, type StreamOpts, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult,
   type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult,
-  type SkillInfo, type SkillListResult,
+  type SkillInfo, type SkillListResult, type AgentDetectOptions,
 } from './code-agent.js';
 import { getDriver, hasDriver, allDriverIds } from './agent-driver.js';
+import { terminateProcessTree } from './process-control.js';
 
 export { type Agent, type CodexCumulativeUsage, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
 export type ChatId = number | string;
-export const VERSION = '0.2.30';
+export const VERSION = '0.2.31';
 const MACOS_USER_ACTIVITY_PULSE_INTERVAL_MS = 20_000;
 const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 
@@ -156,6 +157,24 @@ export function formatThinkingForDisplay(text: string, maxChars = 800): string {
 export function buildPrompt(text: string, files: string[]): string {
   if (!files.length) return text;
   return `${text || 'Please analyze this.'}\n\n[Files: ${files.map(f => path.basename(f)).join(', ')}]`;
+}
+
+function configModelValue(config: Record<string, any>, agent: Agent): string {
+  switch (agent) {
+    case 'claude': return String(config.claudeModel || process.env.CLAUDE_MODEL || 'claude-opus-4-6').trim();
+    case 'codex': return String(config.codexModel || process.env.CODEX_MODEL || 'gpt-5.4').trim();
+    case 'gemini': return String(config.geminiModel || process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview').trim();
+  }
+  return '';
+}
+
+function configReasoningEffortValue(config: Record<string, any>, agent: Agent): string | null {
+  switch (agent) {
+    case 'claude': return String(config.claudeReasoningEffort || process.env.CLAUDE_REASONING_EFFORT || 'high').trim().toLowerCase() || 'high';
+    case 'codex': return String(config.codexReasoningEffort || process.env.CODEX_REASONING_EFFORT || 'xhigh').trim().toLowerCase() || 'xhigh';
+    case 'gemini': return null;
+  }
+  return null;
 }
 
 interface HostBatteryData {
@@ -369,7 +388,6 @@ function getHostMemoryUsageData(totalMem: number, freeMem: number): HostMemoryUs
 export interface ChatState {
   agent: Agent;
   sessionId: string | null;
-  localSessionId?: string | null;
   workspacePath?: string | null;
   codexCumulative?: CodexCumulativeUsage;
   modelId?: string | null;
@@ -381,7 +399,6 @@ export interface SessionRuntime {
   workdir: string;
   agent: Agent;
   sessionId: string | null;
-  localSessionId: string;
   workspacePath: string | null;
   codexCumulative?: CodexCumulativeUsage;
   modelId?: string | null;
@@ -427,6 +444,7 @@ export class Bot {
   sessionStates = new Map<string, SessionRuntime>();
   activeTasks = new Map<string, RunningTask>();
   startedAt = Date.now();
+  connected = false;
   stats = { totalTurns: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCachedTokens: 0 };
 
   private keepAliveProc: ReturnType<typeof spawn> | null = null;
@@ -436,23 +454,24 @@ export class Bot {
 
   constructor() {
     this.workdir = resolveUserWorkdir();
+    const config = getActiveUserConfig();
 
     // Initialize per-agent configs
     this.agentConfigs = {
       codex: {
-        model: (process.env.CODEX_MODEL || 'gpt-5.4').trim(),
-        reasoningEffort: (process.env.CODEX_REASONING_EFFORT || 'xhigh').trim().toLowerCase(),
+        model: configModelValue(config, 'codex'),
+        reasoningEffort: configReasoningEffortValue(config, 'codex') || 'xhigh',
         fullAccess: envBool('CODEX_FULL_ACCESS', true),
         extraArgs: shellSplit(process.env.CODEX_EXTRA_ARGS || ''),
       },
       claude: {
-        model: (process.env.CLAUDE_MODEL || 'claude-opus-4-6').trim(),
-        reasoningEffort: (process.env.CLAUDE_REASONING_EFFORT || 'high').trim().toLowerCase(),
+        model: configModelValue(config, 'claude'),
+        reasoningEffort: configReasoningEffortValue(config, 'claude') || 'high',
         permissionMode: (process.env.CLAUDE_PERMISSION_MODE || 'bypassPermissions').trim(),
         extraArgs: shellSplit(process.env.CLAUDE_EXTRA_ARGS || ''),
       },
       gemini: {
-        model: (process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview').trim(),
+        model: configModelValue(config, 'gemini'),
         extraArgs: shellSplit(process.env.GEMINI_EXTRA_ARGS || ''),
       },
     };
@@ -475,8 +494,8 @@ export class Bot {
     return s;
   }
 
-  protected sessionKey(agent: Agent, localSessionId: string): string {
-    return `${agent}:${localSessionId}`;
+  protected sessionKey(agent: Agent, sessionId: string): string {
+    return `${agent}:${sessionId}`;
   }
 
   protected getSessionRuntimeByKey(sessionKey: string | null | undefined, opts: { allowAnyWorkdir?: boolean } = {}): SessionRuntime | null {
@@ -493,20 +512,19 @@ export class Bot {
 
   protected upsertSessionRuntime(session: {
     agent: Agent;
-    localSessionId: string;
-    sessionId?: string | null;
+    sessionId: string;
     workspacePath?: string | null;
     codexCumulative?: CodexCumulativeUsage;
     modelId?: string | null;
     workdir?: string;
   }): SessionRuntime {
     const workdir = path.resolve(session.workdir || this.workdir);
-    const key = this.sessionKey(session.agent, session.localSessionId);
+    const key = this.sessionKey(session.agent, session.sessionId);
     const existing = this.sessionStates.get(key);
     if (existing) {
       existing.workdir = workdir;
       existing.agent = session.agent;
-      if (session.sessionId !== undefined) existing.sessionId = session.sessionId ?? null;
+      existing.sessionId = session.sessionId;
       if (session.workspacePath !== undefined) existing.workspacePath = session.workspacePath ?? null;
       if (session.codexCumulative !== undefined) existing.codexCumulative = session.codexCumulative;
       if (session.modelId !== undefined) existing.modelId = session.modelId ?? null;
@@ -517,8 +535,7 @@ export class Bot {
       key,
       workdir,
       agent: session.agent,
-      sessionId: session.sessionId ?? null,
-      localSessionId: session.localSessionId,
+      sessionId: session.sessionId,
       workspacePath: session.workspacePath ?? null,
       codexCumulative: session.codexCumulative,
       modelId: session.modelId ?? null,
@@ -533,14 +550,12 @@ export class Bot {
     if (session) {
       cs.agent = session.agent;
       cs.sessionId = session.sessionId;
-      cs.localSessionId = session.localSessionId;
       cs.workspacePath = session.workspacePath;
       cs.codexCumulative = session.codexCumulative;
       cs.modelId = session.modelId ?? null;
       return;
     }
     cs.sessionId = null;
-    cs.localSessionId = null;
     cs.workspacePath = null;
     cs.codexCumulative = undefined;
     cs.modelId = null;
@@ -550,15 +565,14 @@ export class Bot {
     this.applySessionSelection(cs, null);
   }
 
-  protected adoptSession(cs: ChatState, session: Pick<SessionInfo, 'agent' | 'engineSessionId' | 'localSessionId' | 'workspacePath' | 'model'>) {
-    if (!session.localSessionId) {
+  protected adoptSession(cs: ChatState, session: Pick<SessionInfo, 'agent' | 'sessionId' | 'workspacePath' | 'model'>) {
+    if (!session.sessionId) {
       this.applySessionSelection(cs, null);
       return;
     }
     const runtime = this.upsertSessionRuntime({
       agent: session.agent,
-      localSessionId: session.localSessionId,
-      sessionId: session.engineSessionId ?? null,
+      sessionId: session.sessionId,
       workspacePath: session.workspacePath ?? null,
       modelId: session.model ?? null,
     });
@@ -617,6 +631,45 @@ export class Bot {
     return this.sessionChains.has(session.key);
   }
 
+  selectedSession(chatId: ChatId): SessionRuntime | null {
+    return this.getSelectedSession(this.chat(chatId));
+  }
+
+  resetConversationForChat(chatId: ChatId) {
+    this.resetChatConversation(this.chat(chatId));
+  }
+
+  adoptExistingSessionForChat(
+    chatId: ChatId,
+    session: Pick<SessionInfo, 'agent' | 'sessionId' | 'workspacePath' | 'model'>,
+  ): SessionRuntime | null {
+    const cs = this.chat(chatId);
+    this.adoptSession(cs, session);
+    return this.getSelectedSession(cs);
+  }
+
+  switchAgentForChat(chatId: ChatId, agent: Agent): boolean {
+    const cs = this.chat(chatId);
+    if (cs.agent === agent) return false;
+    cs.agent = agent;
+    this.resetChatConversation(cs);
+    this.log(`agent switched to ${agent} chat=${chatId}`);
+    return true;
+  }
+
+  switchModelForChat(chatId: ChatId, modelId: string) {
+    const cs = this.chat(chatId);
+    this.setModelForAgent(cs.agent, modelId);
+    this.resetChatConversation(cs);
+    this.log(`model switched to ${modelId} for ${cs.agent} chat=${chatId}`);
+  }
+
+  switchEffortForChat(chatId: ChatId, effort: string) {
+    const cs = this.chat(chatId);
+    this.setEffortForAgent(cs.agent, effort);
+    this.log(`effort switched to ${effort} for ${cs.agent} chat=${chatId}`);
+  }
+
   modelForAgent(agent: Agent): string {
     return this.agentConfigs[agent]?.model || '';
   }
@@ -629,8 +682,8 @@ export class Bot {
     return getSessionTail({ agent, sessionId, workdir: this.workdir, limit });
   }
 
-  fetchAgents() {
-    return listAgents();
+  fetchAgents(options: AgentDetectOptions = {}) {
+    return listAgents(options);
   }
 
   fetchSkills() {
@@ -646,7 +699,7 @@ export class Bot {
     const prev = this.defaultAgent;
     this.defaultAgent = next;
     for (const [, cs] of this.chats) {
-      if (cs.activeSessionKey || cs.localSessionId || cs.sessionId) continue;
+      if (cs.activeSessionKey || cs.sessionId) continue;
       if (cs.agent === prev) cs.agent = next;
     }
     this.log(`default agent changed to ${next}`);
@@ -681,7 +734,7 @@ export class Bot {
       version: VERSION, uptime: Date.now() - this.startedAt,
       memRss: mem.rss, memHeap: mem.heapUsed, pid: process.pid,
       workdir: this.workdir, agent: cs.agent, model, sessionId: cs.sessionId,
-      localSessionId: cs.localSessionId ?? null, workspacePath: cs.workspacePath ?? null,
+      workspacePath: cs.workspacePath ?? null,
       running: fallbackTask, activeTasksCount: this.activeTasks.size, stats: this.stats,
       usage: getUsage({ agent: cs.agent, model }),
     };
@@ -713,11 +766,15 @@ export class Bot {
     };
   }
 
-  switchWorkdir(newPath: string) {
+  switchWorkdir(newPath: string, opts: { persist?: boolean } = {}) {
     const old = this.workdir;
     const resolvedPath = path.resolve(newPath.replace(/^~/, process.env.HOME || ''));
+    if (opts.persist !== false) {
+      setUserWorkdir(resolvedPath, { notify: false });
+    } else {
+      process.env.CODECLAW_WORKDIR = resolvedPath;
+    }
     this.workdir = resolvedPath;
-    process.env.CODECLAW_WORKDIR = resolvedPath;
     for (const [, cs] of this.chats) {
       this.resetChatConversation(cs);
     }
@@ -740,29 +797,43 @@ export class Bot {
       this.workdir = nextWorkdir;
       ensureGitignore(this.workdir);
     } else if (nextWorkdir !== this.workdir) {
-      this.switchWorkdir(nextWorkdir);
+      this.switchWorkdir(nextWorkdir, { persist: false });
     }
 
     const nextDefaultAgent = normalizeAgent(String(config.defaultAgent || 'codex').trim().toLowerCase() || 'codex');
     if (opts.initial) this.defaultAgent = nextDefaultAgent;
     else if (nextDefaultAgent !== this.defaultAgent) this.setDefaultAgent(nextDefaultAgent);
 
+    for (const agent of ['claude', 'codex', 'gemini'] as Agent[]) {
+      const nextModel = configModelValue(config, agent);
+      if (nextModel && this.modelForAgent(agent) !== nextModel) {
+        if (opts.initial) this.agentConfigs[agent].model = nextModel;
+        else this.setModelForAgent(agent, nextModel);
+      }
+
+      const nextEffort = configReasoningEffortValue(config, agent);
+      if (nextEffort && agent !== 'gemini' && this.effortForAgent(agent) !== nextEffort) {
+        if (opts.initial) this.agentConfigs[agent].reasoningEffort = nextEffort;
+        else this.setEffortForAgent(agent, nextEffort);
+      }
+    }
+
     if (!opts.initial) this.onManagedConfigChange(config, opts);
   }
 
   async runStream(
-    prompt: string, cs: Pick<SessionRuntime, 'key' | 'agent' | 'sessionId' | 'localSessionId' | 'workspacePath' | 'codexCumulative' | 'modelId'> | ChatState, attachments: string[],
+    prompt: string, cs: Pick<SessionRuntime, 'key' | 'agent' | 'sessionId' | 'workspacePath' | 'codexCumulative' | 'modelId'> | ChatState, attachments: string[],
     onText: (text: string, thinking: string, activity?: string, meta?: StreamPreviewMeta, plan?: StreamPreviewPlan | null) => void,
     systemPrompt?: string,
   ): Promise<StreamResult> {
     const resolvedModel = cs.modelId || this.modelForAgent(cs.agent);
     const agentConfig = this.agentConfigs[cs.agent] || {};
     const extraArgs: string[] = agentConfig.extraArgs || [];
-    this.log(`[runStream] agent=${cs.agent} session=${cs.sessionId || '(new)'} local_session=${cs.localSessionId || '(new)'} workdir=${this.workdir} timeout=${this.runTimeout}s attachments=${attachments.length}`);
+    this.log(`[runStream] agent=${cs.agent} session=${cs.sessionId || '(new)'} workdir=${this.workdir} timeout=${this.runTimeout}s attachments=${attachments.length}`);
     this.log(`[runStream] ${cs.agent} config: model=${resolvedModel} extraArgs=[${extraArgs.join(' ')}]`);
     const opts: StreamOpts = {
       agent: cs.agent, prompt, workdir: this.workdir, timeout: this.runTimeout,
-      sessionId: cs.sessionId, localSessionId: cs.localSessionId ?? null, model: null,
+      sessionId: cs.sessionId, model: null,
       thinkingEffort: agentConfig.reasoningEffort || 'high', onText,
       attachments: attachments.length ? attachments : undefined,
       // codex-specific
@@ -787,11 +858,21 @@ export class Bot {
     if (result.cachedInputTokens) this.stats.totalCachedTokens += result.cachedInputTokens;
     if (result.codexCumulative) cs.codexCumulative = result.codexCumulative;
     if (result.sessionId) cs.sessionId = result.sessionId;
-    if (result.localSessionId) cs.localSessionId = result.localSessionId;
     if (result.workspacePath) cs.workspacePath = result.workspacePath;
     if (result.model) cs.modelId = result.model;
     if ('key' in cs && typeof cs.key === 'string') {
+      // If session was promoted from pending, update the runtime key
       const runtime = this.getSessionRuntimeByKey(cs.key, { allowAnyWorkdir: true });
+      if (runtime && result.sessionId && runtime.sessionId !== result.sessionId) {
+        this.sessionStates.delete(runtime.key);
+        runtime.sessionId = result.sessionId;
+        runtime.key = this.sessionKey(runtime.agent, result.sessionId);
+        this.sessionStates.set(runtime.key, runtime);
+        // Update all chats pointing to the old key
+        for (const [, chatState] of this.chats) {
+          if (chatState.activeSessionKey === cs.key) chatState.activeSessionKey = runtime.key;
+        }
+      }
       if (runtime) this.syncSelectedChats(runtime);
     }
     this.log(`[runStream] completed turn=${this.stats.totalTurns} cumulative: in=${fmtTokens(this.stats.totalInputTokens)} out=${fmtTokens(this.stats.totalOutputTokens)} cached=${fmtTokens(this.stats.totalCachedTokens)}`);
@@ -837,7 +918,7 @@ export class Bot {
       this.keepAlivePulseTimer = null;
     }
     if (this.keepAliveProc) {
-      try { this.keepAliveProc.kill('SIGTERM'); } catch {}
+      terminateProcessTree(this.keepAliveProc, { signal: 'SIGTERM', forceSignal: 'SIGKILL', forceAfterMs: 2000 });
       this.keepAliveProc = null;
     }
   }

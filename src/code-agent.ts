@@ -11,6 +11,7 @@ import { createInterface } from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import { getDriver, allDrivers, shutdownAllDrivers, hasDriver } from './agent-driver.js';
+import { terminateProcessTree } from './process-control.js';
 export { type AgentDriver, registerDriver, getDriver, allDrivers, allDriverIds, hasDriver, shutdownAllDrivers } from './agent-driver.js';
 
 // Load all drivers (side-effect: each calls registerDriver)
@@ -28,6 +29,12 @@ export { doGeminiStream } from './driver-gemini.js';
 // ---------------------------------------------------------------------------
 
 export type Agent = string;
+
+export interface AgentDetectOptions {
+  includeVersion?: boolean;
+  refresh?: boolean;
+  versionTimeoutMs?: number;
+}
 
 export interface CodexCumulativeUsage {
   input: number;
@@ -57,7 +64,6 @@ export interface StreamOpts {
   prompt: string;
   workdir: string;
   timeout: number;
-  localSessionId?: string | null;
   sessionId: string | null;
   model: string | null;
   thinkingEffort: string;
@@ -92,7 +98,6 @@ export interface StreamResult {
   ok: boolean;
   message: string;
   thinking: string | null;
-  localSessionId: string | null;
   sessionId: string | null;
   workspacePath: string | null;
   model: string | null;
@@ -127,6 +132,18 @@ export interface BotArtifact {
 // ---------------------------------------------------------------------------
 
 export const Q = (a: string) => /[^a-zA-Z0-9_./:=@-]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a;
+
+const AGENT_DETECT_TTL_MS = 1_000;
+const AGENT_VERSION_TTL_MS = 5 * 60_000;
+const AGENT_VERSION_TIMEOUT_MS = 900;
+
+interface AgentDetectCacheEntry {
+  detectedAt: number;
+  versionAt: number;
+  info: AgentInfo;
+}
+
+const agentDetectCache = new Map<string, AgentDetectCacheEntry>();
 
 export function agentLog(msg: string) {
   const ts = new Date().toTimeString().slice(0, 8);
@@ -353,15 +370,109 @@ export function emptyUsage(agent: Agent, error: string): UsageResult {
   return { ok: false, agent, source: null, capturedAt: null, status: null, windows: [], error };
 }
 
-// Agent detection (used by all drivers)
-export function detectAgentBin(cmd: string, agent: string): AgentInfo {
-  let binPath: string | null = null;
-  try { binPath = execSync(`which ${cmd} 2>/dev/null`, { encoding: 'utf-8' }).trim() || null; } catch {}
-  let version: string | null = null;
-  if (binPath) {
-    try { version = execSync(`${cmd} --version 2>/dev/null`, { encoding: 'utf-8' }).trim().split('\n')[0] || null; } catch {}
+function isExecutableFile(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    if (process.platform === 'win32') return true;
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
   }
-  return { agent, installed: !!binPath, path: binPath, version };
+}
+
+function executableCandidates(cmd: string): string[] {
+  if (process.platform !== 'win32') return [cmd];
+  const ext = path.extname(cmd).toLowerCase();
+  if (ext) return [cmd];
+  const pathExt = (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .map(value => value.trim())
+    .filter(Boolean);
+  return [cmd, ...pathExt.map(value => `${cmd}${value.toLowerCase()}`)];
+}
+
+function resolveAgentBinPath(cmd: string): string | null {
+  const raw = String(cmd || '').trim();
+  if (!raw) return null;
+
+  const hasPathSeparator = raw.includes('/') || raw.includes('\\');
+  if (hasPathSeparator) {
+    const absolutePath = path.resolve(raw);
+    for (const candidate of executableCandidates(absolutePath)) {
+      if (isExecutableFile(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  const searchPaths = String(process.env.PATH || '')
+    .split(path.delimiter)
+    .map(entry => entry.trim())
+    .filter(Boolean);
+
+  for (const dir of searchPaths) {
+    for (const candidate of executableCandidates(path.join(dir, raw))) {
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function readAgentVersion(binPath: string, timeoutMs: number): string | null {
+  try {
+    return execSync(`${Q(binPath)} --version 2>/dev/null`, {
+      encoding: 'utf-8',
+      timeout: Math.max(250, timeoutMs),
+    }).trim().split('\n')[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+// Agent detection (used by all drivers)
+export function detectAgentBin(cmd: string, agent: string, options: AgentDetectOptions = {}): AgentInfo {
+  const cacheKey = `${agent}:${cmd}`;
+  const now = Date.now();
+  const includeVersion = !!options.includeVersion;
+  const refresh = !!options.refresh;
+  const versionTimeoutMs = options.versionTimeoutMs ?? AGENT_VERSION_TIMEOUT_MS;
+  let entry = agentDetectCache.get(cacheKey) || null;
+
+  const shouldRefreshBase = refresh || !entry || now - entry.detectedAt > AGENT_DETECT_TTL_MS;
+  if (shouldRefreshBase) {
+    const binPath = resolveAgentBinPath(cmd);
+    const previousVersion = entry?.info.path === binPath ? entry.info.version ?? null : null;
+    const previousVersionAt = entry?.info.path === binPath ? entry.versionAt : 0;
+    entry = {
+      detectedAt: now,
+      versionAt: previousVersionAt,
+      info: {
+        agent,
+        installed: !!binPath,
+        path: binPath,
+        version: previousVersion,
+      },
+    };
+    agentDetectCache.set(cacheKey, entry);
+  }
+
+  if (!entry) {
+    return { agent, installed: false, path: null, version: null };
+  }
+
+  if (
+    includeVersion
+    && entry.info.installed
+    && entry.info.path
+    && (refresh || !entry.versionAt || now - entry.versionAt > AGENT_VERSION_TTL_MS)
+  ) {
+    entry.info.version = readAgentVersion(entry.info.path, versionTimeoutMs);
+    entry.versionAt = now;
+    agentDetectCache.set(cacheKey, entry);
+  }
+
+  return { ...entry.info };
 }
 
 // Session tail helpers (used by drivers)
@@ -391,10 +502,9 @@ export function stripInjectedPrompts(text: string): string {
 // ---------------------------------------------------------------------------
 
 interface LocalSessionRecord {
-  localSessionId: string;
+  sessionId: string;
   agent: Agent;
   workdir: string;
-  engineSessionId: string | null;
   workspacePath: string;
   createdAt: string;
   updatedAt: string;
@@ -411,13 +521,12 @@ interface SessionIndexData {
 interface EnsureSessionWorkspaceOpts {
   agent: Agent;
   workdir: string;
-  localSessionId?: string | null;
   sessionId?: string | null;
   title?: string | null;
 }
 
 interface SessionWorkspaceInfo {
-  localSessionId: string;
+  sessionId: string;
   workspacePath: string;
   manifestPath: string;
   record: LocalSessionRecord;
@@ -435,9 +544,9 @@ const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
 const ARTIFACT_PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 
 function sessionIndexPath(workdir: string): string { return path.join(workdir, CODECLAW_SESSION_INDEX); }
-function sessionDirPath(workdir: string, agent: Agent, localSessionId: string): string { return path.join(workdir, CODECLAW_SESSIONS_DIR, agent, localSessionId); }
-function legacySessionWorkspacePath(workdir: string, agent: Agent, localSessionId: string): string { return path.join(workdir, CODECLAW_LEGACY_WORKSPACES_DIR, agent, localSessionId); }
-function sessionWorkspacePath(workdir: string, agent: Agent, localSessionId: string): string { return path.join(sessionDirPath(workdir, agent, localSessionId), SESSION_WORKSPACE_DIR); }
+function sessionDirPath(workdir: string, agent: Agent, sessionId: string): string { return path.join(workdir, CODECLAW_SESSIONS_DIR, agent, sessionId); }
+function legacySessionWorkspacePath(workdir: string, agent: Agent, sessionId: string): string { return path.join(workdir, CODECLAW_LEGACY_WORKSPACES_DIR, agent, sessionId); }
+function sessionWorkspacePath(workdir: string, agent: Agent, sessionId: string): string { return path.join(sessionDirPath(workdir, agent, sessionId), SESSION_WORKSPACE_DIR); }
 function sessionRootFromWorkspacePath(workspacePath: string): string {
   const resolved = path.resolve(workspacePath);
   return path.basename(resolved) === SESSION_WORKSPACE_DIR ? path.dirname(resolved) : resolved;
@@ -447,16 +556,26 @@ function sessionMetaPath(workspacePath: string): string { return path.join(sessi
 function legacySessionMetaPath(workspacePath: string): string { return path.join(workspacePath, CODECLAW_DIR, SESSION_META_FILE); }
 function legacySessionManifestPath(workspacePath: string): string { return path.join(workspacePath, CODECLAW_DIR, SESSION_RETURN_MANIFEST); }
 
+/** Generate a temporary session ID for new sessions before the agent assigns one. */
+function nextPendingSessionId(): string { return `pending_${crypto.randomBytes(6).toString('hex')}`; }
+
+export function isPendingSessionId(sessionId: string | null | undefined): boolean {
+  return typeof sessionId === 'string' && sessionId.startsWith('pending_');
+}
+
 function normalizeSessionRecord(raw: any, workdir: string): LocalSessionRecord | null {
-  const localSessionId = typeof raw?.localSessionId === 'string' ? raw.localSessionId.trim() : '';
+  // Support both new format (sessionId) and legacy format (localSessionId + engineSessionId)
+  const sessionId = typeof raw?.sessionId === 'string' ? raw.sessionId.trim()
+    : typeof raw?.engineSessionId === 'string' && raw.engineSessionId.trim() ? raw.engineSessionId.trim()
+    : typeof raw?.localSessionId === 'string' ? raw.localSessionId.trim()
+    : '';
   const agent = typeof raw?.agent === 'string' ? raw.agent.trim() : null;
-  if (!localSessionId || !agent) return null;
+  if (!sessionId || !agent) return null;
   const workspacePath = typeof raw?.workspacePath === 'string' && raw.workspacePath.trim()
     ? path.resolve(raw.workspacePath)
-    : sessionWorkspacePath(workdir, agent, localSessionId);
+    : sessionWorkspacePath(workdir, agent, sessionId);
   return {
-    localSessionId, agent, workdir,
-    engineSessionId: typeof raw?.engineSessionId === 'string' && raw.engineSessionId.trim() ? raw.engineSessionId.trim() : null,
+    sessionId, agent, workdir,
     workspacePath,
     createdAt: typeof raw?.createdAt === 'string' && raw.createdAt.trim() ? raw.createdAt : new Date().toISOString(),
     updatedAt: typeof raw?.updatedAt === 'string' && raw.updatedAt.trim() ? raw.updatedAt : new Date().toISOString(),
@@ -479,8 +598,8 @@ function loadSessionIndex(workdir: string): SessionIndexData {
 
 function writeSessionMeta(record: LocalSessionRecord) {
   writeJsonFile(sessionMetaPath(record.workspacePath), {
-    localSessionId: record.localSessionId, agent: record.agent, workdir: record.workdir,
-    engineSessionId: record.engineSessionId, workspacePath: record.workspacePath,
+    sessionId: record.sessionId, agent: record.agent, workdir: record.workdir,
+    workspacePath: record.workspacePath,
     createdAt: record.createdAt, updatedAt: record.updatedAt,
     title: record.title, model: record.model, stagedFiles: record.stagedFiles,
     returnManifestPath: sessionManifestPath(record.workspacePath),
@@ -495,11 +614,11 @@ function copyPath(sourcePath: string, targetPath: string) {
 }
 
 function migrateSessionLayout(workdir: string, record: LocalSessionRecord): LocalSessionRecord {
-  const targetSessionDir = sessionDirPath(workdir, record.agent, record.localSessionId);
-  const targetWorkspacePath = sessionWorkspacePath(workdir, record.agent, record.localSessionId);
+  const targetSessionDir = sessionDirPath(workdir, record.agent, record.sessionId);
+  const targetWorkspacePath = sessionWorkspacePath(workdir, record.agent, record.sessionId);
   const targetManifestPath = sessionManifestPath(targetWorkspacePath);
   const currentWorkspacePath = path.resolve(record.workspacePath || targetWorkspacePath);
-  const legacyWp = path.resolve(legacySessionWorkspacePath(workdir, record.agent, record.localSessionId));
+  const legacyWp = path.resolve(legacySessionWorkspacePath(workdir, record.agent, record.sessionId));
 
   ensureDir(targetSessionDir);
   ensureDir(targetWorkspacePath);
@@ -523,11 +642,11 @@ function migrateSessionLayout(workdir: string, record: LocalSessionRecord): Loca
 
 function saveSessionRecord(workdir: string, record: LocalSessionRecord): LocalSessionRecord {
   record = migrateSessionLayout(workdir, record);
-  ensureDir(sessionDirPath(workdir, record.agent, record.localSessionId));
+  ensureDir(sessionDirPath(workdir, record.agent, record.sessionId));
   ensureDir(record.workspacePath);
   const index = loadSessionIndex(workdir);
   record.updatedAt = new Date().toISOString();
-  const pos = index.sessions.findIndex(entry => entry.localSessionId === record.localSessionId);
+  const pos = index.sessions.findIndex(entry => entry.sessionId === record.sessionId);
   if (pos >= 0) index.sessions[pos] = record;
   else index.sessions.unshift(record);
   index.sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
@@ -536,7 +655,29 @@ function saveSessionRecord(workdir: string, record: LocalSessionRecord): LocalSe
   return record;
 }
 
-function nextLocalSessionId(): string { return `sess_${crypto.randomBytes(6).toString('hex')}`; }
+/**
+ * Promote a pending session to a real session ID. Renames the workspace directory
+ * and updates the index. Called after the first stream returns the agent's native ID.
+ */
+export function promoteSessionId(workdir: string, agent: Agent, pendingId: string, nativeId: string): void {
+  if (!isPendingSessionId(pendingId) || !nativeId.trim()) return;
+  const resolvedWorkdir = path.resolve(workdir);
+  const index = loadSessionIndex(resolvedWorkdir);
+  const record = index.sessions.find(entry => entry.sessionId === pendingId && entry.agent === agent);
+  if (!record) return;
+
+  const oldDir = sessionDirPath(resolvedWorkdir, agent, pendingId);
+  const newDir = sessionDirPath(resolvedWorkdir, agent, nativeId);
+
+  // Move workspace directory if it exists
+  if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) {
+    try { fs.renameSync(oldDir, newDir); } catch { /* cross-device: copy+delete */ try { fs.cpSync(oldDir, newDir, { recursive: true }); fs.rmSync(oldDir, { recursive: true, force: true }); } catch {} }
+  }
+
+  record.sessionId = nativeId;
+  record.workspacePath = sessionWorkspacePath(resolvedWorkdir, agent, nativeId);
+  saveSessionRecord(resolvedWorkdir, record);
+}
 
 function summarizePromptTitle(prompt: string | null | undefined): string | null {
   const text = String(prompt || '').replace(/\s+/g, ' ').trim();
@@ -580,24 +721,21 @@ function importFilesIntoWorkspace(workspacePath: string, files: string[]): strin
 function ensureSessionWorkspace(opts: EnsureSessionWorkspaceOpts): SessionWorkspaceInfo {
   const workdir = path.resolve(opts.workdir);
   const index = loadSessionIndex(workdir);
-  let record = index.sessions.find(entry => entry.agent === opts.agent && opts.localSessionId && entry.localSessionId === opts.localSessionId)
-    || index.sessions.find(entry => entry.agent === opts.agent && opts.sessionId && entry.engineSessionId === opts.sessionId)
+  let record = index.sessions.find(entry => entry.agent === opts.agent && opts.sessionId && entry.sessionId === opts.sessionId)
     || null;
   if (!record) {
-    const localSessionId = opts.localSessionId?.trim() || nextLocalSessionId();
+    const sessionId = opts.sessionId?.trim() || nextPendingSessionId();
     record = {
-      localSessionId, agent: opts.agent, workdir,
-      engineSessionId: opts.sessionId?.trim() || null,
-      workspacePath: sessionWorkspacePath(workdir, opts.agent, localSessionId),
+      sessionId, agent: opts.agent, workdir,
+      workspacePath: sessionWorkspacePath(workdir, opts.agent, sessionId),
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       title: summarizePromptTitle(opts.title) || null, model: null, stagedFiles: [],
     };
   }
-  if (!record.engineSessionId && opts.sessionId?.trim()) record.engineSessionId = opts.sessionId.trim();
   if (!record.title && opts.title) record.title = summarizePromptTitle(opts.title);
   record.workspacePath = path.resolve(record.workspacePath);
   saveSessionRecord(workdir, record);
-  return { localSessionId: record.localSessionId, workspacePath: record.workspacePath, manifestPath: sessionManifestPath(record.workspacePath), record };
+  return { sessionId: record.sessionId, workspacePath: record.workspacePath, manifestPath: sessionManifestPath(record.workspacePath), record };
 }
 
 // Exported for drivers
@@ -608,8 +746,8 @@ export function listCodeclawSessions(workdir: string, agent: Agent, limit?: numb
   return typeof limit === 'number' ? records.slice(0, limit) : records;
 }
 
-export function findCodeclawSessionByLocalId(workdir: string, agent: Agent, localSessionId: string): LocalSessionRecord | null {
-  return listCodeclawSessions(workdir, agent).find(entry => entry.localSessionId === localSessionId) || null;
+export function findCodeclawSession(workdir: string, agent: Agent, sessionId: string): LocalSessionRecord | null {
+  return listCodeclawSessions(workdir, agent).find(entry => entry.sessionId === sessionId) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -679,27 +817,26 @@ export function buildArtifactPrompt(prompt: string, workspacePath: string, manif
 }
 
 export function stageSessionFiles(opts: StageSessionFilesOpts): StageSessionFilesResult {
-  const session = ensureSessionWorkspace({ agent: opts.agent, workdir: opts.workdir, localSessionId: opts.localSessionId, sessionId: opts.sessionId, title: opts.title });
+  const session = ensureSessionWorkspace({ agent: opts.agent, workdir: opts.workdir, sessionId: opts.sessionId, title: opts.title });
   const importedFiles = importFilesIntoWorkspace(session.workspacePath, opts.files);
   if (importedFiles.length) {
     session.record.stagedFiles = dedupeStrings([...session.record.stagedFiles, ...importedFiles]);
     if (!session.record.title) session.record.title = importedFiles[0];
     saveSessionRecord(opts.workdir, session.record);
   }
-  return { localSessionId: session.localSessionId, workspacePath: session.workspacePath, importedFiles };
+  return { sessionId: session.sessionId, workspacePath: session.workspacePath, importedFiles };
 }
 
 export interface StageSessionFilesOpts {
   agent: Agent;
   workdir: string;
   files: string[];
-  localSessionId?: string | null;
   sessionId?: string | null;
   title?: string | null;
 }
 
 export interface StageSessionFilesResult {
-  localSessionId: string;
+  sessionId: string;
   workspacePath: string;
   importedFiles: string[];
 }
@@ -731,14 +868,25 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
   agentLog(`[spawn] cwd: ${opts.workdir} timeout: ${opts.timeout}s session: ${opts.sessionId || '(new)'}`);
   agentLog(`[spawn] prompt: "${opts.prompt.slice(0, 120)}"`);
 
-  const proc = spawn(shellCmd, { cwd: opts.workdir, stdio: ['pipe', 'pipe', 'pipe'], shell: true });
+  const proc = spawn(shellCmd, {
+    cwd: opts.workdir,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    shell: true,
+    detached: process.platform !== 'win32',
+  });
   agentLog(`[spawn] pid=${proc.pid}`);
   try { proc.stdin!.write(opts._stdinOverride ?? opts.prompt); proc.stdin!.end(); } catch {}
   proc.stderr?.on('data', (c: Buffer) => { const chunk = c.toString(); stderr += chunk; agentLog(`[stderr] ${chunk.trim().slice(0, 200)}`); });
 
   const rl = createInterface({ input: proc.stdout!, crlfDelay: Infinity });
   rl.on('line', raw => {
-    if (Date.now() > deadline) { timedOut = true; s.stopReason = 'timeout'; agentLog(`[timeout] deadline exceeded, killing process`); proc.kill('SIGKILL'); return; }
+    if (Date.now() > deadline) {
+      timedOut = true;
+      s.stopReason = 'timeout';
+      agentLog(`[timeout] deadline exceeded, killing process tree`);
+      terminateProcessTree(proc, { signal: 'SIGKILL' });
+      return;
+    }
     const line = raw.trim();
     if (!line || line[0] !== '{') return;
     lineCount++;
@@ -759,9 +907,8 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
 
   const hardTimer = setTimeout(() => {
     timedOut = true; s.stopReason = 'timeout';
-    agentLog(`[timeout] hard deadline reached (${opts.timeout}s), killing process pid=${proc.pid}`);
-    try { proc.kill('SIGTERM'); } catch {}
-    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+    agentLog(`[timeout] hard deadline reached (${opts.timeout}s), killing process tree pid=${proc.pid}`);
+    terminateProcessTree(proc, { signal: 'SIGTERM', forceSignal: 'SIGKILL', forceAfterMs: 5000 });
   }, opts.timeout * 1000 + 10_000);
 
   const [procOk, code] = await new Promise<[boolean, number | null]>(resolve => {
@@ -784,7 +931,7 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
   if (stderr.trim() && !procOk) agentLog(`[result] stderr: ${stderr.trim().slice(0, 300)}`);
 
   return {
-    ok, localSessionId: opts.localSessionId ?? null, sessionId: s.sessionId, workspacePath: null,
+    ok, sessionId: s.sessionId, workspacePath: null,
     model: s.model, thinkingEffort: s.thinkingEffort,
     message: s.text.trim() || s.errors?.join('; ') || (procOk ? '(no textual response)' : `Failed (exit=${code}).\n\n${stderr.trim() || '(no output)'}`),
     thinking: s.thinking.trim() || null,
@@ -801,7 +948,7 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
 // ---------------------------------------------------------------------------
 
 function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: SessionWorkspaceInfo; attachments: string[] } {
-  const session = ensureSessionWorkspace({ agent: opts.agent, workdir: opts.workdir, localSessionId: opts.localSessionId, sessionId: opts.sessionId, title: opts.prompt });
+  const session = ensureSessionWorkspace({ agent: opts.agent, workdir: opts.workdir, sessionId: opts.sessionId, title: opts.prompt });
   const importedFiles = importFilesIntoWorkspace(session.workspacePath, opts.attachments || []);
   const attachmentRelPaths = dedupeStrings([...session.record.stagedFiles, ...importedFiles]);
   session.record.stagedFiles = [];
@@ -816,12 +963,15 @@ function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: S
     ? buildArtifactPrompt(opts.prompt, session.workspacePath, session.manifestPath)
     : opts.prompt;
 
+  // For pending sessions, pass null sessionId to the CLI so it creates a new session
+  const effectiveSessionId = isPendingSessionId(session.sessionId) ? null : session.sessionId;
+
   return {
     session,
     attachments: attachmentPaths,
     prepared: {
       ...opts,
-      localSessionId: session.localSessionId,
+      sessionId: effectiveSessionId,
       prompt,
       attachments: attachmentPaths.length ? attachmentPaths : undefined,
       codexDeveloperInstructions: appendSystemPrompt(opts.codexDeveloperInstructions, artifactSystemPrompt),
@@ -833,12 +983,18 @@ function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: S
 }
 
 function finalizeStreamResult(result: StreamResult, workdir: string, prompt: string, session: SessionWorkspaceInfo): StreamResult {
-  session.record.engineSessionId = result.sessionId || session.record.engineSessionId;
+  // If the agent returned a native session ID and our session was pending, promote it
+  const pendingId = session.sessionId;
+  if (result.sessionId && isPendingSessionId(pendingId)) {
+    promoteSessionId(workdir, session.record.agent, pendingId, result.sessionId);
+    session.sessionId = result.sessionId;
+  }
+  session.record.sessionId = result.sessionId || session.record.sessionId;
   session.record.model = result.model || session.record.model;
   if (!session.record.title) session.record.title = summarizePromptTitle(prompt);
   saveSessionRecord(workdir, session.record);
   const artifacts = collectArtifacts(session.workspacePath, session.manifestPath, msg => agentLog(msg));
-  return { ...result, localSessionId: session.localSessionId, workspacePath: session.workspacePath, artifacts };
+  return { ...result, sessionId: session.sessionId, workspacePath: session.workspacePath, artifacts };
 }
 
 export async function doStream(opts: StreamOpts): Promise<StreamResult> {
@@ -851,7 +1007,7 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
   } catch (e: any) {
     const message = e?.message || String(e);
     return {
-      ok: false, message, thinking: null, localSessionId: opts.localSessionId ?? null,
+      ok: false, message, thinking: null,
       sessionId: opts.sessionId, workspacePath: null, model: opts.model, thinkingEffort: opts.thinkingEffort,
       elapsedS: 0, inputTokens: null, outputTokens: null, cachedInputTokens: null,
       cacheCreationInputTokens: null, contextWindow: null, contextUsedTokens: null, contextPercent: null,
@@ -870,8 +1026,6 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
 
 export interface SessionInfo {
   sessionId: string | null;
-  localSessionId: string | null;
-  engineSessionId: string | null;
   agent: Agent;
   workdir: string | null;
   workspacePath: string | null;
@@ -894,7 +1048,12 @@ export interface SessionListOpts {
 }
 
 export function getSessions(opts: SessionListOpts): Promise<SessionListResult> {
-  return getDriver(opts.agent).getSessions(opts.workdir, opts.limit);
+  const workdir = path.resolve(opts.workdir);
+  agentLog(`[sessions] request agent=${opts.agent} workdir=${workdir} limit=${opts.limit ?? 'all'}`);
+  return getDriver(opts.agent).getSessions(workdir, opts.limit).then(result => {
+    agentLog(`[sessions] result agent=${opts.agent} ok=${result.ok} count=${result.sessions.length} error=${result.error || '(none)'}`);
+    return result;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +1092,8 @@ export interface AgentInfo {
 
 export interface AgentListResult { agents: AgentInfo[]; }
 
-export function listAgents(): AgentListResult {
-  return { agents: allDrivers().map(d => d.detect()) };
+export function listAgents(options: AgentDetectOptions = {}): AgentListResult {
+  return { agents: allDrivers().map(d => detectAgentBin(d.cmd, d.id, options)) };
 }
 
 // ---------------------------------------------------------------------------

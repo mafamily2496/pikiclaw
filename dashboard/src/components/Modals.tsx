@@ -3,7 +3,7 @@ import { useStore } from '../store';
 import { createT } from '../i18n';
 import { api } from '../api';
 import { Modal, ModalHeader, Button, Input, Label, Badge } from './ui';
-import { fmtTime } from '../utils';
+import { fmtTime, getAgentMeta } from '../utils';
 import type { SessionInfo, SessionTailMessage, DirEntry } from '../types';
 
 function isAbortError(error: unknown): boolean {
@@ -31,10 +31,13 @@ export function TelegramModal({ open, onClose }: { open: boolean; onClose: () =>
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const requestRef = useRef<AbortController | null>(null);
 
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
   useEffect(() => {
     if (open) {
-      setToken(state?.config.telegramBotToken || '');
-      setIds(state?.config.telegramAllowedChatIds || '');
+      setToken(stateRef.current?.config.telegramBotToken || '');
+      setIds(stateRef.current?.config.telegramAllowedChatIds || '');
       setShowToken(false);
       setResult(null);
     } else {
@@ -42,7 +45,7 @@ export function TelegramModal({ open, onClose }: { open: boolean; onClose: () =>
       requestRef.current = null;
       setSaving(false);
     }
-  }, [open, state]);
+  }, [open]);
 
   useEffect(() => () => {
     requestRef.current?.abort();
@@ -159,17 +162,20 @@ export function FeishuModal({ open, onClose }: { open: boolean; onClose: () => v
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const requestRef = useRef<AbortController | null>(null);
 
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
   useEffect(() => {
     if (open) {
-      setAppId(state?.config.feishuAppId || '');
-      setSecret(state?.config.feishuAppSecret || '');
+      setAppId(stateRef.current?.config.feishuAppId || '');
+      setSecret(stateRef.current?.config.feishuAppSecret || '');
       setResult(null);
     } else {
       requestRef.current?.abort();
       requestRef.current = null;
       setSaving(false);
     }
-  }, [open, state]);
+  }, [open]);
 
   useEffect(() => () => {
     requestRef.current?.abort();
@@ -268,6 +274,7 @@ export function FeishuModal({ open, onClose }: { open: boolean; onClose: () => v
 export function WorkdirModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { state, toast, reload, locale } = useStore();
   const t = createT(locale);
+  const runtimeWorkdir = state?.bot?.workdir || state?.runtimeWorkdir || '';
   const [currentPath, setCurrentPath] = useState('');
   const [inputPath, setInputPath] = useState('');
   const [dirs, setDirs] = useState<DirEntry[]>([]);
@@ -297,10 +304,9 @@ export function WorkdirModal({ open, onClose }: { open: boolean; onClose: () => 
 
   useEffect(() => {
     if (open) {
-      const cur = state?.bot?.workdir || state?.runtimeWorkdir || '';
-      browse(cur || undefined);
+      browse(runtimeWorkdir || undefined);
     }
-  }, [open, state, browse]);
+  }, [open, runtimeWorkdir, browse]);
 
   const handleConfirm = async () => {
     const p = inputPath.trim() || currentPath;
@@ -315,7 +321,14 @@ export function WorkdirModal({ open, onClose }: { open: boolean; onClose: () => 
   const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   return (
-    <Modal open={open} onClose={onClose}>
+    <Modal
+      open={open}
+      onClose={onClose}
+      panelStyle={{
+        width: 'min(500px, calc(100vw - 2rem))',
+        maxWidth: 'min(500px, calc(100vw - 2rem))',
+      }}
+    >
       <ModalHeader title={t('modal.switchWorkdir')} onClose={onClose} />
 
       <div className="flex items-center gap-1 text-[11px] font-mono text-fg-4 mb-3 flex-wrap">
@@ -329,39 +342,52 @@ export function WorkdirModal({ open, onClose }: { open: boolean; onClose: () => 
         {isGit && <Badge variant="accent" className="ml-1 !text-[9px] !py-0 !px-1.5">git</Badge>}
       </div>
 
-      <div className="border border-edge rounded-lg overflow-y-auto bg-panel-alt" style={{ maxHeight: 320, minHeight: 160 }}>
-        {loading ? (
-          <div className="text-xs text-fg-5 p-4 text-center">{t('sessions.loading')}</div>
-        ) : error ? (
-          <div className="text-xs text-red-500/70 p-4">{error}</div>
-        ) : (
-          <>
-            {parentDir && parentDir !== currentPath && (
-              <div
-                className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-panel transition-colors border-b border-edge"
-                onClick={() => browse(parentDir)}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-fg-5 shrink-0"><polyline points="15 18 9 12 15 6"/></svg>
-                <span className="text-xs text-fg-4">..</span>
-              </div>
-            )}
-            {dirs.length === 0 && !parentDir && (
-              <div className="text-xs text-fg-5 p-4 text-center">{t('modal.emptyDir')}</div>
-            )}
-            {dirs.map(d => (
-              <div
-                key={d.path}
-                className="flex items-center gap-2.5 px-3 py-[7px] cursor-pointer hover:bg-panel transition-colors"
-                onClick={() => browse(d.path)}
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={d.name === '.git' ? 'var(--th-primary)' : 'currentColor'} strokeWidth="1.8" className="text-fg-5 shrink-0">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                </svg>
-                <span className="text-xs text-fg-3">{escHtml(d.name)}</span>
-              </div>
-            ))}
-          </>
-        )}
+      <div className="relative">
+        <div
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 h-5 rounded-t-lg"
+          style={{ background: 'linear-gradient(to bottom, var(--th-panel-alt), rgba(0, 0, 0, 0))' }}
+        />
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-5 rounded-b-lg"
+          style={{ background: 'linear-gradient(to top, var(--th-panel-alt), rgba(0, 0, 0, 0))' }}
+        />
+        <div
+          className="border border-edge rounded-lg overflow-y-auto overscroll-contain scroll-smooth bg-panel-alt"
+          style={{ maxHeight: 420, minHeight: 240, scrollbarGutter: 'stable' }}
+        >
+          {loading ? (
+            <div className="text-xs text-fg-5 p-4 text-center">{t('sessions.loading')}</div>
+          ) : error ? (
+            <div className="text-xs text-red-500/70 p-4">{error}</div>
+          ) : (
+            <>
+              {parentDir && parentDir !== currentPath && (
+                <div
+                  className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-panel transition-colors border-b border-edge"
+                  onClick={() => browse(parentDir)}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-fg-5 shrink-0"><polyline points="15 18 9 12 15 6"/></svg>
+                  <span className="text-xs text-fg-4">..</span>
+                </div>
+              )}
+              {dirs.length === 0 && !parentDir && (
+                <div className="text-xs text-fg-5 p-4 text-center">{t('modal.emptyDir')}</div>
+              )}
+              {dirs.map(d => (
+                <div
+                  key={d.path}
+                  className="flex items-center gap-2.5 px-3 py-[7px] cursor-pointer hover:bg-panel transition-colors"
+                  onClick={() => browse(d.path)}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={d.name === '.git' ? 'var(--th-primary)' : 'currentColor'} strokeWidth="1.8" className="text-fg-5 shrink-0">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  </svg>
+                  <span className="text-xs text-fg-3">{escHtml(d.name)}</span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
       </div>
 
       <div className="mt-3">
@@ -385,12 +411,6 @@ export function WorkdirModal({ open, onClose }: { open: boolean; onClose: () => 
 /* ═══════════════════════════════════════════════════
    Session Detail Modal
    ═══════════════════════════════════════════════════ */
-const sesAgentMeta: Record<string, { label: string }> = {
-  claude: { label: 'Claude Code' },
-  codex: { label: 'Codex' },
-  gemini: { label: 'Gemini CLI' },
-};
-
 export function SessionDetailModal({ open, onClose, agent, sessionId, session }: {
   open: boolean; onClose: () => void;
   agent: string; sessionId: string; session: SessionInfo | null;
@@ -400,23 +420,52 @@ export function SessionDetailModal({ open, onClose, agent, sessionId, session }:
   const [messages, setMessages] = useState<SessionTailMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const requestRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    if (!open || !agent || !sessionId) return;
+    if (!open || !agent || !sessionId) {
+      requestRef.current?.abort();
+      requestRef.current = null;
+      setLoading(false);
+      return;
+    }
+
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
     setLoading(true);
     setError('');
     setMessages([]);
-    api.getSessionDetail(agent, sessionId).then(r => {
-      if (!r.ok || !r.messages?.length) {
-        setError(r.error || t('modal.noConv'));
-      } else {
-        setMessages(r.messages);
+    api.getSessionDetail(agent, sessionId, 12, {
+      signal: controller.signal,
+      timeoutMs: 30_000,
+    }).then(r => {
+      if (!r.ok) {
+        setError(r.error || t('modal.loadFailed'));
+        return;
       }
-    }).catch(() => setError(t('modal.loadFailed'))).finally(() => setLoading(false));
+      if (!r.messages?.length) {
+        setError(t('modal.noConv'));
+        return;
+      }
+      setMessages(r.messages);
+    }).catch(err => {
+      if (isAbortError(err)) return;
+      setError(requestErrorText(err, t));
+    }).finally(() => {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      controller.abort();
+      if (requestRef.current === controller) requestRef.current = null;
+    };
   }, [open, agent, sessionId, t]);
 
-  const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const m = sesAgentMeta[agent] || { label: agent };
+  const m = getAgentMeta(agent);
 
   return (
     <Modal open={open} onClose={onClose} wide>
@@ -428,7 +477,10 @@ export function SessionDetailModal({ open, onClose, agent, sessionId, session }:
           <div className="text-fg-4">Model</div><div className="font-mono text-[11px] text-fg-3">{session.model || '—'}</div>
           <div className="text-fg-4">{t('modal.createdAt')}</div><div className="text-fg-3">{fmtTime(session.createdAt)}</div>
           <div className="text-fg-4">{t('modal.status')}</div>
-          <div>{session.running ? <Badge variant="ok" className="!text-[10px]">{t('status.running')}</Badge> : <Badge variant="muted" className="!text-[10px]">{t('modal.ended')}</Badge>}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            {session.isCurrent && <Badge variant="accent" className="!text-[10px]">{t('sessions.current')}</Badge>}
+            {session.running ? <Badge variant="ok" className="!text-[10px]">{t('status.running')}</Badge> : <Badge variant="muted" className="!text-[10px]">{t('modal.ended')}</Badge>}
+          </div>
           <div className="text-fg-4">Session ID</div><div className="font-mono text-[10px] text-fg-5 truncate" title={sessionId}>{sessionId}</div>
           <div className="text-fg-4">{t('modal.workdir')}</div><div className="font-mono text-[10px] text-fg-5 truncate" title={session.workdir || ''}>{session.workdir || '—'}</div>
         </div>
@@ -437,7 +489,19 @@ export function SessionDetailModal({ open, onClose, agent, sessionId, session }:
       <div className="text-[13px] font-semibold text-fg-3 mb-3">{t('modal.recentConv')}</div>
       <div className="max-h-[40vh] overflow-y-auto">
         {loading ? (
-          <div className="text-xs text-fg-5">{t('modal.loadingConv')}</div>
+          <div className="space-y-3">
+            <div className="w-28 rounded-md bg-panel px-3 py-1 text-[10px] text-fg-5">{t('modal.loadingConv')}</div>
+            {Array.from({ length: 3 }, (_, index) => (
+              <div
+                key={index}
+                className={`rounded-xl border p-3 ${index % 2 === 0 ? 'border-indigo-500/10 bg-indigo-500/[0.06]' : 'border-edge bg-panel'}`}
+              >
+                <div className="mb-2 h-3 w-16 rounded-md bg-panel animate-shimmer" />
+                <div className="mb-2 h-3 w-full rounded-md bg-panel animate-shimmer" />
+                <div className="h-3 w-2/3 rounded-md bg-panel animate-shimmer" />
+              </div>
+            ))}
+          </div>
         ) : error ? (
           <div className="text-xs text-fg-5">{error}</div>
         ) : (
@@ -456,7 +520,7 @@ export function SessionDetailModal({ open, onClose, agent, sessionId, session }:
                 <div className="text-[10px] font-medium mb-1" style={{ color: isUser ? 'var(--th-primary)' : undefined }}>
                   {isUser ? 'User' : 'Assistant'}
                 </div>
-                <div>{escHtml(text)}</div>
+                <div>{text}</div>
               </div>
             );
           })

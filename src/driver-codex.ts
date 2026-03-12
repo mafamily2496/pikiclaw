@@ -6,11 +6,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import { registerDriver, type AgentDriver } from './agent-driver.js';
+import { terminateProcessTree } from './process-control.js';
 import {
   type AgentInfo, type StreamOpts, type StreamResult,
   type StreamPreviewMeta, type StreamPreviewPlan, type StreamPreviewPlanStep,
   type CodexCumulativeUsage,
-  type SessionListResult, type SessionTailOpts, type SessionTailResult,
+  type SessionListResult, type SessionInfo, type SessionTailOpts, type SessionTailResult,
   type ModelListOpts, type ModelListResult, type ModelInfo,
   type UsageOpts, type UsageResult, type UsageWindowInfo,
   // shared helpers
@@ -18,8 +19,8 @@ import {
   buildStreamPreviewMeta, pushRecentActivity, normalizeActivityLine,
   firstNonEmptyLine, shortValue, numberOrNull,
   IMAGE_EXTS,
-  listCodeclawSessions, findCodeclawSessionByLocalId,
-  stripInjectedPrompts, computeContext,
+  listCodeclawSessions, findCodeclawSession,
+  stripInjectedPrompts, computeContext, readTailLines,
   roundPercent, toIsoFromEpochSeconds, labelFromWindowMinutes,
   usageWindowFromRateLimit, parseJsonTail, emptyUsage,
   Q,
@@ -60,7 +61,10 @@ export class CodexAppServer {
       const args = ['app-server'];
       for (const c of this.configOverrides) args.push('-c', c);
       agentLog(`[codex-rpc] spawning: codex ${args.join(' ')}`);
-      const proc = spawn('codex', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      const proc = spawn('codex', args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+      });
       this.proc = proc;
       this.buf = '';
       this.nextId = 1;
@@ -130,7 +134,7 @@ export class CodexAppServer {
   }
 
   kill(): void {
-    try { this.proc?.kill(); } catch {}
+    terminateProcessTree(this.proc, { signal: 'SIGTERM', forceSignal: 'SIGKILL', forceAfterMs: 2000 });
     this.proc = null;
     this.ready = false;
     this.pending.clear();
@@ -319,7 +323,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     if (!(await srv.ensureRunning(config))) {
       return {
         ok: false, message: 'Failed to start codex app-server.', thinking: null,
-        localSessionId: opts.localSessionId ?? null, sessionId: opts.sessionId, workspacePath: null,
+        sessionId: opts.sessionId, workspacePath: null,
         model: opts.model, thinkingEffort: opts.thinkingEffort,
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
@@ -367,7 +371,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       agentLog(`[codex-rpc] thread error: ${errMsg}`);
       return {
         ok: false, message: errMsg, thinking: null,
-        localSessionId: opts.localSessionId ?? null, sessionId: opts.sessionId, workspacePath: null,
+        sessionId: opts.sessionId, workspacePath: null,
         model: opts.model, thinkingEffort: opts.thinkingEffort,
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
@@ -519,7 +523,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       agentLog(`[codex-rpc] turn/start error: ${errMsg}`);
       return {
         ok: false, message: errMsg, thinking: null,
-        localSessionId: opts.localSessionId ?? null, sessionId: s.sessionId, workspacePath: null,
+        sessionId: s.sessionId, workspacePath: null,
         model: s.model, thinkingEffort: s.thinkingEffort,
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
@@ -544,7 +548,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     agentLog(`[codex-rpc] result: ok=${ok} elapsed=${elapsed}s text=${s.text.length}chars session=${s.sessionId} status=${s.turnStatus}`);
 
     return {
-      ok, localSessionId: opts.localSessionId ?? null, sessionId: s.sessionId,
+      ok, sessionId: s.sessionId,
       workspacePath: null, model: s.model, thinkingEffort: s.thinkingEffort,
       message: s.text.trim() || error || '(no textual response)',
       thinking: s.thinking.trim() || null,
@@ -565,11 +569,169 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
 // Sessions
 // ---------------------------------------------------------------------------
 
+/** Load title index from ~/.codex/session_index.jsonl (deduped, last entry wins). */
+function loadCodexSessionIndex(): Map<string, { threadName: string; updatedAt: string }> {
+  const home = process.env.HOME || '';
+  if (!home) return new Map();
+  const indexPath = path.join(home, '.codex', 'session_index.jsonl');
+  if (!fs.existsSync(indexPath)) return new Map();
+  const map = new Map<string, { threadName: string; updatedAt: string }>();
+  try {
+    const data = fs.readFileSync(indexPath, 'utf8');
+    for (const line of data.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.id) map.set(entry.id, { threadName: entry.thread_name || '', updatedAt: entry.updated_at || '' });
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return map;
+}
+
+/** Scan ~/.codex/sessions/ rollout files to find sessions matching the given workdir. */
+function getNativeCodexSessions(workdir: string): SessionInfo[] {
+  const home = process.env.HOME || '';
+  if (!home) return [];
+  const sessionsDir = path.join(home, '.codex', 'sessions');
+  if (!fs.existsSync(sessionsDir)) return [];
+
+  const resolvedWorkdir = path.resolve(workdir);
+  const titleIndex = loadCodexSessionIndex();
+  const sessions: SessionInfo[] = [];
+  const seenIds = new Set<string>();
+
+  // Walk year/month/day directories
+  const walkDir = (dir: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walkDir(fullPath); continue; }
+      if (!entry.name.startsWith('rollout-') || !entry.name.endsWith('.jsonl')) continue;
+
+      // Read first chunk to extract session_meta fields via regex
+      // (first line can be very large due to base_instructions, so we avoid full JSON parse)
+      try {
+        const fd = fs.openSync(fullPath, 'r');
+        const buf = Buffer.alloc(1024); // only need the first ~1KB for type, id, cwd, timestamp
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+        const head = buf.toString('utf8', 0, bytesRead);
+        if (!head.includes('"session_meta"')) continue;
+        // Extract fields with regex (they appear early in the JSON before base_instructions)
+        const idMatch = head.match(/"id"\s*:\s*"([^"]+)"/);
+        const cwdMatch = head.match(/"cwd"\s*:\s*"([^"]+)"/);
+        const tsMatch = head.match(/"timestamp"\s*:\s*"([^"]+)"/);
+        if (!idMatch || !cwdMatch) continue;
+        const metaId = idMatch[1];
+        const metaCwd = cwdMatch[1];
+        if (path.resolve(metaCwd) !== resolvedWorkdir) continue;
+        if (seenIds.has(metaId)) continue;
+        seenIds.add(metaId);
+
+        const stat = fs.statSync(fullPath);
+        const idx = titleIndex.get(metaId);
+        const title = idx?.threadName || null;
+        const updatedAt = idx?.updatedAt || stat.mtime.toISOString();
+
+        sessions.push({
+          sessionId: metaId,
+          agent: 'codex',
+          workdir: metaCwd,
+          workspacePath: null,
+          model: null,
+          createdAt: tsMatch?.[1] || stat.birthtime.toISOString(),
+          title,
+          running: Date.now() - Date.parse(updatedAt) < 10_000,
+        });
+      } catch { /* skip */ }
+    }
+  };
+
+  walkDir(sessionsDir);
+  return sessions;
+}
+
+function readCodexSessionMeta(filePath: string): { sessionId: string; cwd: string } | null {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(4096);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const firstLine = buf.toString('utf8', 0, bytesRead).split('\n')[0];
+    if (!firstLine) return null;
+    const parsed = JSON.parse(firstLine);
+    if (parsed?.type !== 'session_meta') return null;
+    const sessionId = typeof parsed?.payload?.id === 'string' ? parsed.payload.id : '';
+    const cwd = typeof parsed?.payload?.cwd === 'string' ? parsed.payload.cwd : '';
+    if (!sessionId || !cwd) return null;
+    return { sessionId, cwd };
+  } catch {
+    return null;
+  }
+}
+
+function findCodexRolloutPath(sessionId: string, workdir: string): string | null {
+  const home = process.env.HOME || '';
+  if (!home) return null;
+  const sessionsRoot = path.join(home, '.codex', 'sessions');
+  if (!fs.existsSync(sessionsRoot)) return null;
+  const resolvedWorkdir = path.resolve(workdir);
+
+  const walkDir = (dir: string): string | null => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const found = walkDir(fullPath);
+        if (found) return found;
+        continue;
+      }
+      if (!entry.name.startsWith('rollout-') || !entry.name.endsWith('.jsonl')) continue;
+      const meta = readCodexSessionMeta(fullPath);
+      if (!meta) continue;
+      if (meta.sessionId === sessionId && path.resolve(meta.cwd) === resolvedWorkdir) return fullPath;
+    }
+    return null;
+  };
+
+  return walkDir(sessionsRoot);
+}
+
+function getCodexSessionTailFromRollout(opts: SessionTailOpts): SessionTailResult {
+  const limit = opts.limit ?? 4;
+  const rolloutPath = findCodexRolloutPath(opts.sessionId, opts.workdir);
+  if (!rolloutPath) return { ok: false, messages: [], error: 'Session history file not found' };
+
+  try {
+    const lines = readTailLines(rolloutPath, 512 * 1024);
+    const allMsgs: { role: 'user' | 'assistant'; text: string }[] = [];
+    for (const raw of lines) {
+      if (!raw || raw[0] !== '{' || !raw.includes('"event_msg"')) continue;
+      let ev: any;
+      try { ev = JSON.parse(raw); } catch { continue; }
+      if (ev?.type !== 'event_msg' || !ev.payload || typeof ev.payload !== 'object') continue;
+      if (ev.payload.type === 'user_message' && typeof ev.payload.message === 'string') {
+        const text = stripInjectedPrompts(ev.payload.message).trim();
+        if (text) allMsgs.push({ role: 'user', text });
+      } else if (ev.payload.type === 'agent_message' && typeof ev.payload.message === 'string') {
+        const text = ev.payload.message.trim();
+        if (text) allMsgs.push({ role: 'assistant', text });
+      }
+    }
+    return { ok: true, messages: allMsgs.slice(-limit), error: null };
+  } catch (error: any) {
+    return { ok: false, messages: [], error: error?.message || 'Failed to read session history' };
+  }
+}
+
 function getCodexSessions(workdir: string, limit?: number): SessionListResult {
-  const sessions = listCodeclawSessions(workdir, 'codex', limit).map(record => ({
-    sessionId: record.engineSessionId,
-    localSessionId: record.localSessionId,
-    engineSessionId: record.engineSessionId,
+  const resolvedWorkdir = path.resolve(workdir);
+  // Merge codeclaw-tracked sessions with native Codex sessions
+  const codeclawSessions = listCodeclawSessions(resolvedWorkdir, 'codex').map(record => ({
+    sessionId: record.sessionId,
     agent: 'codex' as const,
     workdir: record.workdir,
     workspacePath: record.workspacePath,
@@ -578,18 +740,44 @@ function getCodexSessions(workdir: string, limit?: number): SessionListResult {
     title: record.title,
     running: Date.now() - Date.parse(record.updatedAt) < 10_000,
   }));
+  const nativeSessions = getNativeCodexSessions(resolvedWorkdir);
+
+  // Merge: codeclaw records take precedence
+  const seen = new Set<string>();
+  const merged: SessionInfo[] = [];
+  for (const s of codeclawSessions) {
+    if (s.sessionId) seen.add(s.sessionId);
+    merged.push(s);
+  }
+  for (const s of nativeSessions) {
+    if (s.sessionId && !seen.has(s.sessionId)) merged.push(s);
+  }
+
+  merged.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''));
+  const sessions = typeof limit === 'number' ? merged.slice(0, limit) : merged;
+  const sessionsDir = path.join(process.env.HOME || '', '.codex', 'sessions');
+  agentLog(
+    `[sessions:codex] workdir=${resolvedWorkdir} sessionsDir=${sessionsDir} sessionsDirExists=${fs.existsSync(sessionsDir)} ` +
+    `codeclaw=${codeclawSessions.length} native=${nativeSessions.length} merged=${sessions.length}`
+  );
   return { ok: true, sessions, error: null };
 }
 
 async function getCodexSessionTail(opts: SessionTailOpts): Promise<SessionTailResult> {
   const limit = opts.limit ?? 4;
   const srv = getSharedServer();
-  if (!(await srv.ensureRunning())) return { ok: false, messages: [], error: 'Failed to start codex app-server.' };
+  if (!(await srv.ensureRunning())) return getCodexSessionTailFromRollout(opts);
 
   const resp = await srv.call('thread/read', { threadId: opts.sessionId, includeTurns: true });
-  if (resp.error) return { ok: false, messages: [], error: resp.error.message || 'thread/read failed' };
+  if (resp.error) {
+    const fallback = getCodexSessionTailFromRollout(opts);
+    return fallback.ok ? fallback : { ok: false, messages: [], error: resp.error.message || fallback.error || 'thread/read failed' };
+  }
   const thread = resp.result?.thread;
-  if (!thread) return { ok: false, messages: [], error: 'No thread data returned' };
+  if (!thread) {
+    const fallback = getCodexSessionTailFromRollout(opts);
+    return fallback.ok ? fallback : { ok: false, messages: [], error: 'No thread data returned' };
+  }
 
   const allMsgs: { role: 'user' | 'assistant'; text: string }[] = [];
   for (const turn of (thread.turns ?? [])) {
@@ -603,7 +791,9 @@ async function getCodexSessionTail(opts: SessionTailOpts): Promise<SessionTailRe
       }
     }
   }
-  return { ok: true, messages: allMsgs.slice(-limit), error: null };
+  const messages = allMsgs.slice(-limit);
+  if (messages.length > 0) return { ok: true, messages, error: null };
+  return getCodexSessionTailFromRollout(opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -780,11 +970,6 @@ class CodexDriver implements AgentDriver {
   }
 
   async getSessionTail(opts: SessionTailOpts): Promise<SessionTailResult> {
-    const managed = findCodeclawSessionByLocalId(opts.workdir, 'codex', opts.sessionId);
-    if (managed) {
-      if (!managed.engineSessionId) return { ok: true, messages: [], error: null };
-      return getCodexSessionTail({ ...opts, sessionId: managed.engineSessionId });
-    }
     return getCodexSessionTail(opts);
   }
 

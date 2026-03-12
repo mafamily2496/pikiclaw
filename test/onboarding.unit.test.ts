@@ -1,11 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { buildSetupGuide, collectSetupState, isSetupReady, isSupportedNode } from '../src/onboarding.ts';
+import { buildSetupGuide, collectSetupState, isSetupReady } from '../src/onboarding.ts';
 import { captureEnv, makeTmpDir, restoreEnv } from './support/env.ts';
 
 const ENV_KEYS = [
   'HOME',
-  'ANTHROPIC_API_KEY',
-  'OPENAI_API_KEY',
 ] as const;
 
 const envSnapshot = captureEnv(ENV_KEYS);
@@ -23,12 +21,6 @@ describe('onboarding helpers', () => {
     restoreEnv(envSnapshot);
   });
 
-  it('accepts Node.js 18+ and rejects older versions', () => {
-    expect(isSupportedNode('18.0.0')).toBe(true);
-    expect(isSupportedNode('22.12.0')).toBe(true);
-    expect(isSupportedNode('16.20.2')).toBe(false);
-  });
-
   it('renders an English first-time setup guide for missing agent and token', () => {
     const state = collectSetupState({
       agents: [
@@ -37,7 +29,6 @@ describe('onboarding helpers', () => {
       ],
       channel: 'telegram',
       tokenProvided: false,
-      nodeVersion: '20.18.1',
     });
 
     const guide = buildSetupGuide(state, '0.2.22');
@@ -51,9 +42,7 @@ describe('onboarding helpers', () => {
     expect(guide).toContain('npx codeclaw@latest -t <YOUR_BOT_TOKEN>');
   });
 
-  it('marks API-key backed agent auth as ready in doctor mode', () => {
-    process.env.ANTHROPIC_API_KEY = 'test-key';
-
+  it('marks installed agent as ready in doctor mode', () => {
     const state = collectSetupState({
       agents: [
         { agent: 'claude', installed: true, path: '/usr/local/bin/claude', version: '1.0.79' },
@@ -61,28 +50,23 @@ describe('onboarding helpers', () => {
       ],
       channel: 'telegram',
       tokenProvided: true,
-      nodeVersion: '20.18.1',
     });
 
     const guide = buildSetupGuide(state, '0.2.22', { doctor: true });
 
     expect(guide).toContain('Setup check');
     expect(guide).toContain('OK       Claude Code found at /usr/local/bin/claude (1.0.79)');
-    expect(guide).toContain('OK       Claude Code sign-in looks ready. ANTHROPIC_API_KEY detected.');
     expect(guide).toContain('OK       A Telegram token was provided.');
     expect(guide).toContain('npx codeclaw@latest --doctor');
   });
 
   it('does not report setup ready when a configured IM channel fails live validation', () => {
-    process.env.ANTHROPIC_API_KEY = 'test-key';
-
     const state = collectSetupState({
       agents: [
         { agent: 'claude', installed: true, path: '/usr/local/bin/claude', version: '1.0.79' },
       ],
       channel: 'telegram',
       tokenProvided: true,
-      nodeVersion: '20.18.1',
       channels: [{
         channel: 'telegram',
         configured: true,

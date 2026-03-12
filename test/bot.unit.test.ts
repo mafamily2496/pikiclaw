@@ -10,16 +10,16 @@ vi.mock('../src/code-agent.ts', async importOriginal => {
 
 import { doStream } from '../src/code-agent.ts';
 import { Bot } from '../src/bot.ts';
-import { loadUserConfig, saveUserConfig } from '../src/user-config.ts';
 import { captureEnv, makeTmpDir, restoreEnv } from './support/env.ts';
 import { makeStreamResult } from './support/stream-result.ts';
 
-const envSnapshot = captureEnv(['CODECLAW_CONFIG_DIR', 'CODECLAW_WORKDIR', 'DEFAULT_AGENT']);
+const envSnapshot = captureEnv(['CODECLAW_CONFIG', 'CODECLAW_WORKDIR', 'DEFAULT_AGENT']);
 
 beforeEach(() => {
   restoreEnv(envSnapshot);
   vi.clearAllMocks();
-  process.env.CODECLAW_CONFIG_DIR = makeTmpDir('bot-unit-config-');
+  const tmpConfig = makeTmpDir('bot-unit-config-');
+  process.env.CODECLAW_CONFIG = `${tmpConfig}/setting.json`;
   process.env.CODECLAW_WORKDIR = makeTmpDir('bot-unit-workdir-');
   process.env.DEFAULT_AGENT = 'codex';
 });
@@ -91,38 +91,4 @@ describe('Bot.runStream', () => {
     expect(cs.codexCumulative).toBeUndefined();
   });
 
-  it('uses current process cwd when env is unset', () => {
-    const savedWorkdir = makeTmpDir('bot-unit-saved-');
-    const runtimeCwd = makeTmpDir('bot-unit-cwd-');
-    const originalCwd = process.cwd();
-    saveUserConfig({ defaultWorkdir: savedWorkdir });
-    delete process.env.CODECLAW_WORKDIR;
-    try {
-      process.chdir(runtimeCwd);
-      const bot = new Bot();
-      expect(bot.workdir).toBe(process.cwd());
-    } finally {
-      process.chdir(originalCwd);
-    }
-  });
-
-  it('keeps switched workdir in runtime only', () => {
-    const initialWorkdir = process.env.CODECLAW_WORKDIR;
-    saveUserConfig({
-      defaultAgent: 'codex',
-      telegramBotToken: '123:test-token',
-      defaultWorkdir: initialWorkdir,
-    });
-    const bot = new Bot();
-    const nextWorkdir = makeTmpDir('bot-unit-next-persist-');
-
-    bot.switchWorkdir(nextWorkdir);
-
-    expect(process.env.CODECLAW_WORKDIR).toBe(nextWorkdir);
-    expect(loadUserConfig()).toMatchObject({
-      defaultAgent: 'codex',
-      telegramBotToken: '123:test-token',
-      defaultWorkdir: initialWorkdir,
-    });
-  });
 });

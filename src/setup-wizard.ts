@@ -172,19 +172,13 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
   try {
     io.write(title(`codeclaw v${options.version} setup`));
 
-    if (!state.nodeOk) {
-      io.write(buildSetupGuide(state, options.version));
-      io.write('\nNode.js is too old for this build. Install Node.js 18 or newer, then run the setup again.\n');
-      return { completed: false, token, agent: null, configPath: null, tokenCheck: null };
-    }
-
     if (options.channel !== 'telegram') {
       io.write(buildSetupGuide(state, options.version));
       io.write('\nInteractive setup is currently only available for Telegram.\n');
       return { completed: false, token, agent: null, configPath: null, tokenCheck: null };
     }
 
-    io.write('This wizard will help you install or verify a local agent, sign in, validate your Telegram bot token, and optionally save the setup for next time.\n');
+    io.write('This wizard will help you install or verify a local agent, validate your Telegram bot token, and optionally save the setup for next time.\n');
 
     refreshState();
     io.write(title('Step 1: Local agent'));
@@ -221,25 +215,6 @@ export async function runSetupWizard(options: SetupWizardOptions): Promise<Setup
     }
 
     io.write(`Using ${selectedState.label}.\n`);
-    if (selectedState.authStatus !== 'ready') {
-      io.write(`${selectedState.authDetail}\n`);
-      io.write(`A ${selectedAgent} session will open next. Complete sign-in there, then exit back to this wizard.\n`);
-      const openLogin = await askYesNo(io, `Open ${selectedAgent} now?`, true);
-      if (!openLogin) {
-        const continueAnyway = await askYesNo(io, 'Continue anyway without verifying sign-in?', false);
-        if (!continueAnyway) return { completed: false, token, agent: selectedAgent, configPath: null, tokenCheck: null };
-      } else {
-        await io.runCommand(selectedAgent, []);
-        selectedState = refreshState().agents.find(agent => agent.agent === selectedAgent) || null;
-        if (selectedState && selectedState.authStatus !== 'ready') {
-          io.write(`${selectedState.authDetail}\n`);
-          const continueAnyway = await askYesNo(io, 'I still cannot verify sign-in automatically. Continue anyway?', selectedState.authStatus === 'unknown');
-          if (!continueAnyway) return { completed: false, token, agent: selectedAgent, configPath: null, tokenCheck: null };
-        }
-      }
-    } else {
-      io.write(`${selectedState.label} sign-in looks ready.\n`);
-    }
 
     io.write(title('Step 2: Telegram bot token'));
     if (token) {

@@ -1,105 +1,132 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useStore } from './store';
+import { resolveAppStatusBadge } from './app-status';
 import { createT } from './i18n';
+import { fmtBytes } from './utils';
 import { Sidebar } from './components/Sidebar';
 import { ConfigTab } from './components/ConfigTab';
 import { SessionsTab } from './components/SessionsTab';
-import { PluginsTab } from './components/PluginsTab';
 import { TelegramModal, FeishuModal, WorkdirModal, SessionDetailModal } from './components/Modals';
-import { Badge, Dot, Toasts } from './components/ui';
+import { Badge, Button, Dot, Toasts } from './components/ui';
 import { api } from './api';
 import type { SessionInfo } from './types';
 
-export function App() {
-  const { state, tab, toasts, toast, reload, locale } = useStore();
-  const t = createT(locale);
+/* eslint-disable @typescript-eslint/no-unused-vars */
 
-  // Modal states
-  const [tgOpen, setTgOpen] = useState(false);
-  const [fsOpen, setFsOpen] = useState(false);
-  const [wdOpen, setWdOpen] = useState(false);
-  const [sesOpen, setSesOpen] = useState(false);
-  const [sesAgent, setSesAgent] = useState('');
-  const [sesId, setSesId] = useState('');
-  const [sesInfo, setSesInfo] = useState<SessionInfo | null>(null);
+type ModalState =
+  | null
+  | { type: 'telegram' }
+  | { type: 'feishu' }
+  | { type: 'workdir' }
+  | { type: 'session'; agent: string; sessionId: string; session: SessionInfo | null };
+
+export function App() {
+  const { state, tab, toasts, toast, reload, locale, host } = useStore();
+  const t = createT(locale);
+  const [modal, setModal] = useState<ModalState>(null);
+  const closeModal = useCallback(() => setModal(null), []);
 
   const [prompted, setPrompted] = useState(false);
   useEffect(() => {
     if (state && !prompted && !state.config.telegramBotToken && !state.config.feishuAppId) {
       setPrompted(true);
-      setTimeout(() => setFsOpen(true), 400);
+      setTimeout(() => setModal({ type: 'feishu' }), 400);
     }
   }, [state, prompted]);
 
   const handleOpenSession = useCallback((agent: string, sid: string, ses: SessionInfo) => {
-    setSesAgent(agent);
-    setSesId(sid);
-    setSesInfo(ses);
-    setSesOpen(true);
+    setModal({ type: 'session', agent, sessionId: sid, session: ses });
   }, []);
 
   const handleRestart = useCallback(async () => {
-    if (!confirm(t('modal.confirmRestart'))) return;
-    try { await api.restart(); toast(t('modal.restarting')); } catch { toast(t('modal.restartFailed'), false); }
+    try {
+      const result = await api.restart();
+      if (!result.ok) {
+        toast(result.error || t('modal.restartFailed'), false);
+        return;
+      }
+      toast(t('modal.restarting'));
+    } catch {
+      toast(t('modal.restartFailed'), false);
+    }
   }, [toast, t]);
 
-  // Header badge
-  let badgeVariant: 'ok' | 'warn' | 'accent' | 'muted' = 'muted';
-  let badgeContent = t('status.loading');
-  let dotVariant: 'ok' | 'warn' | 'idle' = 'warn';
-  let dotPulse = true;
-  if (state) {
-    if (state.ready && state.bot) {
-      badgeVariant = 'ok'; badgeContent = t('status.running'); dotVariant = 'ok'; dotPulse = true;
-    } else if (state.ready) {
-      badgeVariant = 'accent'; badgeContent = t('status.ready'); dotVariant = 'ok'; dotPulse = false;
-    } else {
-      badgeVariant = 'warn'; badgeContent = t('status.needsConfig'); dotVariant = 'warn'; dotPulse = true;
-    }
-  }
+  const { badgeVariant, badgeContent, dotVariant, dotPulse } = resolveAppStatusBadge(state, t);
 
-  const tabTitles: Record<string, string> = { config: t('tab.config'), sessions: t('tab.sessions'), plugins: t('tab.plugins') };
+  const [confirmingRestart, setConfirmingRestart] = useState(false);
+  const onRestartClick = useCallback(() => {
+    if (confirmingRestart) {
+      setConfirmingRestart(false);
+      handleRestart();
+    } else {
+      setConfirmingRestart(true);
+      setTimeout(() => setConfirmingRestart(false), 3000);
+    }
+  }, [confirmingRestart, handleRestart]);
+
+  const hostSummary = host ? `${host.hostName || '—'}  ·  ${host.cpuCount} cores  ·  ${fmtBytes(host.memoryUsed || (host.totalMem || 0) - (host.freeMem || 0))} / ${fmtBytes(host.totalMem || 0)}` : '';
+  const currentWorkdir = state?.bot?.workdir || state?.runtimeWorkdir || state?.config.workdir || '';
+
+  const tabTitles: Record<string, string> = { config: t('tab.config'), sessions: t('tab.sessions') };
 
   return (
     <div className="noise-overlay">
-      {/* BG: aurora orbs + dot grid */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden">
-        <div className="grid-bg absolute inset-0 opacity-60" />
-        <div className="absolute -top-48 -right-48 w-[600px] h-[600px] rounded-full" style={{ background: 'radial-gradient(ellipse, var(--th-orb1), transparent 70%)', animation: 'drift 20s ease-in-out infinite' }} />
-        <div className="absolute -bottom-48 -left-48 w-[500px] h-[500px] rounded-full" style={{ background: 'radial-gradient(ellipse, var(--th-orb2), transparent 70%)', animation: 'drift 24s ease-in-out infinite reverse' }} />
-        <div className="absolute top-1/3 right-1/4 w-[350px] h-[350px] rounded-full" style={{ background: 'radial-gradient(ellipse, var(--th-orb3), transparent 70%)', animation: 'drift 26s ease-in-out infinite 3s' }} />
+        <div className="grid-bg absolute inset-0 opacity-50" />
+        <div className="absolute -top-36 right-0 h-[420px] w-[420px] rounded-full" style={{ background: 'radial-gradient(ellipse, var(--th-orb1), transparent 72%)', animation: 'drift 24s ease-in-out infinite' }} />
+        <div className="absolute -bottom-40 -left-20 h-[360px] w-[360px] rounded-full" style={{ background: 'radial-gradient(ellipse, var(--th-orb2), transparent 74%)', animation: 'drift 28s ease-in-out infinite reverse' }} />
       </div>
 
-      <div className="relative min-h-screen flex">
+      <div className="relative min-h-screen flex flex-col">
         <Sidebar
           version={state?.version || '...'}
-          onSwitchWorkdir={() => setWdOpen(true)}
-          onRestart={handleRestart}
+          confirmingRestart={confirmingRestart}
+          onRestartClick={onRestartClick}
         />
 
-        <main className="flex-1 overflow-y-auto max-h-screen">
-          <header className="sticky top-0 z-30 px-8 py-4 bg-[var(--th-header)] border-b border-edge backdrop-blur-[20px] [backdrop-filter:blur(20px)_saturate(1.2)]">
-            <div className="flex items-center justify-between">
-              <h2 className="text-[15px] font-semibold tracking-tight text-fg">{tabTitles[tab] || tab}</h2>
-              <Badge variant={badgeVariant}>
-                <Dot variant={dotVariant} pulse={dotPulse} />
-                {badgeContent}
-              </Badge>
-            </div>
-          </header>
+        <main className="flex-1 overflow-y-auto">
+          <div className="mx-auto max-w-[1100px] px-6 py-8">
+            <div className="mb-8 space-y-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div className="flex min-w-0 items-center gap-4">
+                  <h2 className="shrink-0 text-lg font-semibold tracking-tight text-fg">{tabTitles[tab] || tab}</h2>
+                </div>
+                <div className="flex shrink-0 items-center gap-2.5">
+                  <Badge variant={badgeVariant}>
+                    <Dot variant={dotVariant} pulse={dotPulse} />
+                    {badgeContent}
+                  </Badge>
+                </div>
+              </div>
 
-          <div className="p-8 max-w-[1100px]">
-            {tab === 'config' && <ConfigTab onOpenTelegram={() => setTgOpen(true)} onOpenFeishu={() => setFsOpen(true)} />}
+              <div className="flex flex-col gap-3 rounded-xl border border-edge bg-panel-alt px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5">
+                  <Badge variant="muted">{t('app.systemInfo')}</Badge>
+                  {hostSummary && <span className="min-w-0 truncate text-[13px] font-mono text-fg-5">{hostSummary}</span>}
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-fg-5">{t('config.workdir')}</span>
+                  <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg-3">{currentWorkdir || t('sidebar.notSet')}</span>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => setModal({ type: 'workdir' })}>
+                  {t('sidebar.switchDir')}
+                </Button>
+              </div>
+            </div>
+            {tab === 'config' && <ConfigTab onOpenTelegram={() => setModal({ type: 'telegram' })} onOpenFeishu={() => setModal({ type: 'feishu' })} />}
             {tab === 'sessions' && <SessionsTab onOpenSession={handleOpenSession} />}
-            {tab === 'plugins' && <PluginsTab />}
           </div>
         </main>
       </div>
 
-      <TelegramModal open={tgOpen} onClose={() => setTgOpen(false)} />
-      <FeishuModal open={fsOpen} onClose={() => setFsOpen(false)} />
-      <WorkdirModal open={wdOpen} onClose={() => setWdOpen(false)} />
-      <SessionDetailModal open={sesOpen} onClose={() => setSesOpen(false)} agent={sesAgent} sessionId={sesId} session={sesInfo} />
+      <TelegramModal open={modal?.type === 'telegram'} onClose={closeModal} />
+      <FeishuModal open={modal?.type === 'feishu'} onClose={closeModal} />
+      <WorkdirModal open={modal?.type === 'workdir'} onClose={closeModal} />
+      <SessionDetailModal
+        open={modal?.type === 'session'}
+        onClose={closeModal}
+        agent={modal?.type === 'session' ? modal.agent : ''}
+        sessionId={modal?.type === 'session' ? modal.sessionId : ''}
+        session={modal?.type === 'session' ? modal.session : null}
+      />
       <Toasts items={toasts} />
     </div>
   );

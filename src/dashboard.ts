@@ -8,15 +8,23 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { exec, execSync } from 'node:child_process';
+import { exec, execFileSync, execSync } from 'node:child_process';
 import { collectSetupState, isSetupReady, type SetupState } from './onboarding.js';
-import { loadUserConfig, saveUserConfig, applyUserConfig, resolveUserWorkdir, type UserConfig } from './user-config.js';
-import { listAgents, getSessionTail, getSessions, listModels, type UsageResult } from './code-agent.js';
+import { loadUserConfig, saveUserConfig, applyUserConfig, resolveUserWorkdir, setUserWorkdir, hasUserConfigFile, type UserConfig } from './user-config.js';
+import { listAgents, getSessionTail, getSessions, listModels, type AgentDetectOptions, type SessionInfo, type SessionListResult, type UsageResult } from './code-agent.js';
 import type { Agent } from './code-agent.js';
 import { getDriver } from './agent-driver.js';
 import { VERSION, type Bot } from './bot.js';
 import { validateFeishuConfig, validateTelegramConfig } from './config-validation.js';
 import { getDashboardHtml } from './dashboard-ui.js';
+import { shouldCacheChannelStates } from './channel-states.js';
+import {
+  formatActiveTaskRestartError,
+  getActiveTaskCount,
+  registerProcessRuntime,
+  requestProcessRestart,
+} from './process-control.js';
+import { getSessionStatusForBot } from './session-status.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,10 +48,14 @@ export interface DashboardServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const AGENT_STATUS_MODELS_TIMEOUT_MS = 1_500;
+// Codex model discovery has to cold-start the app-server on some machines.
+// If we fall back too quickly the dashboard only shows the current model.
+const AGENT_STATUS_MODELS_TIMEOUT_MS = 4_000;
 const AGENT_STATUS_USAGE_TIMEOUT_MS = 1_500;
-const CHANNEL_STATUS_VALIDATION_TIMEOUT_MS = 1_500;
+const CHANNEL_STATUS_VALIDATION_TIMEOUT_MS = 3_000;
 const CHANNEL_STATUS_CACHE_TTL_MS = 20_000;
+const DEFAULT_SESSION_PAGE_SIZE = 6;
+const MAX_SESSION_PAGE_SIZE = 30;
 
 function buildLocalChannelStates(config: Partial<UserConfig>): NonNullable<SetupState['channels']> {
   const telegramConfigured = !!String(config.telegramBotToken || '').trim();
@@ -56,28 +68,28 @@ function buildLocalChannelStates(config: Partial<UserConfig>): NonNullable<Setup
     {
       channel: 'telegram',
       configured: telegramConfigured,
-      ready: telegramConfigured,
+      ready: false,
       validated: false,
-      status: telegramConfigured ? 'ready' : 'missing',
-      detail: telegramConfigured ? 'Telegram credentials are configured.' : 'Telegram is not configured.',
+      status: telegramConfigured ? 'checking' : 'missing',
+      detail: telegramConfigured ? 'Validating Telegram credentials…' : 'Telegram is not configured.',
     },
     {
       channel: 'feishu',
       configured: feishuConfigured,
-      ready: feishuReady,
+      ready: false,
       validated: false,
-      status: feishuConfigured ? (feishuReady ? 'ready' : 'invalid') : 'missing',
+      status: !feishuConfigured ? 'missing' : feishuReady ? 'checking' : 'invalid',
       detail: !feishuConfigured
         ? 'Feishu credentials are not configured.'
         : feishuReady
-          ? 'Feishu credentials are configured.'
+          ? 'Validating Feishu credentials…'
           : 'Both App ID and App Secret are required.',
     },
   ];
 }
 
-function getSetupState(config = loadUserConfig()): SetupState {
-  const agents = listAgents().agents;
+function getSetupState(config = loadUserConfig(), agentOptions: AgentDetectOptions = {}): SetupState {
+  const agents = listAgents(agentOptions).agents;
   const channels = buildLocalChannelStates(config);
   const readyChannel = channels.find(channel => channel.ready)?.channel;
   const configuredChannel = channels.find(channel => channel.configured)?.channel;
@@ -114,6 +126,52 @@ function withTimeoutFallback<T>(promise: Promise<T>, timeoutMs: number, fallback
   });
 }
 
+function parsePageNumber(value: string | null, fallback = 0): number {
+  const parsed = Number.parseInt(value || '', 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+function parsePageSize(value: string | null, fallback = DEFAULT_SESSION_PAGE_SIZE): number {
+  const parsed = Number.parseInt(value || '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, MAX_SESSION_PAGE_SIZE);
+}
+
+function paginateSessionResult<T>(result: { ok: boolean; sessions: T[]; error: string | null }, page: number, limit: number) {
+  const sessions = Array.isArray(result.sessions) ? result.sessions : [] as T[];
+  const total = sessions.length;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+  const safePage = Math.min(page, totalPages - 1);
+  const start = safePage * limit;
+  return {
+    ok: result.ok,
+    error: result.error,
+    sessions: sessions.slice(start, start + limit),
+    page: safePage,
+    limit,
+    total,
+    totalPages,
+    hasMore: safePage + 1 < totalPages,
+  };
+}
+
+type DashboardSessionInfo = SessionInfo & { isCurrent?: boolean };
+
+function enrichSessionResultWithRuntimeStatus(result: SessionListResult, bot: Bot | null): SessionListResult & { sessions: DashboardSessionInfo[] } {
+  return {
+    ...result,
+    sessions: result.sessions.map(session => {
+      const status = bot ? getSessionStatusForBot(bot, session) : { isCurrent: false, isRunning: !!session.running };
+      return {
+        ...session,
+        running: status.isRunning,
+        isCurrent: status.isCurrent,
+      };
+    }),
+  };
+}
+
 function dedupeModels(models: { id: string; alias: string | null }[]): { id: string; alias: string | null }[] {
   const seen = new Set<string>();
   const deduped: { id: string; alias: string | null }[] = [];
@@ -128,6 +186,85 @@ function dedupeModels(models: { id: string; alias: string | null }[]): { id: str
 
 interface PermissionStatus { granted: boolean; checkable: boolean; detail: string }
 
+type DashboardPermissionKey = 'accessibility' | 'screenRecording' | 'fullDiskAccess';
+type PermissionRequestAction = 'already_granted' | 'prompted' | 'opened_settings' | 'unsupported';
+
+interface PermissionRequestResult {
+  ok: boolean;
+  action: PermissionRequestAction;
+  granted: boolean;
+  requiresManualGrant: boolean;
+  error?: string;
+}
+
+const permissionPaneUrls: Record<DashboardPermissionKey, string> = {
+  accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+  screenRecording: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+  fullDiskAccess: 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
+};
+
+function runJxa(script: string, timeout = 5_000): string | null {
+  try {
+    return String(execFileSync('osascript', ['-l', 'JavaScript', '-e', script], { encoding: 'utf8', timeout })).trim().toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function checkAccessibilityPermission(): boolean | null {
+  try {
+    execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke ""'], { stdio: 'ignore', timeout: 4_000 });
+    return true;
+  } catch {}
+  const output = runJxa(
+    'ObjC.bindFunction("CGPreflightPostEventAccess", ["bool", []]); console.log($.CGPreflightPostEventAccess());',
+    4_000,
+  );
+  if (output == null) return null;
+  return output === 'true';
+}
+
+function requestAccessibilityPermission(): boolean {
+  return runJxa(
+    'ObjC.bindFunction("CGRequestPostEventAccess", ["bool", []]); console.log($.CGRequestPostEventAccess());',
+    6_000,
+  ) !== null;
+}
+
+function checkScreenRecordingPermission(): boolean | null {
+  const screenshotPath = path.join(os.tmpdir(), `.codeclaw_perm_test_${process.pid}_${Date.now()}.png`);
+  try {
+    execFileSync('screencapture', ['-x', screenshotPath], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch {} finally {
+    try { fs.rmSync(screenshotPath, { force: true }); } catch {}
+  }
+  const output = runJxa(
+    'ObjC.bindFunction("CGPreflightScreenCaptureAccess", ["bool", []]); console.log($.CGPreflightScreenCaptureAccess());',
+    4_000,
+  );
+  if (output == null) return null;
+  return output === 'true';
+}
+
+function requestScreenRecordingPermission(): boolean {
+  return runJxa(
+    'ObjC.bindFunction("CGRequestScreenCaptureAccess", ["bool", []]); console.log($.CGRequestScreenCaptureAccess());',
+    6_000,
+  ) !== null;
+}
+
+function openPermissionSettings(permission: DashboardPermissionKey): boolean {
+  const pane = permissionPaneUrls[permission];
+  if (!pane) return false;
+  try {
+    execFileSync('open', [pane], { stdio: 'ignore', timeout: 3_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function checkPermissions(): Record<string, PermissionStatus> {
   const r: Record<string, PermissionStatus> = {};
   if (process.platform !== 'darwin') {
@@ -136,19 +273,88 @@ function checkPermissions(): Record<string, PermissionStatus> {
     r.fullDiskAccess = { granted: true, checkable: false, detail: 'N/A' };
     return r;
   }
-  try {
-    execSync("osascript -e 'tell application \"System Events\" to return 1' 2>/dev/null", { timeout: 3000 });
-    r.accessibility = { granted: true, checkable: true, detail: '已授权' };
-  } catch { r.accessibility = { granted: false, checkable: true, detail: '未授权' }; }
-  try {
-    execSync('screencapture -x /tmp/.codeclaw_perm_test.png 2>/dev/null && rm -f /tmp/.codeclaw_perm_test.png', { timeout: 5000 });
-    r.screenRecording = { granted: true, checkable: true, detail: '已授权' };
-  } catch { r.screenRecording = { granted: false, checkable: true, detail: '未授权' }; }
+  const accessibilityGranted = checkAccessibilityPermission();
+  r.accessibility = {
+    granted: accessibilityGranted === true,
+    checkable: true,
+    detail: accessibilityGranted === true ? '已授权' : '未授权',
+  };
+
+  const screenRecordingGranted = checkScreenRecordingPermission();
+  r.screenRecording = {
+    granted: screenRecordingGranted === true,
+    checkable: true,
+    detail: screenRecordingGranted === true ? '已授权' : '未授权',
+  };
+
   try {
     execSync(`ls "${os.homedir()}/Library/Mail" 2>/dev/null`, { timeout: 3000 });
     r.fullDiskAccess = { granted: true, checkable: true, detail: '已授权' };
   } catch { r.fullDiskAccess = { granted: false, checkable: true, detail: '未授权' }; }
   return r;
+}
+
+function requestPermission(permission: DashboardPermissionKey): PermissionRequestResult {
+  if (process.platform !== 'darwin') {
+    return {
+      ok: false,
+      action: 'unsupported',
+      granted: true,
+      requiresManualGrant: false,
+      error: 'Permission requests are only supported on macOS.',
+    };
+  }
+
+  const current = checkPermissions()[permission];
+  if (current?.granted) {
+    return {
+      ok: true,
+      action: 'already_granted',
+      granted: true,
+      requiresManualGrant: false,
+    };
+  }
+
+  if (permission === 'accessibility') {
+    const prompted = requestAccessibilityPermission();
+    if (!prompted) {
+      const openedSettings = openPermissionSettings(permission);
+      return openedSettings
+        ? { ok: true, action: 'opened_settings', granted: false, requiresManualGrant: true }
+        : { ok: false, action: 'unsupported', granted: false, requiresManualGrant: true, error: 'Failed to trigger Accessibility permission request.' };
+    }
+    return {
+      ok: true,
+      action: 'prompted',
+      granted: !!checkPermissions().accessibility?.granted,
+      requiresManualGrant: true,
+    };
+  }
+
+  if (permission === 'screenRecording') {
+    const prompted = requestScreenRecordingPermission();
+    if (!prompted) {
+      const openedSettings = openPermissionSettings(permission);
+      return openedSettings
+        ? { ok: true, action: 'opened_settings', granted: false, requiresManualGrant: true }
+        : { ok: false, action: 'unsupported', granted: false, requiresManualGrant: true, error: 'Failed to trigger Screen Recording permission request.' };
+    }
+    return {
+      ok: true,
+      action: 'prompted',
+      granted: !!checkPermissions().screenRecording?.granted,
+      requiresManualGrant: true,
+    };
+  }
+
+  if (permission === 'fullDiskAccess') {
+    const openedSettings = openPermissionSettings(permission);
+    return openedSettings
+      ? { ok: true, action: 'opened_settings', granted: false, requiresManualGrant: true }
+      : { ok: false, action: 'unsupported', granted: false, requiresManualGrant: true, error: 'Failed to open Full Disk Access settings.' };
+  }
+
+  return { ok: false, action: 'unsupported', granted: false, requiresManualGrant: true, error: 'Unknown permission.' };
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
@@ -163,6 +369,11 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
 function json(res: http.ServerResponse, data: unknown, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
+}
+
+function dashboardLog(message: string) {
+  const ts = new Date().toTimeString().slice(0, 8);
+  process.stdout.write(`[dashboard ${ts}] ${message}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,16 +447,18 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     ]);
 
     const channels: NonNullable<SetupState['channels']> = [telegram, feishu];
-    channelStateCache = {
-      key,
-      expiresAt: now + CHANNEL_STATUS_CACHE_TTL_MS,
-      channels,
-    };
+    if (shouldCacheChannelStates(channels)) {
+      channelStateCache = {
+        key,
+        expiresAt: now + CHANNEL_STATUS_CACHE_TTL_MS,
+        channels,
+      };
+    }
     return channels;
   }
 
-  async function buildValidatedSetupState(config = loadUserConfig()): Promise<SetupState> {
-    const agents = listAgents().agents;
+  async function buildValidatedSetupState(config = loadUserConfig(), agentOptions: AgentDetectOptions = {}): Promise<SetupState> {
+    const agents = listAgents(agentOptions).agents;
     const channels = await resolveChannelStates(config);
     const readyChannel = channels.find(channel => channel.ready)?.channel;
     const configuredChannel = channels.find(channel => channel.configured)?.channel;
@@ -269,6 +482,22 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     switch (agent) {
       case 'claude': return process.env.CLAUDE_REASONING_EFFORT;
       case 'codex': return process.env.CODEX_REASONING_EFFORT;
+      case 'gemini': return undefined;
+    }
+  }
+
+  function configModel(config: Partial<UserConfig>, agent: Agent): string | undefined {
+    switch (agent) {
+      case 'claude': return String(config.claudeModel || '').trim() || undefined;
+      case 'codex': return String(config.codexModel || '').trim() || undefined;
+      case 'gemini': return String(config.geminiModel || '').trim() || undefined;
+    }
+  }
+
+  function configEffort(config: Partial<UserConfig>, agent: Agent): string | undefined {
+    switch (agent) {
+      case 'claude': return String(config.claudeReasoningEffort || '').trim().toLowerCase() || undefined;
+      case 'codex': return String(config.codexReasoningEffort || '').trim().toLowerCase() || undefined;
       case 'gemini': return undefined;
     }
   }
@@ -299,20 +528,24 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     return botRef?.workdir || resolveUserWorkdir({ config });
   }
 
-  function getRuntimeModel(agent: Agent): string {
-    if (botRef) return botRef.modelForAgent(agent) || defaultModels[agent];
-    return String(runtimePrefs.models[agent] || modelEnv(agent) || defaultModels[agent]).trim();
+  function getRequestWorkdir(config = loadUserConfig()): string {
+    return getRuntimeWorkdir(config);
   }
 
-  function getRuntimeEffort(agent: Agent): string | null {
+  function getRuntimeModel(agent: Agent, config = loadUserConfig()): string {
+    if (botRef) return botRef.modelForAgent(agent) || defaultModels[agent];
+    return String(runtimePrefs.models[agent] || configModel(config, agent) || modelEnv(agent) || defaultModels[agent]).trim();
+  }
+
+  function getRuntimeEffort(agent: Agent, config = loadUserConfig()): string | null {
     if (agent === 'gemini') return null;
     if (botRef) return botRef.effortForAgent(agent);
-    const value = String(runtimePrefs.efforts[agent] || effortEnv(agent) || defaultEfforts[agent] || '').trim().toLowerCase();
+    const value = String(runtimePrefs.efforts[agent] || configEffort(config, agent) || effortEnv(agent) || defaultEfforts[agent] || '').trim().toLowerCase();
     return value || null;
   }
 
   async function buildAgentStatusResponse(config = loadUserConfig()) {
-    const setupState = getSetupState(config);
+    const setupState = getSetupState(config, { includeVersion: true });
     const workdir = getRuntimeWorkdir(config);
     const defaultAgent = getRuntimeDefaultAgent(config);
     const agents = await Promise.all(setupState.agents.map(async (agentState) => {
@@ -328,8 +561,8 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
         };
       }
 
-      const selectedModel = getRuntimeModel(agentId);
-      const selectedEffort = getRuntimeEffort(agentId);
+      const selectedModel = getRuntimeModel(agentId, config);
+      const selectedEffort = getRuntimeEffort(agentId, config);
       let models: { id: string; alias: string | null }[] = [];
       let usage: UsageResult = emptyUsage(agentId, 'Agent not installed.');
 
@@ -393,6 +626,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
         return json(res, {
           version: VERSION,
           ready: isSetupReady(setupState),
+          configExists: hasUserConfigFile(),
           config,
           runtimeWorkdir: getRuntimeWorkdir(config),
           setupState,
@@ -404,6 +638,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
             workdir: botRef.workdir,
             defaultAgent: botRef.defaultAgent,
             uptime: Date.now() - botRef.startedAt,
+            connected: botRef.connected,
             stats: botRef.stats,
             activeTasks: botRef.activeTasks.size,
             sessions: botRef.sessionStates.size,
@@ -428,23 +663,51 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
 
       // Agents
       if (url.pathname === '/api/agents' && method === 'GET') {
-        return json(res, { agents: getSetupState().agents });
+        return json(res, { agents: getSetupState(loadUserConfig(), { includeVersion: true }).agents });
       }
 
       // Sessions (per agent)
       if (url.pathname.match(/^\/api\/sessions\/[^/]+$/) && method === 'GET') {
         const agent = url.pathname.split('/')[3] as Agent;
-        const workdir = botRef?.workdir || process.env.CODECLAW_WORKDIR || process.cwd();
-        return json(res, await getSessions({ agent, workdir }));
+        const config = loadUserConfig();
+        const workdir = getRequestWorkdir(config);
+        const page = parsePageNumber(url.searchParams.get('page'));
+        const limit = parsePageSize(url.searchParams.get('limit'));
+        dashboardLog(
+          `[sessions] endpoint=single agent=${agent} resolvedWorkdir=${workdir} exists=${fs.existsSync(workdir)} ` +
+          `configWorkdir=${String(config.workdir || '(none)')} botWorkdir=${botRef?.workdir || '(none)'} ` +
+          `page=${page} limit=${limit}`
+        );
+        const result = await getSessions({ agent, workdir });
+        const paged = paginateSessionResult(enrichSessionResultWithRuntimeStatus(result, botRef), page, limit);
+        dashboardLog(
+          `[sessions] endpoint=single agent=${agent} ok=${paged.ok} total=${paged.total} ` +
+          `returned=${paged.sessions.length} error=${paged.error || '(none)'}`
+        );
+        return json(res, paged);
       }
 
       // All sessions (all agents, for swim lane view)
       if (url.pathname === '/api/sessions' && method === 'GET') {
-        const workdir = botRef?.workdir || process.env.CODECLAW_WORKDIR || process.cwd();
+        const config = loadUserConfig();
+        const workdir = getRequestWorkdir(config);
+        const page = parsePageNumber(url.searchParams.get('page'));
+        const limit = parsePageSize(url.searchParams.get('limit'));
+        dashboardLog(
+          `[sessions] endpoint=all resolvedWorkdir=${workdir} exists=${fs.existsSync(workdir)} ` +
+          `configWorkdir=${String(config.workdir || '(none)')} botWorkdir=${botRef?.workdir || '(none)'} ` +
+          `page=${page} limit=${limit}`
+        );
         const agents = listAgents().agents.filter(a => a.installed);
         const result: Record<string, any> = {};
         await Promise.all(agents.map(async a => {
-          result[a.agent] = await getSessions({ agent: a.agent, workdir });
+          const agentResult = await getSessions({ agent: a.agent, workdir });
+          result[a.agent] = paginateSessionResult(enrichSessionResultWithRuntimeStatus(agentResult, botRef), page, limit);
+          const paged = result[a.agent];
+          dashboardLog(
+            `[sessions] endpoint=all agent=${a.agent} ok=${!!paged?.ok} total=${paged?.total ?? 0} ` +
+            `returned=${Array.isArray(paged?.sessions) ? paged.sessions.length : 0} error=${paged?.error || '(none)'}`
+          );
         }));
         return json(res, result);
       }
@@ -454,9 +717,15 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
         const parts = url.pathname.split('/');
         const agent = parts[3] as Agent;
         const sessionId = decodeURIComponent(parts[4]);
-        const workdir = botRef?.workdir || process.env.CODECLAW_WORKDIR || process.cwd();
+        const config = loadUserConfig();
+        const workdir = getRequestWorkdir(config);
         const limit = parseInt(url.searchParams.get('limit') || '6', 10);
+        dashboardLog(
+          `[sessions] endpoint=detail agent=${agent} session=${sessionId} limit=${limit} resolvedWorkdir=${workdir} ` +
+          `exists=${fs.existsSync(workdir)} configWorkdir=${String(config.workdir || '(none)')} botWorkdir=${botRef?.workdir || '(none)'}`
+        );
         const tail = await getSessionTail({ agent, sessionId, workdir, limit });
+        dashboardLog(`[sessions] endpoint=detail agent=${agent} session=${sessionId} ok=${tail.ok} messages=${tail.messages.length} error=${tail.error || '(none)'}`);
         return json(res, tail);
       }
 
@@ -477,6 +746,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
       if (url.pathname === '/api/runtime-agent' && method === 'POST') {
         const body = await parseJsonBody(req);
         const config = loadUserConfig();
+        const nextConfig: Partial<UserConfig> = { ...config };
         const defaultAgent = body?.defaultAgent;
         const targetAgent = body?.agent;
         const model = typeof body?.model === 'string' ? body.model.trim() : '';
@@ -486,6 +756,7 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           if (!isAgent(defaultAgent)) return json(res, { ok: false, error: 'Invalid defaultAgent' }, 400);
           runtimePrefs.defaultAgent = defaultAgent;
           process.env.DEFAULT_AGENT = defaultAgent;
+          nextConfig.defaultAgent = defaultAgent;
           if (botRef) botRef.setDefaultAgent(defaultAgent);
         }
 
@@ -494,16 +765,23 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           if (model) {
             runtimePrefs.models[targetAgent] = model;
             setModelEnv(targetAgent, model);
+            if (targetAgent === 'claude') nextConfig.claudeModel = model;
+            if (targetAgent === 'codex') nextConfig.codexModel = model;
+            if (targetAgent === 'gemini') nextConfig.geminiModel = model;
             if (botRef) botRef.setModelForAgent(targetAgent, model);
           }
           if (effort && targetAgent !== 'gemini') {
             runtimePrefs.efforts[targetAgent] = effort;
             setEffortEnv(targetAgent, effort);
+            if (targetAgent === 'claude') nextConfig.claudeReasoningEffort = effort;
+            if (targetAgent === 'codex') nextConfig.codexReasoningEffort = effort;
             if (botRef) botRef.setEffortForAgent(targetAgent, effort);
           }
         }
 
-        return json(res, { ok: true, ...(await buildAgentStatusResponse(config)) });
+        saveUserConfig(nextConfig);
+        applyUserConfig(nextConfig);
+        return json(res, { ok: true, ...(await buildAgentStatusResponse(nextConfig)) });
       }
 
       // Validate Telegram token
@@ -544,22 +822,33 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
       // Open macOS preferences
       if (url.pathname === '/api/open-preferences' && method === 'POST') {
         const body = await parseJsonBody(req);
-        if (process.platform === 'darwin') {
-          const panes: Record<string, string> = {
-            accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
-            screenRecording: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
-            fullDiskAccess: 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles',
-          };
-          const pane = panes[body.permission];
-          if (pane) { exec(`open "${pane}"`); return json(res, { ok: true }); }
+        const permission = String(body.permission || '') as DashboardPermissionKey;
+        if (!permissionPaneUrls[permission]) {
+          return json(res, {
+            ok: false,
+            action: 'unsupported',
+            granted: false,
+            requiresManualGrant: false,
+            error: 'Invalid permission.',
+          }, 400);
         }
-        return json(res, { ok: false });
+        const result = requestPermission(permission);
+        dashboardLog(
+          `[permissions] permission=${permission} action=${result.action} granted=${result.granted} manual=${result.requiresManualGrant} ok=${result.ok}`
+        );
+        return json(res, result, result.ok ? 200 : 500);
       }
 
       // Restart process
       if (url.pathname === '/api/restart' && method === 'POST') {
+        const activeTasks = getActiveTaskCount();
+        if (activeTasks > 0) {
+          return json(res, { ok: false, error: formatActiveTaskRestartError(activeTasks) }, 409);
+        }
         json(res, { ok: true });
-        setTimeout(() => process.exit(0), 300);
+        setTimeout(() => {
+          void requestProcessRestart({ log: message => dashboardLog(message) });
+        }, 50);
         return;
       }
 
@@ -573,8 +862,8 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
           botRef.switchWorkdir(resolvedPath);
           return json(res, { ok: true, workdir: botRef.workdir });
         }
-        process.env.CODECLAW_WORKDIR = resolvedPath;
-        return json(res, { ok: true, workdir: resolvedPath });
+        const saved = setUserWorkdir(resolvedPath);
+        return json(res, { ok: true, workdir: saved.workdir });
       }
 
       // List directory entries for tree browser
@@ -600,10 +889,24 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
     }
   });
 
+  const unregisterProcessRuntime = registerProcessRuntime({
+    label: 'dashboard',
+    prepareForRestart: () => new Promise<void>(resolve => {
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close(() => resolve());
+    }),
+  });
+
   return new Promise<DashboardServer>((resolve, reject) => {
     server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') server.listen(preferredPort + 1, onListening);
       else reject(err);
+    });
+    server.on('close', () => {
+      unregisterProcessRuntime();
     });
 
     function onListening() {
@@ -628,7 +931,19 @@ export async function startDashboard(opts: DashboardOptions = {}): Promise<Dashb
             if (isAgent(agent) && agent !== 'gemini' && typeof effort === 'string' && effort.trim()) bot.setEffortForAgent(agent, effort);
           }
         },
-        close() { return new Promise<void>(r => server.close(() => r())); },
+        close() {
+          return new Promise<void>(resolveClose => {
+            if (!server.listening) {
+              unregisterProcessRuntime();
+              resolveClose();
+              return;
+            }
+            server.close(() => {
+              unregisterProcessRuntime();
+              resolveClose();
+            });
+          });
+        },
       });
     }
 

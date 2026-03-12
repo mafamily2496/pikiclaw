@@ -204,8 +204,8 @@ describe('TelegramBot status and session previews', () => {
     vi.spyOn(bot, 'fetchAgents').mockReturnValue({
       ok: true,
       agents: [
-        { agent: 'claude', installed: true, version: '1.2.3', path: '/tmp/claude', authStatus: 'ready' } as any,
-        { agent: 'codex', installed: true, version: '9.9.9', path: '/tmp/codex', authStatus: 'ready' } as any,
+        { agent: 'claude', installed: true, version: '1.2.3', path: '/tmp/claude' } as any,
+        { agent: 'codex', installed: true, version: '9.9.9', path: '/tmp/codex' } as any,
       ],
       error: null,
     });
@@ -213,8 +213,8 @@ describe('TelegramBot status and session previews', () => {
 
     await (bot as any).cmdAgents(ctx);
 
-    expect(replies[0]?.text).toBe('<b>Agents</b>');
-    expect(replies[0]?.text).not.toContain('Version:');
+    expect(replies[0]?.text).toContain('<b>Agents</b>');
+    expect(replies[0]?.text).toContain('Version 1.2.3');
     expect(replies[0]?.text).not.toContain('Path:');
     expect(replies[0]?.opts?.keyboard?.inline_keyboard).toEqual([
       [{ text: 'claude', callback_data: 'ag:claude' }, { text: '● codex', callback_data: 'ag:codex' }],
@@ -234,9 +234,9 @@ describe('TelegramBot status and session previews', () => {
 
     await (bot as any).cmdModels(ctx);
 
-    expect(replies[0]?.text).toBe('<b>Models</b> · <code>claude</code>');
-    expect(replies[0]?.text).not.toContain('Source:');
-    expect(replies[0]?.text).not.toContain('debug note');
+    expect(replies[0]?.text).toContain('<b>Models</b> · <code>claude</code>');
+    expect(replies[0]?.text).toContain('Source: app-server model/list');
+    expect(replies[0]?.text).toContain('debug note should stay hidden while models exist');
     expect(replies[0]?.opts?.keyboard?.inline_keyboard).toEqual([
       [{ text: 'sonnet', callback_data: 'mod:claude-sonnet-4-6' }, { text: 'opus-1m', callback_data: 'mod:claude-opus-4-6[1m]' }],
       [{ text: 'Low', callback_data: 'eff:low' }, { text: 'Medium', callback_data: 'eff:medium' }, { text: '● High', callback_data: 'eff:high' }],
@@ -267,18 +267,15 @@ describe('TelegramBot status and session previews', () => {
 
   it('renders resumed history as quoted user text plus normal assistant markdown', async () => {
     const { bot, ctx, sends } = createBot();
-    const localSessionId = 'sess-history-preview';
-    const engineSessionId = 'engine-history-preview';
+    const sessionId = 'engine-history-preview';
 
     vi.spyOn(bot, 'fetchSessions').mockResolvedValue({
       ok: true,
       sessions: [{
-        sessionId: engineSessionId,
-        localSessionId,
-        engineSessionId,
+        sessionId,
         agent: 'claude',
         workdir: process.env.CODECLAW_WORKDIR!,
-        workspacePath: path.join(process.env.CODECLAW_WORKDIR!, '.codeclaw', 'sessions', 'claude', localSessionId, 'workspace'),
+        workspacePath: path.join(process.env.CODECLAW_WORKDIR!, '.codeclaw', 'sessions', 'claude', sessionId, 'workspace'),
         model: 'claude-opus-4-6',
         createdAt: new Date().toISOString(),
         title: 'history preview',
@@ -296,15 +293,14 @@ describe('TelegramBot status and session previews', () => {
       error: null,
     });
 
-    await bot.handleCallback(`sess:${localSessionId}`, ctx as any);
+    await bot.handleCallback(`sess:${sessionId}`, ctx as any);
 
     expect(ctx.editReply).toHaveBeenCalledWith(
       ctx.messageId,
-      `<b>Session</b>\n<code>${localSessionId}</code>`,
+      `<b>Session</b>\n<code>${sessionId}</code>`,
       { parseMode: 'HTML' },
     );
-    expect(bot.chat(ctx.chatId).sessionId).toBe(engineSessionId);
-    expect(bot.chat(ctx.chatId).localSessionId).toBe(localSessionId);
+    expect(bot.chat(ctx.chatId).sessionId).toBe(sessionId);
     expect(sends).toHaveLength(1);
     expect(sends[0].text).toContain('<blockquote expandable>请总结这次修改\n第二行保留原样</blockquote>');
     expect(sends[0].text).toContain('<b>Summary</b>');
@@ -318,7 +314,7 @@ describe('TelegramBot status and session previews', () => {
     await bot.handleCallback('ag:codex', ctx as any);
     expect(ctx.editReply).toHaveBeenLastCalledWith(
       ctx.messageId,
-      '<b>Agent</b>\n<code>codex</code>\n<i>Session reset</i>',
+      '<b>Agent</b>\ncodex\n<i>Session reset</i>',
       { parseMode: 'HTML' },
     );
 
@@ -411,12 +407,12 @@ describe('TelegramBot.handleMessage streaming', () => {
     fs.writeFileSync(uploadPath, 'pdf');
 
     const stagedHarness = createBot();
-    let stagedLocalSessionId: string | null = null;
+    let stagedSessionId: string | null = null;
     let stagedWorkspacePath: string | null = null;
 
     const stagedRunStream = vi.spyOn(stagedHarness.bot, 'runStream').mockImplementation(async (_prompt: string, state: any, files: string[]) => {
       expect(files).toEqual([]);
-      expect(state.localSessionId).toBe(stagedLocalSessionId);
+      expect(state.sessionId).toBe(stagedSessionId);
       expect(state.workspacePath).toBe(stagedWorkspacePath);
       expect(stagedWorkspacePath && fs.existsSync(path.join(stagedWorkspacePath, 'report.pdf'))).toBe(true);
       return claudeResult({
@@ -429,7 +425,7 @@ describe('TelegramBot.handleMessage streaming', () => {
     });
 
     await (stagedHarness.bot as any).handleMessage({ text: '', files: [uploadPath] }, stagedHarness.ctx);
-    stagedLocalSessionId = stagedHarness.bot.chat(stagedHarness.ctx.chatId).localSessionId ?? null;
+    stagedSessionId = stagedHarness.bot.chat(stagedHarness.ctx.chatId).sessionId ?? null;
     stagedWorkspacePath = stagedHarness.bot.chat(stagedHarness.ctx.chatId).workspacePath ?? null;
 
     expect(stagedRunStream).not.toHaveBeenCalled();
@@ -437,7 +433,7 @@ describe('TelegramBot.handleMessage streaming', () => {
     expect(stagedHarness.reactions).toEqual([
       { chatId: stagedHarness.ctx.chatId, messageId: stagedHarness.ctx.messageId, reactions: ['👌'] },
     ]);
-    expect(stagedLocalSessionId).toBeTruthy();
+    expect(stagedSessionId).toBeTruthy();
     expect(stagedWorkspacePath).toBeTruthy();
     expect(fs.existsSync(path.join(stagedWorkspacePath!, 'report.pdf'))).toBe(true);
 
@@ -453,7 +449,6 @@ describe('TelegramBot.handleMessage streaming', () => {
     const artifactHarness = createBot();
     vi.spyOn(artifactHarness.bot, 'runStream').mockResolvedValue(claudeResult({
       message: 'Artifacts ready.',
-      localSessionId: 'sess-artifacts-fail-local',
       sessionId: 'sess-artifacts-fail',
       workspacePath: artifactDir,
       elapsedS: 1.5,
@@ -537,15 +532,14 @@ describe('TelegramBot.handleMessage streaming', () => {
     await Promise.resolve();
 
     expect(states).toHaveLength(2);
-    expect(states[0].localSessionId).toBeTruthy();
-    expect(states[1].localSessionId).toBeTruthy();
-    expect(states[0].localSessionId).not.toBe(states[1].localSessionId);
+    expect(states[0].sessionId).toBeTruthy();
+    expect(states[1].sessionId).toBeTruthy();
+    expect(states[0].sessionId).not.toBe(states[1].sessionId);
     expect(bot.activeTasks.size).toBe(2);
 
     first.resolve(claudeResult({
       message: 'done a',
-      localSessionId: states[0].localSessionId,
-      sessionId: `engine-${states[0].localSessionId}`,
+      sessionId: `engine-${states[0].sessionId}`,
       workspacePath: states[0].workspacePath,
       elapsedS: 1,
       inputTokens: 1,
@@ -553,8 +547,7 @@ describe('TelegramBot.handleMessage streaming', () => {
     }));
     second.resolve(claudeResult({
       message: 'done b',
-      localSessionId: states[1].localSessionId,
-      sessionId: `engine-${states[1].localSessionId}`,
+      sessionId: `engine-${states[1].sessionId}`,
       workspacePath: states[1].workspacePath,
       elapsedS: 1,
       inputTokens: 1,
@@ -601,8 +594,7 @@ describe('TelegramBot.handleMessage streaming', () => {
 
     first.resolve(claudeResult({
       message: 'done first',
-      localSessionId: states[0].localSessionId,
-      sessionId: `engine-${states[0].localSessionId}`,
+      sessionId: `engine-${states[0].sessionId}`,
       workspacePath: states[0].workspacePath,
       elapsedS: 1,
       inputTokens: 1,
@@ -611,12 +603,11 @@ describe('TelegramBot.handleMessage streaming', () => {
     await vi.waitFor(() => {
       expect(states).toHaveLength(2);
     });
-    expect(states[1].localSessionId).toBe(states[0].localSessionId);
+    expect(states[1].sessionId).toBe(states[0].sessionId);
 
     second.resolve(claudeResult({
       message: 'done second',
-      localSessionId: states[1].localSessionId,
-      sessionId: `engine-${states[1].localSessionId}`,
+      sessionId: `engine-${states[1].sessionId}`,
       workspacePath: states[1].workspacePath,
       elapsedS: 1,
       inputTokens: 1,

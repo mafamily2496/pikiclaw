@@ -1,286 +1,502 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useStore } from '../store';
 import { createT } from '../i18n';
 import { api } from '../api';
-import { Badge, Button, Card, Dot, SectionLabel, Select, Skeleton } from './ui';
-import type { AgentRuntimeStatus, AgentStatusResponse, ChannelSetupState, PermissionStatus, UsageResult } from '../types';
-import { HostCards } from './HostCards';
+import { channelBadgeState, channelSummaryText } from '../channel-status';
+import { Badge, Button, Card, Dot, Label, Modal, ModalHeader, SectionLabel, Select, Skeleton } from './ui';
+import { BrandBadge, BrandIcon } from './BrandIcon';
+import { cn, getAgentMeta } from '../utils';
+import { formatUsageSummary, usageBadgeText, usageTone } from '../usage';
+import type { AgentRuntimeStatus, AgentStatusResponse, PermissionStatus } from '../types';
 
-const agentMeta: Record<string, {
+const effortOptions: Record<string, string[]> = {
+  claude: ['low', 'medium', 'high'],
+  codex: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+};
+
+type PermissionKey = 'accessibility' | 'screenRecording' | 'fullDiskAccess';
+type PermissionGuideState = { permission: PermissionKey; action: 'prompted' | 'opened_settings' };
+
+function AgentAvatar({ agent }: { agent: string }) {
+  return <BrandBadge brand={agent} size={44} iconSize={22} className="rounded-lg bg-panel-alt shadow-[0_0_18px_var(--th-glow-a)]" />;
+}
+
+function Field({
+  label,
+  hint,
+  children,
+}: {
   label: string;
-  color: string;
-  bg: string;
-  letter: string;
-  glow: string;
-  advantageKey: string;
-}> = {
-  claude: {
-    label: 'Claude Code',
-    color: '#818cf8',
-    bg: 'rgba(129,140,248,0.08)',
-    letter: 'C',
-    glow: 'rgba(129,140,248,0.15)',
-    advantageKey: 'config.agentAdvantageClaude',
-  },
-  codex: {
-    label: 'Codex',
-    color: '#34d399',
-    bg: 'rgba(52,211,153,0.08)',
-    letter: 'O',
-    glow: 'rgba(52,211,153,0.15)',
-    advantageKey: 'config.agentAdvantageCodex',
-  },
-  gemini: {
-    label: 'Gemini CLI',
-    color: '#a78bfa',
-    bg: 'rgba(167,139,250,0.08)',
-    letter: 'G',
-    glow: 'rgba(167,139,250,0.15)',
-    advantageKey: 'config.agentAdvantageGemini',
-  },
-};
+  hint?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <Label>{label}</Label>
+      {hint && <div className="mb-2 text-xs text-fg-5">{hint}</div>}
+      {children}
+    </div>
+  );
+}
 
-const effortOptions: Record<string, { value: string; labelKey: string }[]> = {
-  claude: [
-    { value: 'low', labelKey: 'effort.low' },
-    { value: 'medium', labelKey: 'effort.medium' },
-    { value: 'high', labelKey: 'effort.high' },
-  ],
-  codex: [
-    { value: 'minimal', labelKey: 'effort.minimal' },
-    { value: 'low', labelKey: 'effort.low' },
-    { value: 'medium', labelKey: 'effort.medium' },
-    { value: 'high', labelKey: 'effort.high' },
-    { value: 'xhigh', labelKey: 'effort.xhigh' },
-  ],
-};
+function MacSymbol({
+  children,
+  fill = 'none',
+}: {
+  children: ReactNode;
+  fill?: 'none' | 'currentColor';
+}) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill={fill}
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
 
-function IMCards({ onOpenTelegram, onOpenFeishu }: { onOpenTelegram: () => void; onOpenFeishu: () => void }) {
+function SettingRow({
+  icon,
+  title,
+  description,
+  status,
+  statusVariant,
+  actionLabel,
+  actionDisabled,
+  onAction,
+  descriptionMono,
+  meta,
+}: {
+  icon: ReactNode;
+  title: string;
+  description: ReactNode;
+  status?: string;
+  statusVariant?: 'ok' | 'warn' | 'err' | 'muted' | 'accent';
+  actionLabel?: string;
+  actionDisabled?: boolean;
+  onAction?: () => void | Promise<void>;
+  descriptionMono?: boolean;
+  meta?: string;
+}) {
+  return (
+    <div className="flex flex-col gap-3 py-4 first:pt-0 last:pb-0 md:flex-row md:items-center">
+      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-[14px] border border-edge bg-[linear-gradient(180deg,var(--color-panel),var(--color-panel-alt))] text-fg-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.72),0_1px_2px_rgba(15,23,42,0.05)]">
+        {icon}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="text-sm font-medium text-fg-2">{title}</div>
+          {status && <Badge variant={statusVariant || 'muted'}>{status}</Badge>}
+        </div>
+        <div className={cn('mt-1 text-sm leading-relaxed text-fg-4 break-words', descriptionMono && 'font-mono text-[12px] text-fg-3')}>
+          {description}
+        </div>
+        {meta && <div className="mt-2 text-xs text-fg-5">{meta}</div>}
+      </div>
+      {actionLabel && onAction && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start md:self-center"
+          disabled={actionDisabled}
+          onClick={onAction}
+        >
+          {actionLabel}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function PermissionGuideModal({
+  guide,
+  onClose,
+  onRefresh,
+}: {
+  guide: PermissionGuideState | null;
+  onClose: () => void;
+  onRefresh: () => void | Promise<void>;
+}) {
+  const { locale } = useStore();
+  const t = createT(locale);
+
+  if (!guide) return null;
+
+  const pathKey: Record<PermissionKey, string> = {
+    accessibility: 'perm.pathAccessibility',
+    screenRecording: 'perm.pathScreenRecording',
+    fullDiskAccess: 'perm.pathFullDiskAccess',
+  };
+
+  const labelKey: Record<PermissionKey, string> = {
+    accessibility: 'perm.accessibility',
+    screenRecording: 'perm.screenRecording',
+    fullDiskAccess: 'perm.fullDiskAccess',
+  };
+
+  const steps = [
+    ...(guide.action === 'prompted' ? [t('perm.guideAllowPrompt')] : []),
+    `${t('perm.guideOpenPathPrefix')}${t(pathKey[guide.permission])}`,
+    t(guide.permission === 'fullDiskAccess' ? 'perm.guideToggleHostApp' : 'perm.guideGrantHostApp'),
+    ...(guide.permission !== 'accessibility' ? [t('perm.guideMayNeedRestart')] : []),
+    t('perm.guideBackRefresh'),
+  ];
+
+  return (
+    <Modal open={!!guide} onClose={onClose}>
+      <ModalHeader
+        title={`${t(labelKey[guide.permission])} · ${t('perm.guideTitle')}`}
+        description={t(guide.action === 'prompted' ? 'perm.guidePromptIntro' : 'perm.guideSettingsIntro')}
+        onClose={onClose}
+      />
+      <div className="space-y-3">
+        <ol className="space-y-2 text-sm leading-relaxed text-fg-3">
+          {steps.map(step => (
+            <li key={step} className="rounded-lg border border-edge bg-panel-alt px-3 py-2">
+              {step}
+            </li>
+          ))}
+        </ol>
+      </div>
+      <div className="mt-6 flex justify-end gap-2">
+        <Button variant="ghost" onClick={onClose}>{t('perm.guideClose')}</Button>
+        <Button variant="primary" onClick={onRefresh}>{t('perm.guideRefresh')}</Button>
+      </div>
+    </Modal>
+  );
+}
+
+function AgentInventory({
+  agents,
+  loading,
+  activeAgent,
+  onSelect,
+}: {
+  agents: AgentRuntimeStatus[];
+  loading: boolean;
+  activeAgent: string;
+  onSelect: (agent: string) => void;
+}) {
+  const { locale } = useStore();
+  const t = createT(locale);
+
+  if (loading) {
+    return (
+      <div className="space-y-2">
+        {[0, 1, 2].map(index => (
+          <div key={index} className="rounded-lg border border-edge bg-panel-alt p-4">
+            <Skeleton className="mb-3 h-4 w-28" />
+            <Skeleton className="mb-2 h-3 w-40" />
+            <Skeleton className="h-3 w-full" />
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {agents.map(agent => {
+        const meta = getAgentMeta(agent.agent);
+        const selected = agent.agent === activeAgent;
+        const installState = agent.installed ? 'ok' : 'err';
+
+        return (
+          <button
+            key={agent.agent}
+            type="button"
+            disabled={!agent.installed}
+            onClick={() => agent.installed && onSelect(agent.agent)}
+            className={cn(
+              'w-full rounded-lg border p-4 text-left transition-[border-color,background,box-shadow,transform] duration-200',
+              'focus-visible:outline-none focus-visible:shadow-[0_0_0_4px_var(--th-glow-a)]',
+              selected
+                ? 'border-edge-h bg-panel-h shadow-[0_12px_28px_rgba(2,6,23,0.12)]'
+                : 'border-edge bg-panel-alt hover:border-edge-h hover:bg-panel',
+              !agent.installed && 'cursor-not-allowed opacity-65'
+            )}
+          >
+            <div className="flex items-start gap-3">
+              <BrandBadge brand={agent.agent} size={40} iconSize={19} className="rounded-lg bg-panel-alt shadow-[0_0_16px_var(--th-glow-a)]" />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-medium text-fg-2">{meta.label}</div>
+                  <Dot variant={installState} />
+                  {agent.isDefault && <Badge variant="accent">{t('config.defaultBadge')}</Badge>}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-5">
+                  <span className="font-mono text-fg-4">{agent.version || t('config.notInstalled')}</span>
+                  {agent.installed && <span>{formatUsageSummary(agent.usage, t)}</span>}
+                </div>
+                <div className="mt-2 text-sm leading-relaxed text-fg-4">{t(meta.advantageKey)}</div>
+                {!agent.installed && agent.installCommand && (
+                  <div className="mt-2 font-mono text-[11px] text-fg-5">{agent.installCommand}</div>
+                )}
+              </div>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function IMChannels({
+  onOpenTelegram,
+  onOpenFeishu,
+}: {
+  onOpenTelegram: () => void;
+  onOpenFeishu: () => void;
+}) {
   const { state, locale } = useStore();
   const t = createT(locale);
-  if (!state) return <div className="grid grid-cols-1 md:grid-cols-3 gap-3">{[0, 1, 2].map(i => <Card key={i}><Skeleton className="w-16 mb-2" /><Skeleton className="w-10" /></Card>)}</div>;
 
-  const channels = state.setupState?.channels || [];
+  const channels = state?.setupState?.channels || [];
   const tgState = channels.find(channel => channel.channel === 'telegram');
   const fsState = channels.find(channel => channel.channel === 'feishu');
 
-  const channelSubtitle = (channel: ChannelSetupState | undefined) => {
-    if (!channel || !channel.configured) return t('config.clickConfig');
-    return channel.detail || (channel.ready ? t('config.configured') : t('config.validationFailed'));
-  };
-
-  const channelDot = (channel: ChannelSetupState | undefined): 'ok' | 'warn' | 'err' => {
-    if (!channel || !channel.configured) return 'err';
-    if (channel.ready) return 'ok';
-    return channel.status === 'error' ? 'warn' : 'err';
-  };
+  const rows = [
+    {
+      key: 'telegram',
+      title: 'Telegram',
+      icon: <BrandIcon brand="telegram" size={20} />,
+      channel: tgState,
+      action: onOpenTelegram,
+    },
+    {
+      key: 'feishu',
+      title: 'Feishu',
+      icon: <BrandIcon brand="feishu" size={20} />,
+      channel: fsState,
+      action: onOpenFeishu,
+    },
+  ];
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-      <Card interactive onClick={onOpenTelegram}>
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-blue-500/10 shadow-[0_0_12px_rgba(59,130,246,0.1)]">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="#60a5fa"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.07-.2c-.08-.06-.19-.04-.27-.02-.12.02-1.96 1.25-5.54 3.67-.52.36-1 .53-1.42.52-.47-.01-1.37-.26-2.03-.48-.82-.27-1.47-.42-1.42-.88.03-.24.37-.49 1.02-.75 3.98-1.73 6.64-2.88 7.97-3.44 3.8-1.58 4.59-1.86 5.1-1.87.11 0 .37.03.54.17.14.12.18.28.2.45 0 .06.01.24 0 .38z" /></svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-[13px] font-medium text-fg-2">Telegram</div>
-            <div className="text-[11px] text-fg-4 truncate" title={channelSubtitle(tgState)}>{channelSubtitle(tgState)}</div>
-          </div>
-          <Dot variant={channelDot(tgState)} />
+    <Card className="space-y-4">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+          <Badge variant="muted">{t('config.imAccess')}</Badge>
+          <div className="text-sm leading-relaxed text-fg-4">{t('config.channelHint')}</div>
         </div>
-      </Card>
-
-      <Card interactive onClick={onOpenFeishu}>
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-violet-500/10 shadow-[0_0_12px_rgba(139,92,246,0.1)]">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="#a78bfa"><rect x="4" y="4" width="16" height="16" rx="3" /><path d="M8 9h3v6H8z" fill="var(--th-surface)" /><path d="M13 9h3v6h-3z" fill="var(--th-surface)" /></svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-[13px] font-medium text-fg-2">Feishu</div>
-            <div className="text-[11px] text-fg-4 truncate" title={channelSubtitle(fsState)}>{channelSubtitle(fsState)}</div>
-          </div>
-          <Dot variant={channelDot(fsState)} />
+        <div className="flex flex-wrap gap-2">
+          {rows.map(row => {
+            const badge = channelBadgeState(row.channel, t);
+            return (
+              <div
+                key={row.key}
+                className="flex min-w-[260px] flex-1 items-center gap-3 rounded-lg border border-edge bg-panel-alt px-3 py-2.5"
+              >
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-edge bg-panel">
+                  {row.icon}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-sm font-medium text-fg-2">{row.title}</div>
+                    <Badge variant={badge.variant}>{badge.label}</Badge>
+                  </div>
+                  <div className="truncate text-xs text-fg-5">{channelSummaryText(row.channel, t)}</div>
+                </div>
+                <Button variant="outline" size="sm" onClick={row.action}>
+                  {row.channel?.configured ? t('perm.settings') : t('config.configure')}
+                </Button>
+              </div>
+            );
+          })}
         </div>
-      </Card>
-
-      <Card className="opacity-30">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-emerald-500/10">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#34d399" strokeWidth="1.8"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-[13px] font-medium text-fg-3">WhatsApp</div>
-            <div className="text-[11px] text-fg-5">{t('config.comingSoon')}</div>
-          </div>
-        </div>
-      </Card>
-    </div>
+      </div>
+    </Card>
   );
 }
 
-function usageTone(usage: UsageResult | null): 'ok' | 'warn' | 'err' {
-  if (!usage?.ok) return 'err';
-  if (usage.windows.some(window => window.remainingPercent != null && window.remainingPercent <= 20)) return 'warn';
-  if (usage.status === 'limit_reached') return 'err';
-  return 'ok';
-}
-
-function formatUsageWindow(window: NonNullable<UsageResult['windows']>[number], t: (key: string) => string): string {
-  if (window.remainingPercent != null) return `${window.label} ${window.remainingPercent.toFixed(0)}%`;
-  if (window.status === 'limit_reached') return `${window.label} ${t('config.limitReached')}`;
-  if (window.status === 'warning') return `${window.label} ${t('config.balanceTight')}`;
-  if (window.status === 'allowed') return `${window.label} ${t('config.balanceHealthy')}`;
-  return window.label;
-}
-
-function formatUsageSummary(usage: UsageResult | null, t: (key: string) => string): string {
-  if (!usage?.ok) return usage?.error || t('config.balanceUnavailable');
-  if (!usage.windows.length) return usage.error || t('config.balanceUnavailable');
-  return usage.windows.slice(0, 2).map(window => formatUsageWindow(window, t)).join(' · ');
-}
-
-function AgentCards({ agents, loading }: { agents: AgentRuntimeStatus[]; loading: boolean }) {
-  const { locale } = useStore();
-  const t = createT(locale);
-  if (loading) return <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">{[0, 1, 2].map(i => <Card key={i}><Skeleton className="w-20 mb-3" /><Skeleton className="w-24 mb-2" /><Skeleton className="w-full mb-2" /><Skeleton className="w-3/4" /></Card>)}</div>;
-
-  return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-      {agents.map(agent => {
-        const meta = agentMeta[agent.agent] || { label: agent.agent, color: '#888', bg: 'rgba(128,128,128,0.08)', letter: '?', glow: 'rgba(128,128,128,0.1)', advantageKey: 'config.balanceUnavailable' };
-        const ok = agent.installed && agent.authStatus === 'ready';
-        const warn = agent.installed && agent.authStatus !== 'ready';
-        return (
-          <Card key={agent.agent} glow className="!p-4">
-            <div className="flex items-start gap-3 mb-3">
-              <div className="w-9 h-9 rounded-xl flex items-center justify-center text-[12px] font-bold shrink-0" style={{ background: meta.bg, color: meta.color, boxShadow: `0 0 12px ${meta.glow}` }}>{meta.letter}</div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <div className="text-[13px] font-medium text-fg-2 truncate">{meta.label}</div>
-                  <Dot variant={ok ? 'ok' : agent.installed ? 'warn' : 'err'} />
-                  {agent.isDefault && <Badge variant="accent" className="!text-[10px]">{t('config.defaultBadge')}</Badge>}
-                </div>
-                <div className="text-[11px] text-fg-4 mt-1 truncate">{agent.version || t('config.notInstalled')}</div>
-              </div>
-            </div>
-
-            <div className="space-y-3 text-[11px]">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-fg-5">{t('config.authStatus')}</span>
-                <span style={{ color: ok ? 'var(--th-ok)' : warn ? 'var(--th-warn)' : 'var(--th-fg-5)' }}>
-                  {ok ? t('config.authenticated') : warn ? t('config.needsLogin') : '—'}
-                </span>
-              </div>
-              {agent.installed && agent.authDetail && (
-                <div className="text-[10px] text-fg-5 leading-relaxed" title={agent.authDetail}>{agent.authDetail}</div>
-              )}
-
-              <div>
-                <div className="text-fg-5 mb-1">{t('config.balance')}</div>
-                <div className={`leading-relaxed ${usageTone(agent.usage) === 'err' ? 'text-fg-4' : 'text-fg-2'}`}>{formatUsageSummary(agent.usage, t)}</div>
-              </div>
-
-              <div>
-                <div className="text-fg-5 mb-1">{t('config.advantage')}</div>
-                <div className="text-fg-3 leading-relaxed">{t(meta.advantageKey)}</div>
-              </div>
-
-              {agent.selectedModel && (
-                <div className="pt-1 border-t border-edge">
-                  <div className="text-fg-5 mb-1">{t('config.model')}</div>
-                  <div className="font-mono text-[10px] text-fg-3 truncate">{agent.selectedModel}</div>
-                </div>
-              )}
-
-              {!agent.installed && agent.installCommand && (
-                <div className="font-mono text-[10px] text-fg-6">{agent.installCommand}</div>
-              )}
-            </div>
-          </Card>
-        );
-      })}
-    </div>
-  );
-}
-
-function PermissionCards() {
-  const { state, locale } = useStore();
+function SystemPermissions() {
+  const { state, locale, reload, toast } = useStore();
   const t = createT(locale);
   const permissions = state?.permissions || {};
-  if (!state) return <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">{[0, 1, 2].map(i => <Card key={i}><Skeleton className="w-20 mb-2" /><Skeleton className="w-full mb-1" /><Skeleton className="w-24" /></Card>)}</div>;
+  const [pendingPermission, setPendingPermission] = useState<PermissionKey | null>(null);
+  const [guide, setGuide] = useState<PermissionGuideState | null>(null);
 
-  const info: Record<string, { labelKey: string; reasonKey: string; pref: string }> = {
-    accessibility: { labelKey: 'perm.accessibility', reasonKey: 'perm.accessibilityReason', pref: 'accessibility' },
-    screenRecording: { labelKey: 'perm.screenRecording', reasonKey: 'perm.screenRecordingReason', pref: 'screenRecording' },
-    fullDiskAccess: { labelKey: 'perm.fullDiskAccess', reasonKey: 'perm.fullDiskAccessReason', pref: 'fullDiskAccess' },
+  const info: Record<PermissionKey, { labelKey: string; reasonKey: string; actionLabelKey: string; manualHintKey?: string; icon: ReactNode }> = {
+    accessibility: {
+      labelKey: 'perm.accessibility',
+      reasonKey: 'perm.accessibilityReason',
+      actionLabelKey: 'perm.authorize',
+      icon: (
+        <MacSymbol>
+          <circle cx="12" cy="5" r="1.8" />
+          <path d="M12 7.7v10.2" />
+          <path d="M8.4 10h7.2" />
+          <path d="M9.6 19.2 12 15.1l2.4 4.1" />
+        </MacSymbol>
+      ),
+    },
+    screenRecording: {
+      labelKey: 'perm.screenRecording',
+      reasonKey: 'perm.screenRecordingReason',
+      actionLabelKey: 'perm.authorize',
+      icon: (
+        <MacSymbol>
+          <rect x="4" y="5.5" width="11.5" height="10" rx="2.4" />
+          <path d="m17.5 8.4 2.7-1.5v7.2l-2.7-1.5" />
+          <circle cx="9.75" cy="10.5" r="1.1" fill="currentColor" stroke="none" />
+        </MacSymbol>
+      ),
+    },
+    fullDiskAccess: {
+      labelKey: 'perm.fullDiskAccess',
+      reasonKey: 'perm.fullDiskAccessReason',
+      actionLabelKey: 'perm.settings',
+      manualHintKey: 'perm.fullDiskAccessManualHint',
+      icon: (
+        <MacSymbol>
+          <rect x="6.2" y="10.1" width="11.6" height="8.6" rx="2.6" />
+          <path d="M9 10V7.8a3 3 0 1 1 6 0V10" />
+          <circle cx="12" cy="13.5" r="0.9" fill="currentColor" stroke="none" />
+          <path d="M12 14.6v1.8" />
+        </MacSymbol>
+      ),
+    },
   };
 
+  const handlePermissionAction = useCallback(async (permission: PermissionKey) => {
+    if (pendingPermission) return;
+    setPendingPermission(permission);
+    try {
+      const result = await api.requestPermission(permission);
+      if (!result.ok) {
+        toast(result.error || t('perm.requestFailed'), false);
+        return;
+      }
+
+      if (result.action === 'already_granted') {
+        toast(t('perm.alreadyGranted'));
+        await reload();
+        return;
+      }
+
+      toast(
+        result.action === 'prompted'
+          ? t('perm.promptOpened')
+          : permission === 'fullDiskAccess'
+            ? t('perm.settingsOpenedManual')
+            : t('perm.settingsOpened')
+      );
+      setGuide({
+        permission,
+        action: result.action === 'prompted' ? 'prompted' : 'opened_settings',
+      });
+    } catch (error) {
+      toast(error instanceof Error && error.message ? error.message : t('perm.requestFailed'), false);
+    } finally {
+      setPendingPermission(current => (current === permission ? null : current));
+    }
+  }, [pendingPermission, reload, t, toast]);
+
+  const handleRefreshPermissionState = useCallback(async () => {
+    if (!guide) return;
+    const permission = guide.permission;
+    const nextState = await reload();
+    if (nextState?.permissions?.[permission]?.granted) toast(t('perm.grantedNow'));
+    else toast(t('perm.stillPending'), false);
+    setGuide(null);
+  }, [guide, reload, t, toast]);
+
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-3">
-      {Object.entries(permissions).map(([key, value]: [string, PermissionStatus]) => {
-        const item = info[key] || { labelKey: key, reasonKey: 'config.balanceUnavailable', pref: key };
-        return (
-          <Card key={key} className="!p-4">
-            <div className="flex items-start gap-3">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <div className="text-[12px] font-medium text-fg-2">{t(item.labelKey)}</div>
-                  <Dot variant={value.granted ? 'ok' : 'err'} />
-                </div>
-                <div className="text-[11px] text-fg-5 leading-relaxed">{t(item.reasonKey)}</div>
-              </div>
-              {value.checkable && !value.granted && (
-                <Button variant="ghost" size="sm" className="shrink-0 !text-[10px]" onClick={() => api.openPreferences(item.pref)}>
-                  {t('perm.settings')}
-                </Button>
-              )}
-            </div>
-          </Card>
-        );
-      })}
-    </div>
+    <Card>
+      <div className="mb-4 text-sm leading-relaxed text-fg-4">{t('config.permissionHint')}</div>
+
+      {!state ? (
+        <div className="space-y-2">
+          {[0, 1, 2].map(index => <Skeleton key={index} className="h-16 rounded-lg" />)}
+        </div>
+      ) : (
+        <div className="divide-y divide-edge">
+          {Object.entries(info).map(([key, item]) => {
+            const value = permissions[key] as PermissionStatus | undefined;
+            const granted = !!value?.granted;
+            const permissionKey = key as PermissionKey;
+            return (
+              <SettingRow
+                key={key}
+                icon={item.icon}
+                title={t(item.labelKey)}
+                description={t(item.reasonKey)}
+                meta={!granted && item.manualHintKey ? t(item.manualHintKey) : undefined}
+                status={granted ? t('config.authorized') : t('config.pendingAuth')}
+                statusVariant={granted ? 'ok' : 'warn'}
+                actionLabel={value?.checkable && !granted
+                  ? pendingPermission === permissionKey
+                    ? t('perm.waiting')
+                    : t(item.actionLabelKey)
+                  : undefined}
+                actionDisabled={pendingPermission != null}
+                onAction={value?.checkable && !granted ? () => handlePermissionAction(permissionKey) : undefined}
+              />
+            );
+          })}
+        </div>
+      )}
+      <PermissionGuideModal
+        guide={guide}
+        onClose={() => setGuide(null)}
+        onRefresh={handleRefreshPermissionState}
+      />
+    </Card>
   );
 }
 
-function applyAgentSnapshot(snapshot: AgentStatusResponse, setAgents: (value: AgentRuntimeStatus[]) => void, setSelectedAgent: (value: string | ((prev: string) => string)) => void, setWorkdir: (value: string) => void, preserveSelection: boolean) {
+function applyAgentSnapshot(
+  snapshot: AgentStatusResponse,
+  setAgents: (value: AgentRuntimeStatus[]) => void,
+  setSelectedAgent: (value: string | ((prev: string) => string)) => void,
+  preserveSelection: boolean,
+) {
   setAgents(snapshot.agents);
-  setWorkdir(snapshot.workdir);
   setSelectedAgent(prev => {
     if (preserveSelection && prev && snapshot.agents.some(agent => agent.agent === prev && agent.installed)) return prev;
     return snapshot.defaultAgent;
   });
 }
 
-export function ConfigTab({ onOpenTelegram, onOpenFeishu }: { onOpenTelegram: () => void; onOpenFeishu: () => void }) {
-  const { state, toast, locale } = useStore();
+export function ConfigTab({
+  onOpenTelegram,
+  onOpenFeishu,
+}: {
+  onOpenTelegram: () => void;
+  onOpenFeishu: () => void;
+}) {
+  const { toast, locale } = useStore();
   const t = createT(locale);
   const [agents, setAgents] = useState<AgentRuntimeStatus[]>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
-  const [runtimeWorkdir, setRuntimeWorkdir] = useState('');
   const [loadingAgents, setLoadingAgents] = useState(true);
+  const [updatingDefault, setUpdatingDefault] = useState(false);
+  const hasAgents = useRef(false);
 
   const loadAgentStatus = useCallback(async (preserveSelection = true) => {
-    if (!agents.length) setLoadingAgents(true);
+    if (!hasAgents.current) setLoadingAgents(true);
     try {
       const snapshot = await api.getAgentStatus();
-      applyAgentSnapshot(snapshot, setAgents, setSelectedAgent, setRuntimeWorkdir, preserveSelection);
-    } catch (err) {
-      if (!agents.length) toast(err instanceof Error ? err.message : t('config.loadAgentFailed'), false);
+      applyAgentSnapshot(snapshot, setAgents, setSelectedAgent, preserveSelection);
+      hasAgents.current = snapshot.agents.length > 0;
+    } catch (error) {
+      if (!hasAgents.current) toast(error instanceof Error ? error.message : t('config.loadAgentFailed'), false);
     } finally {
       setLoadingAgents(false);
     }
-  }, [agents.length, t, toast]);
+  }, [t, toast]);
 
   useEffect(() => {
     void loadAgentStatus(false);
-    const timer = setInterval(() => { void loadAgentStatus(true); }, 30000);
-    return () => clearInterval(timer);
   }, [loadAgentStatus]);
-
-  const installedAgents = useMemo(
-    () => agents.filter(agent => agent.installed).map(agent => ({ value: agent.agent, label: agentMeta[agent.agent]?.label || agent.agent })),
-    [agents]
-  );
 
   const activeAgent = useMemo(
     () => agents.find(agent => agent.agent === selectedAgent) || agents.find(agent => agent.isDefault) || agents.find(agent => agent.installed) || null,
@@ -300,17 +516,17 @@ export function ConfigTab({ onOpenTelegram, onOpenFeishu }: { onOpenTelegram: ()
   }, [activeAgent]);
 
   const reasoningOptions = useMemo(
-    () => (activeAgent ? (effortOptions[activeAgent.agent] || []).map(option => ({ value: option.value, label: t(option.labelKey) })) : []),
-    [activeAgent, t]
+    () => (activeAgent ? (effortOptions[activeAgent.agent] || []).map(value => ({ value, label: value })) : []),
+    [activeAgent]
   );
 
   const updateRuntime = useCallback(async (patch: Record<string, unknown>) => {
     try {
       const snapshot = await api.updateRuntimeAgent(patch);
       if (!snapshot.ok) throw new Error(snapshot.error || t('config.applyFailed'));
-      applyAgentSnapshot(snapshot, setAgents, setSelectedAgent, setRuntimeWorkdir, true);
-    } catch (err) {
-      toast(err instanceof Error ? err.message : t('config.applyFailed'), false);
+      applyAgentSnapshot(snapshot, setAgents, setSelectedAgent, true);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : t('config.applyFailed'), false);
       void loadAgentStatus(true);
     }
   }, [loadAgentStatus, t, toast]);
@@ -318,9 +534,19 @@ export function ConfigTab({ onOpenTelegram, onOpenFeishu }: { onOpenTelegram: ()
   const handleAgentChange = (next: string) => {
     if (!next || next === selectedAgent) return;
     setSelectedAgent(next);
-    setAgents(prev => prev.map(agent => ({ ...agent, isDefault: agent.agent === next })));
-    void updateRuntime({ defaultAgent: next });
   };
+
+  const handleDefaultAgentChange = useCallback(async () => {
+    if (!activeAgent || !activeAgent.installed || activeAgent.isDefault || updatingDefault) return;
+    const nextDefault = activeAgent.agent;
+    setUpdatingDefault(true);
+    setAgents(prev => prev.map(agent => ({ ...agent, isDefault: agent.agent === nextDefault })));
+    try {
+      await updateRuntime({ defaultAgent: nextDefault });
+    } finally {
+      setUpdatingDefault(false);
+    }
+  }, [activeAgent, updateRuntime, updatingDefault]);
 
   const handleModelChange = (next: string) => {
     if (!activeAgent || !next || next === activeAgent.selectedModel) return;
@@ -334,66 +560,122 @@ export function ConfigTab({ onOpenTelegram, onOpenFeishu }: { onOpenTelegram: ()
     void updateRuntime({ agent: activeAgent.agent, effort: next });
   };
 
-  const currentWorkdir = runtimeWorkdir || state?.bot?.workdir || state?.runtimeWorkdir || '';
+  const activeMeta = getAgentMeta(activeAgent?.agent || selectedAgent || 'claude');
+  const usageVariant = activeAgent ? usageTone(activeAgent.usage) : 'muted';
+  const usageBadge = activeAgent ? usageBadgeText(activeAgent.usage) : 'unavailable';
 
   return (
     <div className="animate-in space-y-8">
-      <section>
-        <SectionLabel>{t('config.imAccess')}</SectionLabel>
-        <IMCards onOpenTelegram={onOpenTelegram} onOpenFeishu={onOpenFeishu} />
-      </section>
+      <IMChannels onOpenTelegram={onOpenTelegram} onOpenFeishu={onOpenFeishu} />
 
-      <section>
+      <section className="space-y-4">
         <SectionLabel>{t('config.aiAgent')}</SectionLabel>
-        <AgentCards agents={agents} loading={loadingAgents} />
-      </section>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.95fr)]">
+          <Card className="space-y-4">
+            <div>
+              <div className="text-base font-semibold tracking-tight text-fg">{t('config.runtimeTitle')}</div>
+              <div className="mt-1 text-sm leading-relaxed text-fg-4">{t('config.runtimeSubtitle')}</div>
+            </div>
 
-      <section>
-        <SectionLabel>{t('config.sysPerms')}</SectionLabel>
-        <div className="text-[12px] text-fg-5 mb-3 leading-relaxed">{t('config.permissionHint')}</div>
-        <PermissionCards />
-      </section>
+            <AgentInventory
+              agents={agents}
+              loading={loadingAgents}
+              activeAgent={activeAgent?.agent || selectedAgent}
+              onSelect={handleAgentChange}
+            />
+          </Card>
 
-      <section>
-        <SectionLabel>{t('config.hostStatus')}</SectionLabel>
-        <HostCards />
-      </section>
-
-      <section>
-        <SectionLabel>{t('config.general')}</SectionLabel>
-        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)] gap-3">
-          <Card className="!p-4">
-            <div className="text-[12px] font-medium text-fg-2 mb-1">{t('config.defaultAgent')}</div>
-            <div className="text-[11px] text-fg-5 mb-3 leading-relaxed">{t('config.instantApply')}</div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div>
-                <div className="text-[11px] font-medium text-fg-4 mb-2">{t('config.defaultAgent')}</div>
-                <Select value={activeAgent?.agent || selectedAgent} options={installedAgents} onChange={handleAgentChange} />
-              </div>
-              <div>
-                <div className="text-[11px] font-medium text-fg-4 mb-2">{t('config.model')}</div>
-                <Select value={activeAgent?.selectedModel || ''} options={modelOptions} onChange={handleModelChange} />
-              </div>
-              <div>
-                <div className="text-[11px] font-medium text-fg-4 mb-2">{t('config.thinkingMode')}</div>
-                {reasoningOptions.length > 0
-                  ? <Select value={activeAgent?.selectedEffort || reasoningOptions[0]?.value || ''} options={reasoningOptions} onChange={handleEffortChange} />
-                  : (
-                    <div className="h-[38px] px-3.5 rounded-[10px] border border-edge bg-inset flex items-center text-[12px] text-fg-5">
-                      {t('config.noReasoningMode')}
+          <Card className="space-y-5">
+            <div className="flex items-start gap-3">
+              <AgentAvatar agent={activeAgent?.agent || selectedAgent || 'claude'} />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-base font-semibold tracking-tight text-fg">
+                        {activeAgent ? activeMeta.label : t('config.notInstalled')}
+                      </div>
+                      {activeAgent?.isDefault && <Badge variant="accent">{t('config.defaultBadge')}</Badge>}
                     </div>
-                  )
-                }
+                    <div className="mt-1 text-sm text-fg-4">
+                      {activeAgent?.version || t('config.notInstalled')}
+                    </div>
+                  </div>
+                  {!loadingAgents && activeAgent && activeAgent.installed && !activeAgent.isDefault && (
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      disabled={updatingDefault}
+                      onClick={handleDefaultAgentChange}
+                    >
+                      {t(updatingDefault ? 'config.settingDefault' : 'config.setDefaultAction')}
+                    </Button>
+                  )}
+                </div>
               </div>
             </div>
-          </Card>
 
-          <Card className="!p-4">
-            <div className="text-[12px] font-medium text-fg-2 mb-2">{t('config.workdir')}</div>
-            <div className="font-mono text-[11px] text-fg-3 break-all leading-relaxed min-h-[54px]">{currentWorkdir || '—'}</div>
-            <div className="text-[11px] text-fg-5 mt-3 leading-relaxed">{t('config.switchDirHint')}</div>
+            <div className="space-y-4">
+              <Field label={t('config.model')}>
+                {loadingAgents ? (
+                  <Skeleton className="h-9 rounded-md" />
+                ) : (
+                  <Select
+                    value={activeAgent?.selectedModel || ''}
+                    options={modelOptions}
+                    onChange={handleModelChange}
+                    disabled={!activeAgent?.installed || modelOptions.length === 0}
+                    placeholder={t('config.noModel')}
+                  />
+                )}
+              </Field>
+
+              <Field label={t('config.thinkingMode')}>
+                {loadingAgents ? (
+                  <Skeleton className="h-9 rounded-md" />
+                ) : reasoningOptions.length > 0 ? (
+                  <Select
+                    value={activeAgent?.selectedEffort || reasoningOptions[0]?.value || ''}
+                    options={reasoningOptions}
+                    onChange={handleEffortChange}
+                    disabled={!activeAgent?.installed}
+                  />
+                ) : (
+                  <div className="flex h-9 items-center rounded-md border border-edge bg-inset px-3 text-sm text-fg-5">
+                    {t('config.noReasoningMode')}
+                  </div>
+                )}
+              </Field>
+            </div>
+
+            <div className="rounded-lg border border-edge bg-inset p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-fg-5">{t('config.balance')}</div>
+                <Badge variant={usageVariant === 'ok' ? 'ok' : usageVariant === 'warn' ? 'warn' : usageVariant === 'err' ? 'err' : 'muted'}>
+                  {usageBadge}
+                </Badge>
+              </div>
+              <div className="mt-3 flex items-start gap-2 text-sm leading-relaxed text-fg-3">
+                <Dot variant={usageVariant === 'ok' ? 'ok' : usageVariant === 'warn' ? 'warn' : usageVariant === 'err' ? 'err' : 'idle'} />
+                <span>{formatUsageSummary(activeAgent?.usage || null, t)}</span>
+              </div>
+              <div className="mt-4 border-t border-edge pt-4 text-sm leading-relaxed text-fg-4">
+                {t(activeMeta.advantageKey)}
+              </div>
+            </div>
+
+            {!activeAgent?.installed && activeAgent?.installCommand && (
+              <div className="rounded-lg border border-dashed border-edge bg-panel-alt px-3 py-2 font-mono text-[11px] text-fg-5">
+                {activeAgent.installCommand}
+              </div>
+            )}
           </Card>
         </div>
+      </section>
+
+      <section className="space-y-4">
+        <SectionLabel>{t('config.sysPerms')}</SectionLabel>
+        <SystemPermissions />
       </section>
     </div>
   );

@@ -34,8 +34,36 @@ describe('bot-telegram render helpers', () => {
     });
 
     expect(usageLines.join('\n')).toContain('<b>Provider Usage</b>');
-    expect(usageLines.join('\n')).toContain('Claude: 40% used / 60% left');
-    expect(usageLines.join('\n')).toContain('rate limited');
+    expect(usageLines.join('\n')).toContain('Claude: 40% used status=rate_limited resetAfterSeconds=120');
+    expect(formatMenuLines([{ command: 'status', description: 'Show status' }])[0]).toBe('/status — Show status');
+  });
+
+  it('keeps codex usage output in raw status form', () => {
+    const usageLines = formatProviderUsageLines({
+      ok: true,
+      capturedAt: null,
+      status: null,
+      windows: [
+        {
+          label: 'Primary',
+          usedPercent: 82,
+          remainingPercent: 18,
+          resetAfterSeconds: 300,
+          status: 'warning',
+        },
+        {
+          label: 'Secondary',
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetAfterSeconds: null,
+          status: 'allowed',
+        },
+      ],
+      error: null,
+    });
+
+    expect(usageLines.join('\n')).toContain('Primary: 82% used status=warning resetAfterSeconds=300');
+    expect(usageLines.join('\n')).toContain('Secondary: 0% used status=allowed');
     expect(formatMenuLines([{ command: 'status', description: 'Show status' }])[0]).toBe('/status — Show status');
   });
 

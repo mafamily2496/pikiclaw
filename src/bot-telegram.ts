@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import {
   Bot, VERSION, type Agent, type SessionRuntime, type StreamResult,
   fmtTokens, fmtUptime, fmtBytes, buildPrompt,
-  parseAllowedChatIds, shellSplit,
+  parseAllowedChatIds,
 } from './bot.js';
 import {
   type BotArtifact,
@@ -27,26 +27,38 @@ import {
 } from './bot-menu.js';
 import {
   getStartData,
-  getSessionsPageData,
-  getAgentsListData,
-  getModelsListData,
   getStatusDataAsync,
   getHostDataSync,
-  modelMatchesSelection,
   resolveSkillPrompt,
   summarizePromptForStatus,
 } from './bot-commands.js';
+import {
+  buildAgentsCommandView,
+  buildModelsCommandView,
+  buildSessionsCommandView,
+  decodeCommandAction,
+  executeCommandAction,
+  type CommandActionResult,
+} from './bot-command-ui.js';
 import { buildSwitchWorkdirView, resolveRegisteredPath } from './bot-telegram-directory.js';
 import { LivePreview, type LivePreviewRenderer } from './bot-telegram-live-preview.js';
+import {
+  formatActiveTaskRestartError,
+  getActiveTaskCount,
+  registerProcessRuntime,
+  buildRestartCommand,
+  requestProcessRestart,
+} from './process-control.js';
 import {
   buildInitialPreviewHtml,
   buildStreamPreviewHtml,
   buildFinalReplyRender,
-  buildCompactSelectionNotice,
-  buildCompactSelectionTitle,
   escapeHtml,
   formatMenuLines,
   formatProviderUsageLines,
+  renderCommandNoticeHtml,
+  renderCommandSelectionHtml,
+  renderCommandSelectionKeyboard,
   renderSessionTurnHtml,
   truncateMiddle,
 } from './bot-telegram-render.js';
@@ -61,27 +73,6 @@ const telegramPreviewRenderer: LivePreviewRenderer = {
   renderInitial: buildInitialPreviewHtml,
   renderStream: buildStreamPreviewHtml,
 };
-
-function isNpxBinary(bin: string): boolean {
-  return path.basename(bin, path.extname(bin)).toLowerCase() === 'npx';
-}
-
-function ensureNonInteractiveRestartArgs(bin: string, args: string[]): string[] {
-  if (!isNpxBinary(bin)) return args;
-  if (args.includes('--yes') || args.includes('-y')) return args;
-  return ['--yes', ...args];
-}
-
-function chunkInlineButtons<T>(items: T[], columns: number): T[][] {
-  const rows: T[][] = [];
-  const count = Math.max(1, columns);
-  for (let i = 0; i < items.length; i += count) rows.push(items.slice(i, i + count));
-  return rows;
-}
-
-function compactButtonLabel(text: string, maxChars = 20): string {
-  return truncateMiddle(text.replace(/\s+/g, ' ').trim(), maxChars);
-}
 
 type ShutdownSignal = 'SIGINT' | 'SIGTERM';
 type ProcessSignal = ShutdownSignal | 'SIGUSR2';
@@ -105,6 +96,7 @@ export class TelegramBot extends Bot {
   private shutdownExitCode: number | null = null;
   private shutdownForceExitTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandlers: Partial<Record<ProcessSignal, () => void>> = {};
+  private processRuntimeCleanup: (() => void) | null = null;
 
   constructor() {
     super();
@@ -113,12 +105,12 @@ export class TelegramBot extends Bot {
     if (config.telegramAllowedChatIds) {
       for (const id of parseAllowedChatIds(config.telegramAllowedChatIds)) this.allowedChatIds.add(id);
     }
-    this.token = String(config.telegramBotToken || '').trim();
+    this.token = String(config.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
     if (!this.token) throw new Error('Missing Telegram token. Configure via dashboard or set TELEGRAM_BOT_TOKEN');
   }
 
   protected override onManagedConfigChange(config: Record<string, any>, opts: { initial?: boolean } = {}) {
-    const nextToken = String(config.telegramBotToken || '').trim();
+    const nextToken = String(config.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
     if (nextToken && nextToken !== this.token) {
       this.token = nextToken;
       if (!opts.initial) this.log('telegram token reloaded from setting.json');
@@ -165,11 +157,7 @@ export class TelegramBot extends Bot {
 
     const onSigint = () => this.beginShutdown('SIGINT');
     const onSigterm = () => this.beginShutdown('SIGTERM');
-    const onSigusr2 = () => {
-      if (this.shutdownInFlight) return;
-      this.log('SIGUSR2 received, restarting...');
-      this.performRestart();
-    };
+    const onSigusr2 = () => this.performRestart();
 
     this.signalHandlers = {
       SIGINT: onSigint,
@@ -188,6 +176,13 @@ export class TelegramBot extends Bot {
     shutdownAllDrivers();
   }
 
+  private buildRestartEnv(): Record<string, string> {
+    const knownIds = new Set(this.allowedChatIds);
+    const knownChats = this.channel.knownChats instanceof Set ? this.channel.knownChats : new Set<number>();
+    for (const cid of knownChats) knownIds.add(cid);
+    return knownIds.size ? { TELEGRAM_ALLOWED_CHAT_IDS: [...knownIds].join(',') } : {};
+  }
+
   private beginShutdown(sig: ShutdownSignal) {
     if (this.shutdownInFlight) return;
 
@@ -203,6 +198,21 @@ export class TelegramBot extends Bot {
       process.exit(this.shutdownExitCode ?? 1);
     }, SHUTDOWN_FORCE_EXIT_MS);
     this.shutdownForceExitTimer.unref?.();
+  }
+
+  private performRestart() {
+    this.cleanupRuntimeForExit();
+    const { bin, args } = buildRestartCommand(process.argv.slice(2));
+    const child = spawn(bin, args, {
+      stdio: 'inherit',
+      detached: true,
+      env: {
+        ...process.env,
+        npm_config_yes: process.env.npm_config_yes || 'true',
+      },
+    });
+    child.unref();
+    process.exit(0);
   }
 
   private getCurrentMenuState() {
@@ -261,13 +271,12 @@ export class TelegramBot extends Bot {
       agent: cs.agent,
       workdir: this.workdir,
       files: [],
-      localSessionId: null,
       sessionId: null,
       title: title || files[0] || 'New session',
     });
     const runtime = this.upsertSessionRuntime({
       agent: cs.agent,
-      localSessionId: staged.localSessionId,
+      sessionId: staged.sessionId,
       workspacePath: staged.workspacePath,
       modelId: this.modelForAgent(cs.agent),
     });
@@ -308,38 +317,55 @@ export class TelegramBot extends Bot {
     await ctx.reply(lines.join('\n'), { parseMode: 'HTML' });
   }
 
-  private sessionsPageSize = 5;
-
-  private async buildSessionsPage(chatId: number, page: number): Promise<{ text: string; keyboard: { inline_keyboard: { text: string; callback_data: string }[][] } }> {
-    const d = await getSessionsPageData(this, chatId, page, this.sessionsPageSize);
-    const text = buildCompactSelectionTitle('Sessions', d.agent);
-    const rows: { text: string; callback_data: string }[][] = [];
-
-    for (const s of d.sessions) {
-      const icon = s.isRunning ? '● ' : s.isCurrent ? '○ ' : '';
-      const prefix = compactButtonLabel(s.title, 18);
-      let cbData = `sess:${s.key}`;
-      if (cbData.length > 64) cbData = cbData.slice(0, 64);
-      rows.push([{ text: `${icon}${prefix} ${s.time}`, callback_data: cbData }]);
-    }
-
-    const navRow: { text: string; callback_data: string }[] = [];
-    if (d.page > 0) navRow.push({ text: `◀ ${d.page}/${d.totalPages}`, callback_data: `sp:${d.page - 1}` });
-    navRow.push({ text: '+ New', callback_data: 'sess:new' });
-    if (d.page < d.totalPages - 1) navRow.push({ text: `${d.page + 2}/${d.totalPages} ▶`, callback_data: `sp:${d.page + 1}` });
-    rows.push(navRow);
-
-    return { text, keyboard: { inline_keyboard: rows } };
+  private async sendCommandView(ctx: TgContext, view: Awaited<ReturnType<typeof buildSessionsCommandView>>) {
+    await ctx.reply(
+      renderCommandSelectionHtml(view),
+      { parseMode: 'HTML', keyboard: renderCommandSelectionKeyboard(view) },
+    );
   }
 
-  private async cmdSessions(ctx: TgContext) {
-    const cs = this.chat(ctx.chatId);
-    const res = await this.fetchSessions(cs.agent);
-    if (!res.ok) { await ctx.reply(`Error: ${res.error}`); return; }
-    if (!res.sessions.length) { await ctx.reply(`No ${cs.agent} sessions found in:\n<code>${escapeHtml(this.workdir)}</code>`, { parseMode: 'HTML' }); return; }
+  private async replyCommandResult(ctx: TgContext, result: CommandActionResult) {
+    if (result.kind === 'view') {
+      await this.sendCommandView(ctx, result.view);
+      return;
+    }
+    if (result.kind === 'notice') {
+      const sent = await ctx.reply(renderCommandNoticeHtml(result.notice), { parseMode: 'HTML' });
+      if (result.session && typeof sent === 'number') this.registerSessionMessage(ctx.chatId, sent, result.session);
+      if (result.previewSession) {
+        await this.previewCurrentSessionTurn(ctx.chatId, result.previewSession.agent, result.previewSession.sessionId);
+      }
+      return;
+    }
+    await ctx.reply(escapeHtml(result.message), { parseMode: 'HTML' });
+  }
 
-    const { text, keyboard } = await this.buildSessionsPage(ctx.chatId, 0);
-    await ctx.reply(text, { parseMode: 'HTML', keyboard });
+  private async applyCommandCallbackResult(ctx: TgCallbackContext, result: CommandActionResult) {
+    if (result.kind === 'noop') {
+      await ctx.answerCallback(result.message);
+      return;
+    }
+    if (result.kind === 'view') {
+      await ctx.editReply(
+        ctx.messageId,
+        renderCommandSelectionHtml(result.view),
+        { parseMode: 'HTML', keyboard: renderCommandSelectionKeyboard(result.view) },
+      );
+      await ctx.answerCallback(result.callbackText ?? undefined);
+      return;
+    }
+    await ctx.answerCallback(result.callbackText ?? undefined);
+    await ctx.editReply(ctx.messageId, renderCommandNoticeHtml(result.notice), { parseMode: 'HTML' });
+    if (result.session) this.registerSessionMessage(ctx.chatId, ctx.messageId, result.session);
+    if (result.previewSession) {
+      await this.previewCurrentSessionTurn(ctx.chatId, result.previewSession.agent, result.previewSession.sessionId);
+    }
+  }
+
+  private sessionsPageSize = 5;
+
+  private async cmdSessions(ctx: TgContext) {
+    await this.sendCommandView(ctx, await buildSessionsCommandView(this, ctx.chatId, 0, this.sessionsPageSize));
   }
 
   private async cmdStatus(ctx: TgContext) {
@@ -353,7 +379,7 @@ export class TelegramBot extends Bot {
       '',
       `<b>Agent:</b> ${escapeHtml(d.agent)}`,
       `<b>Model:</b> ${escapeHtml(d.model)}`,
-      `<b>Session:</b> ${d.localSessionId ? `<code>${escapeHtml(d.localSessionId)}</code>` : d.sessionId ? `<code>${escapeHtml(d.sessionId.slice(0, 16))}</code>` : '(new)'}`,
+      `<b>Session:</b> ${d.sessionId ? `<code>${escapeHtml(d.sessionId.slice(0, 16))}</code>` : '(new)'}`,
       `<b>Active Tasks:</b> ${d.activeTasksCount}`,
     ];
     if (d.running) {
@@ -399,94 +425,25 @@ export class TelegramBot extends Bot {
   }
 
   private async cmdAgents(ctx: TgContext) {
-    const d = getAgentsListData(this, ctx.chatId);
-    const buttons: { text: string; callback_data: string }[] = [];
-    for (const a of d.agents) {
-      if (a.installed) {
-        buttons.push({
-          text: a.isCurrent ? `● ${a.agent}` : a.agent,
-          callback_data: `ag:${a.agent}`,
-        });
-      }
-    }
-    const text = buildCompactSelectionTitle('Agents');
-    const keyboard = buttons.length ? { inline_keyboard: chunkInlineButtons(buttons, 3) } : undefined;
-    await ctx.reply(text, { parseMode: 'HTML', keyboard });
+    await this.sendCommandView(ctx, buildAgentsCommandView(this, ctx.chatId));
   }
 
   private async cmdModels(ctx: TgContext) {
-    const d = await getModelsListData(this, ctx.chatId);
-    const models = [...d.models].sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent));
-    const buttons: { text: string; callback_data: string }[] = [];
-    if (!d.models.length) {
-      const detail = d.note || 'No discoverable models found.';
-      await ctx.reply(`${buildCompactSelectionTitle('Models', d.agent)}\n<i>${escapeHtml(detail)}</i>`, { parseMode: 'HTML' });
-      return;
-    }
-    for (const m of models) {
-      buttons.push({
-        text: m.isCurrent ? `● ${compactButtonLabel(m.alias || m.id, 24)}` : compactButtonLabel(m.alias || m.id, 24),
-        callback_data: `mod:${m.id}`,
-      });
-    }
-    const rows = chunkInlineButtons(buttons, buttons.some(button => button.text.length > 14) ? 1 : 2);
-    if (d.effort) {
-      rows.push(d.effort.levels.map(level => ({
-        text: level.isCurrent ? `● ${level.label}` : level.label,
-        callback_data: `eff:${level.id}`,
-      })));
-    }
-    await ctx.reply(
-      buildCompactSelectionTitle('Models', d.agent),
-      { parseMode: 'HTML', keyboard: { inline_keyboard: rows } },
-    );
+    await this.sendCommandView(ctx, await buildModelsCommandView(this, ctx.chatId));
   }
 
   private async cmdRestart(ctx: TgContext) {
-    const activeTasks = this.activeTasks.size;
+    const activeTasks = getActiveTaskCount();
     if (activeTasks > 0) {
-      await ctx.reply(`⚠ ${activeTasks} task(s) still running. Wait for them to finish or try again.`, { parseMode: 'HTML' });
+      await ctx.reply(`⚠ ${formatActiveTaskRestartError(activeTasks)}`, { parseMode: 'HTML' });
       return;
     }
-
     await ctx.reply(
       `<b>Restarting codeclaw...</b>\n\n` +
-      `Pulling latest version via <code>npx --yes codeclaw@latest</code>.\n` +
       `The bot will be back shortly.`,
       { parseMode: 'HTML' },
     );
-
-    this.performRestart();
-  }
-
-  /** Disconnect, spawn a new process, and exit. */
-  private performRestart() {
-    this.log('restart: disconnecting...');
-    this.cleanupRuntimeForExit();
-
-    const restartCmd = process.env.CODECLAW_RESTART_CMD || 'npx --yes codeclaw@latest';
-    const [bin, ...rawArgs] = shellSplit(restartCmd);
-    const baseArgs = ensureNonInteractiveRestartArgs(bin, rawArgs);
-    const allArgs = [...baseArgs, ...process.argv.slice(2)];
-
-    this.log(`restart: spawning \`${bin} ${allArgs.join(' ')}\``);
-    // Collect all known chat IDs so the new process can send startup notices
-    const knownIds = new Set(this.allowedChatIds);
-    const knownChats = this.channel.knownChats instanceof Set ? this.channel.knownChats : new Set<number>();
-    for (const cid of knownChats) knownIds.add(cid);
-
-    const child = spawn(bin, allArgs, {
-      stdio: 'inherit',
-      detached: true,
-      env: {
-        ...process.env,
-        npm_config_yes: process.env.npm_config_yes || 'true',
-        ...(knownIds.size ? { TELEGRAM_ALLOWED_CHAT_IDS: [...knownIds].join(',') } : {}),
-      },
-    });
-    child.unref();
-    this.log(`restart: new process spawned (PID ${child.pid}), exiting...`);
-    process.exit(0);
+    void requestProcessRestart({ log: msg => this.log(msg) });
   }
 
   // ---- streaming bridge -----------------------------------------------------
@@ -508,14 +465,13 @@ export class TelegramBot extends Bot {
             agent: session.agent,
             workdir: this.workdir,
             files: msg.files,
-            localSessionId: session.localSessionId,
             sessionId: session.sessionId,
             title: msg.files[0],
           });
           session.workspacePath = staged.workspacePath;
           this.syncSelectedChats(session);
           if (!staged.importedFiles.length) throw new Error('no files persisted');
-          this.log(`[handleMessage] staged workspace files chat=${ctx.chatId} local_session=${staged.localSessionId} files=${staged.importedFiles.length}`);
+          this.log(`[handleMessage] staged workspace files chat=${ctx.chatId} session=${staged.sessionId} files=${staged.importedFiles.length}`);
           this.registerSessionMessage(ctx.chatId, ctx.messageId, session);
           await this.safeSetMessageReaction(ctx.chatId, ctx.messageId, ['👌']);
         } catch (e: any) {
@@ -536,7 +492,7 @@ export class TelegramBot extends Bot {
     const start = Date.now();
     const canEditMessages = supportsChannelCapability((this as any).channel, 'editMessages');
     const canSendTyping = supportsChannelCapability((this as any).channel, 'typingIndicators');
-    this.log(`[handleMessage] queued chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} local_session=${session.localSessionId} prompt="${prompt.slice(0, 100)}" files=${files.length}`);
+    this.log(`[handleMessage] queued chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} prompt="${prompt.slice(0, 100)}" files=${files.length}`);
     let phId: number | null = null;
     if (canEditMessages) {
       const placeholderId = await ctx.reply(buildInitialPreviewHtml(session.agent), { parseMode: 'HTML', messageThreadId });
@@ -589,7 +545,7 @@ export class TelegramBot extends Bot {
         const artifacts = result.artifacts || [];
 
         this.log(
-          `[handleMessage] done agent=${session.agent} ok=${result.ok} session=${result.sessionId || '?'} local_session=${result.localSessionId || '?'} elapsed=${result.elapsedS.toFixed(1)}s edits=${livePreview?.getEditCount() || 0} ` +
+          `[handleMessage] done agent=${session.agent} ok=${result.ok} session=${result.sessionId || '?'} elapsed=${result.elapsedS.toFixed(1)}s edits=${livePreview?.getEditCount() || 0} ` +
           `tokens=in:${fmtTokens(result.inputTokens)}/cached:${fmtTokens(result.cachedInputTokens)}/out:${fmtTokens(result.outputTokens)} artifacts=${artifacts.length}`
         );
         this.log(`[handleMessage] response preview: "${result.message.slice(0, 150)}"`);
@@ -607,7 +563,7 @@ export class TelegramBot extends Bot {
         this.log(`[handleMessage] final reply sent to chat=${ctx.chatId}`);
       } catch (e: any) {
         const msgText = String(e?.message || e || 'Unknown error');
-        this.log(`[handleMessage] task failed chat=${ctx.chatId} local_session=${session.localSessionId} error=${msgText}`);
+        this.log(`[handleMessage] task failed chat=${ctx.chatId} session=${session.sessionId} error=${msgText}`);
         const errorHtml = `<b>Error</b>\n\n<code>${escapeHtml(msgText.slice(0, 500))}</code>`;
         if (phId != null) {
           try {
@@ -765,18 +721,25 @@ export class TelegramBot extends Bot {
   }
 
   private async handleSessionsPageCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
-    if (!data.startsWith('sp:')) return false;
-    const page = parseInt(data.slice(3), 10) || 0;
-    const view = await this.buildSessionsPage(ctx.chatId, page);
-    await ctx.editReply(ctx.messageId, view.text, { parseMode: 'HTML', keyboard: view.keyboard });
-    await ctx.answerCallback('');
+    const action = decodeCommandAction(data);
+    if (!action) return false;
+    const result = await executeCommandAction(this, ctx.chatId, action, {
+      sessionsPageSize: this.sessionsPageSize,
+    });
+    await this.applyCommandCallbackResult(ctx, result);
     return true;
   }
 
-  private async previewCurrentSessionTurn(chatId: number, agent: Agent, localSessionId: string | null, sessionId: string | null) {
+  async handleCallback(data: string, ctx: TgCallbackContext) {
+    if (await this.handleSwitchNavigateCallback(data, ctx)) return;
+    if (await this.handleSwitchSelectCallback(data, ctx)) return;
+    if (await this.handleSessionsPageCallback(data, ctx)) return;
+    await ctx.answerCallback();
+  }
+
+  private async previewCurrentSessionTurn(chatId: number, agent: Agent, sessionId: string | null) {
     try {
-      const tailId = localSessionId || sessionId;
-      const tail = tailId ? await this.fetchSessionTail(agent, tailId, 50) : { ok: true, messages: [], error: null };
+      const tail = sessionId ? await this.fetchSessionTail(agent, sessionId, 50) : { ok: true, messages: [], error: null };
       if (!tail.ok || !tail.messages.length) return;
 
       const messages = tail.messages;
@@ -797,133 +760,13 @@ export class TelegramBot extends Bot {
       const previewHtml = renderSessionTurnHtml(lastUserText, assistantTexts.join('\n\n'));
       if (!previewHtml) return;
       const sent = await this.channel.send(chatId, previewHtml, { parseMode: 'HTML' });
-      if (localSessionId) {
-        const runtime = this.getSessionRuntimeByKey(this.sessionKey(agent, localSessionId));
+      if (sessionId) {
+        const runtime = this.getSessionRuntimeByKey(this.sessionKey(agent, sessionId));
         if (runtime && typeof sent === 'number') this.registerSessionMessage(chatId, sent, runtime);
       }
     } catch {
       // non-critical
     }
-  }
-
-  private async handleSessionCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
-    if (!data.startsWith('sess:')) return false;
-
-    const requestedSessionId = data.slice(5);
-    const cs = this.chat(ctx.chatId);
-    if (requestedSessionId === 'new') {
-      this.resetChatConversation(cs);
-      await ctx.answerCallback('New session');
-      await ctx.editReply(ctx.messageId, '<b>New session</b>', { parseMode: 'HTML' });
-      return true;
-    }
-
-    const res = await this.fetchSessions(cs.agent);
-    if (!res.ok) {
-      await ctx.answerCallback('Failed to load sessions');
-      return true;
-    }
-
-    const session = res.sessions.find(entry =>
-      entry.localSessionId === requestedSessionId
-      || entry.sessionId === requestedSessionId
-      || entry.engineSessionId === requestedSessionId,
-    );
-    if (!session) {
-      await ctx.answerCallback('Session not found');
-      return true;
-    }
-
-    this.adoptSession(cs, session);
-    const runtime = session.localSessionId ? this.getSessionRuntimeByKey(this.sessionKey(session.agent, session.localSessionId)) : null;
-    const displayId = session.localSessionId || session.sessionId || requestedSessionId;
-    await ctx.answerCallback(`Session: ${displayId.slice(0, 12)}`);
-    await ctx.editReply(
-      ctx.messageId,
-      buildCompactSelectionNotice('Session', displayId),
-      { parseMode: 'HTML' },
-    );
-    if (runtime) this.registerSessionMessage(ctx.chatId, ctx.messageId, runtime);
-    await this.previewCurrentSessionTurn(ctx.chatId, session.agent, session.localSessionId, session.sessionId);
-    return true;
-  }
-
-  private async handleAgentCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
-    if (!data.startsWith('ag:')) return false;
-
-    const agent = data.slice(3) as Agent;
-    const cs = this.chat(ctx.chatId);
-    if (cs.agent === agent) {
-      await ctx.answerCallback(`Already using ${agent}`);
-      return true;
-    }
-
-    cs.agent = agent;
-    this.resetChatConversation(cs);
-    this.log(`agent switched to ${agent} chat=${ctx.chatId}`);
-    await ctx.answerCallback(`Switched to ${agent}`);
-    await ctx.editReply(
-      ctx.messageId,
-      buildCompactSelectionNotice('Agent', agent, 'Session reset'),
-      { parseMode: 'HTML' },
-    );
-    return true;
-  }
-
-  private async handleModelCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
-    if (!data.startsWith('mod:')) return false;
-
-    const modelId = data.slice(4);
-    const cs = this.chat(ctx.chatId);
-    const currentModel = this.modelForAgent(cs.agent);
-    if (modelMatchesSelection(cs.agent, modelId, currentModel)) {
-      await ctx.answerCallback(`Already using ${modelId}`);
-      return true;
-    }
-
-    this.setModelForAgent(cs.agent, modelId);
-    this.resetChatConversation(cs);
-    this.log(`model switched to ${modelId} for ${cs.agent} chat=${ctx.chatId}`);
-    await ctx.answerCallback(`Switched to ${modelId}`);
-    await ctx.editReply(
-      ctx.messageId,
-      buildCompactSelectionNotice('Model', modelId, `${cs.agent} · session reset`),
-      { parseMode: 'HTML' },
-    );
-    return true;
-  }
-
-  private async handleEffortCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
-    if (!data.startsWith('eff:')) return false;
-
-    const effortId = data.slice(4);
-    const cs = this.chat(ctx.chatId);
-    const currentEffort = this.effortForAgent(cs.agent);
-    if (effortId === currentEffort) {
-      await ctx.answerCallback(`Already using ${effortId} effort`);
-      return true;
-    }
-
-    this.setEffortForAgent(cs.agent, effortId);
-    this.log(`effort switched to ${effortId} for ${cs.agent} chat=${ctx.chatId}`);
-    await ctx.answerCallback(`Effort set to ${effortId}`);
-    await ctx.editReply(
-      ctx.messageId,
-      `<b>Thinking effort set to <code>${escapeHtml(effortId)}</code></b>\n\nAgent: ${escapeHtml(cs.agent)}\nTakes effect on next message.`,
-      { parseMode: 'HTML' },
-    );
-    return true;
-  }
-
-  async handleCallback(data: string, ctx: TgCallbackContext) {
-    if (await this.handleSwitchNavigateCallback(data, ctx)) return;
-    if (await this.handleSwitchSelectCallback(data, ctx)) return;
-    if (await this.handleSessionsPageCallback(data, ctx)) return;
-    if (await this.handleSessionCallback(data, ctx)) return;
-    if (await this.handleAgentCallback(data, ctx)) return;
-    if (await this.handleModelCallback(data, ctx)) return;
-    if (await this.handleEffortCallback(data, ctx)) return;
-    await ctx.answerCallback();
   }
 
   // ---- command router -------------------------------------------------------
@@ -975,19 +818,24 @@ export class TelegramBot extends Bot {
       workdir: tmpDir,
       allowedChatIds: this.allowedChatIds.size ? this.allowedChatIds as Set<number> : undefined,
     });
+    this.processRuntimeCleanup?.();
+    this.processRuntimeCleanup = registerProcessRuntime({
+      label: 'telegram',
+      getActiveTaskCount: () => this.activeTasks.size,
+      prepareForRestart: () => this.cleanupRuntimeForExit(),
+      buildRestartEnv: () => this.buildRestartEnv(),
+    });
     this.installSignalHandlers();
 
     try {
       const bot = await this.channel.connect();
+      this.connected = true;
       this.log(`bot: @${bot.username} (id=${bot.id})`);
 
-      const drained = await this.channel.drain();
-      if (drained) this.log(`drained ${drained} pending update(s)`);
+      this.channel.skipPendingUpdatesOnNextListen();
 
       // Seed knownChats so setupMenu applies per-chat commands
       for (const cid of this.allowedChatIds) if (typeof cid === 'number') this.channel.knownChats.add(cid);
-
-      await this.setupMenu();
 
       for (const ag of this.fetchAgents().agents) {
         this.log(`agent ${ag.agent}: ${ag.path || 'NOT FOUND'}`);
@@ -999,9 +847,9 @@ export class TelegramBot extends Bot {
       this.channel.onCallback((data, ctx) => this.handleCallback(data, ctx));
       this.channel.onError(err => this.log(`error: ${err}`));
 
-      await this.sendStartupNotice();
-
       this.startKeepAlive();
+      void this.setupMenu().catch(err => this.log(`menu setup failed: ${err}`));
+      void this.sendStartupNotice().catch(err => this.log(`startup notice failed: ${err}`));
       this.log('polling started');
       await this.channel.listen();
       this.stopKeepAlive();
@@ -1010,6 +858,8 @@ export class TelegramBot extends Bot {
       this.stopKeepAlive();
       this.clearShutdownForceExitTimer();
       this.removeSignalHandlers();
+      this.processRuntimeCleanup?.();
+      this.processRuntimeCleanup = null;
       if (this.shutdownInFlight) process.exit(this.shutdownExitCode ?? 1);
     }
   }

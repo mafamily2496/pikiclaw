@@ -101,7 +101,7 @@ async function main() {
       break;
     }
     case 'claude-status': {
-      const info = listAgents().agents.find(a => a.agent === 'claude')!;
+      const info = listAgents({ includeVersion: true }).agents.find(a => a.agent === 'claude')!;
       const mark = info.installed ? '\u2713' : '\u2717';
       process.stdout.write(`${mark} claude  ${info.version ?? 'not installed'}  ${info.path ?? ''}\n`);
       const usage = getUsage({ agent: 'claude' });
@@ -115,7 +115,7 @@ async function main() {
       break;
     }
     case 'codex-status': {
-      const info = listAgents().agents.find(a => a.agent === 'codex')!;
+      const info = listAgents({ includeVersion: true }).agents.find(a => a.agent === 'codex')!;
       const mark = info.installed ? '\u2713' : '\u2717';
       process.stdout.write(`${mark} codex  ${info.version ?? 'not installed'}  ${info.path ?? ''}\n`);
       const usage = getUsage({ agent: 'codex' });
@@ -162,7 +162,7 @@ async function main() {
         const date = s.createdAt ? s.createdAt.replace('T', ' ').slice(0, 19) : '?';
         const model = s.model ? ` model=${s.model}` : '';
         const title = s.title ? `  ${s.title}` : '';
-        const displayId = s.localSessionId || s.sessionId || s.engineSessionId || '(none)';
+        const displayId = s.sessionId || '(none)';
         process.stdout.write(`  ${displayId}  ${date}${model}${run}\n`);
         if (title) process.stdout.write(`    ${title}\n`);
       }
@@ -179,9 +179,7 @@ async function main() {
           process.stderr.write(`No ${agent} sessions found for ${workdir}\n`);
           process.exit(1);
         }
-        sessionId = sessions.sessions[0].localSessionId
-          || sessions.sessions[0].sessionId
-          || sessions.sessions[0].engineSessionId;
+        sessionId = sessions.sessions[0].sessionId;
         if (!sessionId) {
           process.stderr.write(`Latest ${agent} session has no usable session ID\n`);
           process.exit(1);

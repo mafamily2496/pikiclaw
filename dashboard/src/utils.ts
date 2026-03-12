@@ -23,3 +23,57 @@ export function fmtTime(iso?: string): string {
 export function cn(...classes: (string | false | undefined | null)[]): string {
   return classes.filter(Boolean).join(' ');
 }
+
+export interface AgentMeta {
+  label: string;
+  color: string;
+  bg: string;
+  letter: string;
+  glow: string;
+  border: string;
+  advantageKey: string;
+}
+
+const defaultMeta: AgentMeta = {
+  label: '?',
+  color: '#94a3b8',
+  bg: 'rgba(148,163,184,0.1)',
+  letter: '?',
+  glow: 'rgba(148,163,184,0.16)',
+  border: 'rgba(148,163,184,0.18)',
+  advantageKey: '',
+};
+
+export const agentMeta: Record<string, AgentMeta> = {
+  claude: {
+    label: 'Claude Code',
+    color: '#b4c6ff',
+    bg: 'rgba(180,198,255,0.12)',
+    letter: 'C',
+    glow: 'rgba(180,198,255,0.2)',
+    border: 'rgba(180,198,255,0.2)',
+    advantageKey: 'config.agentAdvantageClaude',
+  },
+  codex: {
+    label: 'Codex',
+    color: '#7dd3fc',
+    bg: 'rgba(125,211,252,0.12)',
+    letter: 'O',
+    glow: 'rgba(125,211,252,0.2)',
+    border: 'rgba(125,211,252,0.2)',
+    advantageKey: 'config.agentAdvantageCodex',
+  },
+  gemini: {
+    label: 'Gemini CLI',
+    color: '#c4b5fd',
+    bg: 'rgba(196,181,253,0.12)',
+    letter: 'G',
+    glow: 'rgba(196,181,253,0.2)',
+    border: 'rgba(196,181,253,0.2)',
+    advantageKey: 'config.agentAdvantageGemini',
+  },
+};
+
+export function getAgentMeta(agent: string): AgentMeta {
+  return agentMeta[agent] || { ...defaultMeta, label: agent };
+}

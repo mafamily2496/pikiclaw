@@ -10,6 +10,7 @@ import {
   doClaudeStream,
   doCodexStream,
   doStream,
+  getSessionTail,
   getUsage,
   labelFromWindowMinutes,
   listModels,
@@ -83,13 +84,13 @@ describe('stageSessionFiles', () => {
       files: [uploadPath],
     });
 
-    const stagedDir = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', staged.localSessionId);
+    const stagedDir = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', staged.sessionId);
     expect(staged.workspacePath).toBe(path.join(stagedDir, 'workspace'));
     expect(fs.existsSync(path.join(staged.workspacePath, 'report.txt'))).toBe(true);
     expect(fs.existsSync(path.join(stagedDir, 'session.json'))).toBe(true);
 
-    const localSessionId = 'sess_legacy_layout';
-    const legacyWorkspacePath = path.join(tmpDir, '.codeclaw', 'workspaces', 'claude', localSessionId);
+    const legacySessionId = 'sess_legacy_layout';
+    const legacyWorkspacePath = path.join(tmpDir, '.codeclaw', 'workspaces', 'claude', legacySessionId);
     const legacyMetaDir = path.join(legacyWorkspacePath, '.codeclaw');
     fs.mkdirSync(legacyMetaDir, { recursive: true });
     fs.writeFileSync(path.join(legacyWorkspacePath, 'legacy.txt'), 'legacy');
@@ -100,10 +101,9 @@ describe('stageSessionFiles', () => {
     fs.writeFileSync(path.join(tmpDir, '.codeclaw', 'sessions', 'index.json'), JSON.stringify({
       version: 1,
       sessions: [{
-        localSessionId,
+        sessionId: legacySessionId,
         agent: 'claude',
         workdir: tmpDir,
-        engineSessionId: 'engine-legacy',
         workspacePath: legacyWorkspacePath,
         createdAt: '2026-03-10T00:00:00.000Z',
         updatedAt: '2026-03-10T00:00:00.000Z',
@@ -117,10 +117,10 @@ describe('stageSessionFiles', () => {
       agent: 'claude',
       workdir: tmpDir,
       files: [],
-      localSessionId,
+      sessionId: legacySessionId,
     });
 
-    const migratedDir = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', localSessionId);
+    const migratedDir = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', legacySessionId);
     expect(migrated.workspacePath).toBe(path.join(migratedDir, 'workspace'));
     expect(fs.existsSync(path.join(migrated.workspacePath, 'legacy.txt'))).toBe(true);
     expect(fs.existsSync(path.join(migratedDir, 'return.json'))).toBe(true);
@@ -585,13 +585,13 @@ describe('doStream and attachments', () => {
       workdir: tmpDir,
       files: [],
     });
-    const manifestPath = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', staged.localSessionId, 'return.json');
+    const manifestPath = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', staged.sessionId, 'return.json');
     fs.writeFileSync(manifestPath, JSON.stringify({
       files: [{ path: 'README.md', kind: 'document', caption: 'stale artifact' }],
     }, null, 2));
 
     const routed = await doStream(baseOpts('claude', {
-      localSessionId: staged.localSessionId,
+      sessionId: staged.sessionId,
       prompt: 'new turn without artifacts',
     }));
     expect(routed.ok).toBe(true);
@@ -756,6 +756,55 @@ exit 0`;
       expect(claudeUsage.status).toBe('warning');
       expect(claudeUsage.windows[0].status).toBe('warning');
       expect(claudeUsage.windows[0].resetAfterSeconds).toBe(39 * 3600);
+    });
+  });
+});
+
+describe('getSessionTail', () => {
+  it('falls back to Codex rollout files when app-server history is unavailable', async () => {
+    await withTempHome(async homeDir => {
+      const emptyBin = makeTmpDir('codeclaw-empty-bin-');
+      const oldPath = process.env.PATH;
+      process.env.PATH = emptyBin;
+      try {
+        const workdir = path.join(homeDir, 'project');
+        fs.mkdirSync(workdir, { recursive: true });
+
+        const sessionsDir = path.join(homeDir, '.codex', 'sessions', '2026', '03', '12');
+        fs.mkdirSync(sessionsDir, { recursive: true });
+        fs.writeFileSync(path.join(sessionsDir, 'rollout-2026-03-12T00-00-00-test.jsonl'), [
+          JSON.stringify({
+            type: 'session_meta',
+            payload: { id: 'sess-fallback', cwd: workdir },
+          }),
+          JSON.stringify({
+            type: 'event_msg',
+            payload: { type: 'user_message', message: 'first question' },
+          }),
+          JSON.stringify({
+            type: 'event_msg',
+            payload: { type: 'agent_message', message: 'first answer' },
+          }),
+        ].join('\n'));
+
+        const tail = await getSessionTail({
+          agent: 'codex',
+          sessionId: 'sess-fallback',
+          workdir,
+          limit: 4,
+        });
+
+        expect(tail).toEqual({
+          ok: true,
+          messages: [
+            { role: 'user', text: 'first question' },
+            { role: 'assistant', text: 'first answer' },
+          ],
+          error: null,
+        });
+      } finally {
+        process.env.PATH = oldPath;
+      }
     });
   });
 });

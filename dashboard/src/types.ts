@@ -5,9 +5,7 @@ export interface AgentInfo {
   label: string;
   installed: boolean;
   version?: string;
-  authStatus?: string;
   installCommand?: string;
-  authDetail?: string;
 }
 
 export interface ModelInfo {
@@ -48,7 +46,7 @@ export interface AgentStatusResponse {
   agents: AgentRuntimeStatus[];
 }
 
-export type ChannelStatus = 'ready' | 'missing' | 'invalid' | 'error';
+export type ChannelStatus = 'ready' | 'missing' | 'invalid' | 'error' | 'checking';
 
 export interface ChannelSetupState {
   channel: 'telegram' | 'feishu' | 'whatsapp';
@@ -72,10 +70,21 @@ export interface PermissionStatus {
   detail: string;
 }
 
+export type PermissionRequestAction = 'already_granted' | 'prompted' | 'opened_settings' | 'unsupported';
+
+export interface PermissionRequestResult {
+  ok: boolean;
+  action: PermissionRequestAction;
+  granted: boolean;
+  requiresManualGrant: boolean;
+  error?: string;
+}
+
 export interface BotStatus {
   workdir: string;
   defaultAgent: Agent;
   uptime: number;
+  connected: boolean;
   stats: {
     totalTurns: number;
     totalInputTokens: number;
@@ -87,7 +96,12 @@ export interface BotStatus {
 
 export interface UserConfig {
   defaultAgent?: Agent;
-  defaultWorkdir?: string;
+  claudeModel?: string;
+  claudeReasoningEffort?: string;
+  codexModel?: string;
+  codexReasoningEffort?: string;
+  geminiModel?: string;
+  workdir?: string;
   telegramBotToken?: string;
   telegramAllowedChatIds?: string;
   feishuAppId?: string;
@@ -98,13 +112,14 @@ export interface UserConfig {
 export interface AppState {
   version: string;
   ready: boolean;
+  configExists: boolean;
   config: UserConfig;
   runtimeWorkdir: string;
   setupState: SetupState | null;
   permissions: Record<string, PermissionStatus>;
   platform: string;
   pid: number;
-  nodeVersion: string;
+  nodeVersion?: string;
   bot: BotStatus | null;
 }
 
@@ -125,12 +140,23 @@ export interface HostInfo {
 
 export interface SessionInfo {
   sessionId: string;
-  localSessionId?: string;
   title?: string;
   createdAt?: string;
   running?: boolean;
+  isCurrent?: boolean;
   model?: string;
   workdir?: string;
+}
+
+export interface SessionsPageResult {
+  ok: boolean;
+  sessions: SessionInfo[];
+  error: string | null;
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasMore: boolean;
 }
 
 export interface SessionTailMessage {

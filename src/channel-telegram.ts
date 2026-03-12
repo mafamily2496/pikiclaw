@@ -277,6 +277,7 @@ class TelegramChannel extends Channel {
   private requireMention: boolean;
 
   private offset = 0;
+  private skipPendingOnNextListen = false;
   private running = false;
   private ac = new AbortController();
   private messageChains = new Map<string, Promise<void>>();
@@ -338,12 +339,17 @@ class TelegramChannel extends Channel {
     let backoff = 3000;
     while (this.running) {
       try {
+        const requestOffset = this.skipPendingOnNextListen ? -1 : this.offset;
         const data = await this.api('getUpdates', {
-          offset: this.offset, timeout: this.pollTimeout,
+          offset: requestOffset, timeout: this.pollTimeout,
           allowed_updates: ['message', 'callback_query'],
         });
+        const skippedPending = this.skipPendingOnNextListen;
+        if (skippedPending) this.skipPendingOnNextListen = false;
         backoff = 3000; // reset on success
-        for (const update of data.result || []) {
+        const results = data.result || [];
+        if (skippedPending && !results.length) this.offset = 0;
+        for (const update of results) {
           this.offset = update.update_id + 1;
           this._dispatch(update).catch(e => this._hError?.(e));
         }
@@ -367,6 +373,10 @@ class TelegramChannel extends Channel {
   disconnect() {
     this.running = false;
     this.ac.abort();
+  }
+
+  skipPendingUpdatesOnNextListen() {
+    this.skipPendingOnNextListen = true;
   }
 
   private _logOutgoingText(action: string, meta: string, text: string) {

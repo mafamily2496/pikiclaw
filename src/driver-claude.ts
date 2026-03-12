@@ -17,7 +17,7 @@ import {
   appendSystemPrompt, buildStreamPreviewMeta, pushRecentActivity,
   summarizeClaudeToolUse, summarizeClaudeToolResult,
   IMAGE_EXTS, mimeForExt,
-  listCodeclawSessions, findCodeclawSessionByLocalId,
+  listCodeclawSessions, findCodeclawSession,
   readTailLines, stripInjectedPrompts,
   roundPercent, toIsoFromEpochSeconds, modelFamily, emptyUsage, normalizeUsageStatus,
 } from './code-agent.js';
@@ -177,11 +177,68 @@ function claudeProjectDirName(workdir: string): string {
   return workdir.replace(/\//g, '-');
 }
 
+/** Read native Claude Code sessions from ~/.claude/projects/{dirName}/*.jsonl */
+function getNativeClaudeSessions(workdir: string): SessionInfo[] {
+  const home = process.env.HOME || '';
+  if (!home) return [];
+  const projectDir = path.join(home, '.claude', 'projects', claudeProjectDirName(workdir));
+  if (!fs.existsSync(projectDir)) return [];
+
+  const sessions: SessionInfo[] = [];
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(projectDir, { withFileTypes: true }); } catch { return []; }
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+    const sessionId = entry.name.slice(0, -6); // strip .jsonl
+    const filePath = path.join(projectDir, entry.name);
+    try {
+      const stat = fs.statSync(filePath);
+      // Read first few KB to extract title and model from first user/assistant messages
+      const fd = fs.openSync(filePath, 'r');
+      const buf = Buffer.alloc(8192);
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+      fs.closeSync(fd);
+      const head = buf.toString('utf8', 0, bytesRead);
+      const lines = head.split('\n');
+
+      let title: string | null = null;
+      let model: string | null = null;
+      for (const line of lines) {
+        if (!line || line[0] !== '{') continue;
+        try {
+          const ev = JSON.parse(line);
+          if (!title && ev.type === 'user') {
+            const text = extractClaudeText(ev.message?.content, true).replace(/\s+/g, ' ').trim();
+            if (text) title = text.length <= 120 ? text : `${text.slice(0, 117).trimEnd()}...`;
+          }
+          if (!model && ev.type === 'assistant' && ev.message?.model) {
+            model = ev.message.model;
+          }
+          if (title && model) break;
+        } catch { /* skip */ }
+      }
+
+      sessions.push({
+        sessionId,
+        agent: 'claude',
+        workdir,
+        workspacePath: null,
+        model,
+        createdAt: stat.birthtime.toISOString(),
+        title,
+        running: Date.now() - stat.mtimeMs < 10_000,
+      });
+    } catch { /* skip unreadable files */ }
+  }
+  return sessions;
+}
+
 function getClaudeSessions(workdir: string, limit?: number): SessionListResult {
-  const sessions = listCodeclawSessions(workdir, 'claude', limit).map(record => ({
-    sessionId: record.engineSessionId,
-    localSessionId: record.localSessionId,
-    engineSessionId: record.engineSessionId,
+  const resolvedWorkdir = path.resolve(workdir);
+  // Merge codeclaw-tracked sessions with native Claude sessions
+  const codeclawSessions = listCodeclawSessions(resolvedWorkdir, 'claude').map(record => ({
+    sessionId: record.sessionId,
     agent: 'claude' as const,
     workdir: record.workdir,
     workspacePath: record.workspacePath,
@@ -190,6 +247,27 @@ function getClaudeSessions(workdir: string, limit?: number): SessionListResult {
     title: record.title,
     running: Date.now() - Date.parse(record.updatedAt) < 10_000,
   }));
+  const nativeSessions = getNativeClaudeSessions(resolvedWorkdir);
+
+  // Merge: codeclaw records take precedence (they have workspacePath etc.)
+  const seen = new Set<string>();
+  const merged: SessionInfo[] = [];
+  for (const s of codeclawSessions) {
+    if (s.sessionId) seen.add(s.sessionId);
+    merged.push(s);
+  }
+  for (const s of nativeSessions) {
+    if (s.sessionId && !seen.has(s.sessionId)) merged.push(s);
+  }
+
+  // Sort by createdAt descending
+  merged.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''));
+  const sessions = typeof limit === 'number' ? merged.slice(0, limit) : merged;
+  const projectDir = path.join(process.env.HOME || '', '.claude', 'projects', claudeProjectDirName(resolvedWorkdir));
+  agentLog(
+    `[sessions:claude] workdir=${resolvedWorkdir} projectDir=${projectDir} projectDirExists=${fs.existsSync(projectDir)} ` +
+    `codeclaw=${codeclawSessions.length} native=${nativeSessions.length} merged=${sessions.length}`
+  );
   return { ok: true, sessions, error: null };
 }
 
@@ -284,18 +362,11 @@ function getClaudeUsageFromOAuth(): UsageResult | null {
     const capturedAt = new Date().toISOString();
     const apiError = data?.error;
     if (apiError && typeof apiError === 'object') {
-      const type = typeof apiError.type === 'string' ? apiError.type.trim() : '';
-      const message = typeof apiError.message === 'string' ? apiError.message.trim() : '';
-      const error = [type, message].filter(Boolean).join(': ') || 'Claude usage query failed.';
-      return {
-        ok: false,
-        agent: 'claude',
-        source: 'oauth-api',
-        capturedAt,
-        status: normalizeUsageStatus(type),
-        windows: [],
-        error,
-      };
+      // The usage query endpoint itself returned an error (e.g. 429 rate
+      // limit on the query API).  This does NOT reflect the user's actual
+      // Claude usage status, so fall through to telemetry instead of
+      // reporting a misleading "limit_reached".
+      return null;
     }
 
     const makeWindow = (label: string, entry: any): UsageWindowInfo | null => {
@@ -379,7 +450,11 @@ function getClaudeUsageFromTelemetry(home: string, model?: string | null): Usage
   const status = normalizeUsageStatus(chosen.status);
   const resetAfterSeconds = chosen.hoursTillReset == null ? null : Math.max(0, Math.round(chosen.hoursTillReset * 3600));
   const resetAt = resetAfterSeconds == null ? null : new Date(chosen.capturedAtMs + resetAfterSeconds * 1000).toISOString();
-  const windows: UsageWindowInfo[] = [{ label: 'Last seen', usedPercent: null, remainingPercent: null, resetAt, resetAfterSeconds, status }];
+  // Build a locale-neutral label from capture age (e.g. "3h ago", "2d ago")
+  const ageMs = Date.now() - chosen.capturedAtMs;
+  const ageMins = Math.round(ageMs / 60_000);
+  const ageLabel = ageMins < 1 ? '<1m ago' : ageMins < 60 ? `${ageMins}m ago` : ageMins < 1440 ? `${Math.round(ageMins / 60)}h ago` : `${Math.round(ageMins / 1440)}d ago`;
+  const windows: UsageWindowInfo[] = [{ label: ageLabel, usedPercent: null, remainingPercent: null, resetAt, resetAfterSeconds, status }];
 
   return { ok: true, agent: 'claude', source: 'telemetry', capturedAt: chosen.capturedAt, status, windows, error: null };
 }
@@ -404,11 +479,6 @@ class ClaudeDriver implements AgentDriver {
   }
 
   async getSessionTail(opts: SessionTailOpts): Promise<SessionTailResult> {
-    const managed = findCodeclawSessionByLocalId(opts.workdir, 'claude', opts.sessionId);
-    if (managed) {
-      if (!managed.engineSessionId) return { ok: true, messages: [], error: null };
-      return getClaudeSessionTail({ ...opts, sessionId: managed.engineSessionId });
-    }
     return getClaudeSessionTail(opts);
   }
 

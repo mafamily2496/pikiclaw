@@ -6,14 +6,16 @@
  */
 
 import { registerDriver, type AgentDriver } from './agent-driver.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   type AgentInfo, type StreamOpts, type StreamResult,
-  type SessionListResult, type SessionTailOpts, type SessionTailResult,
+  type SessionListResult, type SessionInfo, type SessionTailOpts, type SessionTailResult,
   type ModelListOpts, type ModelListResult,
   type UsageOpts, type UsageResult,
   run, agentLog, detectAgentBin, buildStreamPreviewMeta,
   pushRecentActivity,
-  listCodeclawSessions, findCodeclawSessionByLocalId,
+  listCodeclawSessions, findCodeclawSession,
   emptyUsage,
 } from './code-agent.js';
 
@@ -89,11 +91,75 @@ export async function doGeminiStream(opts: StreamOpts): Promise<StreamResult> {
 // Sessions / Tail
 // ---------------------------------------------------------------------------
 
+/** Resolve Gemini project name for a workdir from ~/.gemini/projects.json */
+function geminiProjectName(workdir: string): string | null {
+  const home = process.env.HOME || '';
+  if (!home) return null;
+  const projectsPath = path.join(home, '.gemini', 'projects.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(projectsPath, 'utf8'));
+    const projects = data?.projects;
+    if (!projects || typeof projects !== 'object') return null;
+    const resolved = path.resolve(workdir);
+    // Exact match first, then check entries
+    if (projects[resolved]) return projects[resolved];
+    for (const [dir, name] of Object.entries(projects)) {
+      if (path.resolve(dir) === resolved) return name as string;
+    }
+  } catch { /* skip */ }
+  return null;
+}
+
+/** Read native Gemini CLI sessions from ~/.gemini/tmp/{projectName}/chats/ */
+function getNativeGeminiSessions(workdir: string): SessionInfo[] {
+  const home = process.env.HOME || '';
+  if (!home) return [];
+  const projectName = geminiProjectName(workdir);
+  if (!projectName) return [];
+  const chatsDir = path.join(home, '.gemini', 'tmp', projectName, 'chats');
+  if (!fs.existsSync(chatsDir)) return [];
+
+  const sessions: SessionInfo[] = [];
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(chatsDir, { withFileTypes: true }); } catch { return []; }
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith('session-') || !entry.name.endsWith('.json')) continue;
+    const filePath = path.join(chatsDir, entry.name);
+    try {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (!data.sessionId) continue;
+      // Extract title from first user message
+      let title: string | null = null;
+      const messages = Array.isArray(data.messages) ? data.messages : [];
+      for (const msg of messages) {
+        if (msg.type === 'user') {
+          const content = Array.isArray(msg.content) ? msg.content : [];
+          const text = content.map((c: any) => c?.text || '').join(' ').replace(/\s+/g, ' ').trim();
+          if (text) { title = text.length <= 120 ? text : `${text.slice(0, 117).trimEnd()}...`; }
+          break;
+        }
+      }
+      sessions.push({
+        sessionId: data.sessionId,
+        agent: 'gemini',
+        workdir,
+        workspacePath: null,
+        model: null,
+        createdAt: data.startTime || null,
+        title,
+        running: data.lastUpdated ? Date.now() - Date.parse(data.lastUpdated) < 10_000 : false,
+      });
+    } catch { /* skip */ }
+  }
+  return sessions;
+}
+
 function getGeminiSessions(workdir: string, limit?: number): SessionListResult {
-  const sessions = listCodeclawSessions(workdir, 'gemini', limit).map(record => ({
-    sessionId: record.engineSessionId,
-    localSessionId: record.localSessionId,
-    engineSessionId: record.engineSessionId,
+  const resolvedWorkdir = path.resolve(workdir);
+  // Merge codeclaw-tracked sessions with native Gemini sessions
+  const codeclawSessions = listCodeclawSessions(resolvedWorkdir, 'gemini').map(record => ({
+    sessionId: record.sessionId,
     agent: 'gemini' as const,
     workdir: record.workdir,
     workspacePath: record.workspacePath,
@@ -102,6 +168,27 @@ function getGeminiSessions(workdir: string, limit?: number): SessionListResult {
     title: record.title,
     running: Date.now() - Date.parse(record.updatedAt) < 10_000,
   }));
+  const nativeSessions = getNativeGeminiSessions(resolvedWorkdir);
+
+  // Merge: codeclaw records take precedence
+  const seen = new Set<string>();
+  const merged: SessionInfo[] = [];
+  for (const s of codeclawSessions) {
+    if (s.sessionId) seen.add(s.sessionId);
+    merged.push(s);
+  }
+  for (const s of nativeSessions) {
+    if (s.sessionId && !seen.has(s.sessionId)) merged.push(s);
+  }
+
+  merged.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''));
+  const sessions = typeof limit === 'number' ? merged.slice(0, limit) : merged;
+  const projectName = geminiProjectName(resolvedWorkdir);
+  const chatsDir = projectName ? path.join(process.env.HOME || '', '.gemini', 'tmp', projectName, 'chats') : '';
+  agentLog(
+    `[sessions:gemini] workdir=${resolvedWorkdir} projectName=${projectName || '(none)'} chatsDir=${chatsDir || '(none)'} ` +
+    `chatsDirExists=${chatsDir ? fs.existsSync(chatsDir) : false} codeclaw=${codeclawSessions.length} native=${nativeSessions.length} merged=${sessions.length}`
+  );
   return { ok: true, sessions, error: null };
 }
 
@@ -139,8 +226,6 @@ class GeminiDriver implements AgentDriver {
   }
 
   async getSessionTail(opts: SessionTailOpts): Promise<SessionTailResult> {
-    const managed = findCodeclawSessionByLocalId(opts.workdir, 'gemini', opts.sessionId);
-    if (managed && !managed.engineSessionId) return { ok: true, messages: [], error: null };
     // TODO: implement gemini session tail reading once protocol is known
     return { ok: true, messages: [], error: null };
   }

@@ -3,28 +3,143 @@
  * cli.ts — CLI entry point for codeclaw.
  */
 
+import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { VERSION, envBool } from './bot.js';
 import { TelegramBot } from './bot-telegram.js';
 import { hasConfiguredChannelToken, resolveConfiguredChannels } from './cli-channels.js';
 import { listAgents } from './code-agent.js';
 import { startDashboard, type DashboardServer } from './dashboard.js';
 import { buildSetupGuide, collectSetupState, hasReadyAgent, isSetupReady } from './onboarding.js';
+import {
+  buildRestartCommand,
+  clearRestartStateFile,
+  consumeRestartStateFile,
+  createRestartStateFilePath,
+  PROCESS_RESTART_EXIT_CODE,
+  requestProcessRestart,
+} from './process-control.js';
 import { runSetupWizard } from './setup-wizard.js';
 import { applyUserConfig, loadUserConfig, startUserConfigSync, type ChannelName, type UserConfig } from './user-config.js';
 
-const VALID_CHANNELS = new Set<ChannelName>(['telegram', 'feishu', 'whatsapp']);
+/* ── Daemon (watchdog) mode ─────────────────────────────────────────── */
+
+const DAEMON_RESTART_DELAY_MS = 3_000;
+const DAEMON_MAX_RESTART_DELAY_MS = 60_000;
+const DAEMON_RAPID_CRASH_WINDOW_MS = 10_000;
+
+function daemonLog(msg: string) {
+  const ts = new Date().toTimeString().slice(0, 8);
+  process.stdout.write(`[daemon ${ts}] ${msg}\n`);
+}
+
+/** Args that are daemon-specific and should not be forwarded to the child. */
+const DAEMON_STRIP_ARGS = new Set(['--daemon', '--no-daemon']);
+
+/**
+ * Runs the bot as a supervised child process. On non-zero exit the child is
+ * restarted with exponential back-off. A clean exit (code 0) stops the daemon.
+ * Restart requests use a dedicated exit code and are respawned immediately.
+ */
+async function runDaemon(userArgs: string[]): Promise<never> {
+  // Forward user's CLI args (strip daemon-related flags).
+  const forwardedArgs = userArgs.filter(a => !DAEMON_STRIP_ARGS.has(a));
+  const restartCmd = process.env.CODECLAW_RESTART_CMD;
+  const restartStateFile = createRestartStateFilePath(process.pid);
+
+  let restartDelay = DAEMON_RESTART_DELAY_MS;
+  let attempt = 0;
+  let nextRestartEnv: Record<string, string> = {};
+
+  const spawnChild = (extraEnv: Record<string, string> = {}) => {
+    clearRestartStateFile(restartStateFile);
+    const { bin, args } = buildRestartCommand(forwardedArgs, restartCmd);
+    daemonLog(`exec: ${bin} ${args.join(' ')}`);
+    return spawn(bin, args, {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        ...extraEnv,
+        CODECLAW_DAEMON_CHILD: '1',
+        CODECLAW_RESTART_STATE_FILE: restartStateFile,
+        npm_config_yes: 'true',
+      },
+    });
+  };
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    attempt++;
+    daemonLog(`starting child process (attempt #${attempt})`);
+    const child = spawnChild(nextRestartEnv);
+    nextRestartEnv = {};
+    daemonLog(`child running (pid=${child.pid})`);
+    const startedAt = Date.now();
+
+    let shutdownSignal: 'SIGINT' | 'SIGTERM' | null = null;
+
+    // Forward termination and restart signals to the active child.
+    const forwardShutdownSignal = (sig: 'SIGINT' | 'SIGTERM') => {
+      shutdownSignal = sig;
+      child.kill(sig);
+    };
+    const forwardRestartSignal = () => {
+      child.kill('SIGUSR2');
+    };
+    process.on('SIGINT', forwardShutdownSignal);
+    process.on('SIGTERM', forwardShutdownSignal);
+    process.on('SIGUSR2', forwardRestartSignal);
+
+    const code = await new Promise<number | null>(resolve => {
+      child.on('exit', (c) => resolve(c));
+    });
+
+    process.removeListener('SIGINT', forwardShutdownSignal);
+    process.removeListener('SIGTERM', forwardShutdownSignal);
+    process.removeListener('SIGUSR2', forwardRestartSignal);
+
+    if (shutdownSignal) {
+      const exitCode = shutdownSignal === 'SIGINT' ? 130 : 143;
+      daemonLog(`received ${shutdownSignal}, daemon stopping`);
+      process.exit(exitCode);
+    }
+
+    if (code === PROCESS_RESTART_EXIT_CODE) {
+      nextRestartEnv = consumeRestartStateFile(restartStateFile);
+      restartDelay = DAEMON_RESTART_DELAY_MS;
+      daemonLog('child requested restart, respawning immediately');
+      continue;
+    }
+
+    // Clean exit → stop daemon.
+    if (code === 0 || code === null) {
+      daemonLog(`child exited cleanly (code=${code}), daemon stopping`);
+      process.exit(0);
+    }
+
+    // Exponential back-off for rapid crashes.
+    const uptime = Date.now() - startedAt;
+    if (uptime > DAEMON_RAPID_CRASH_WINDOW_MS) {
+      restartDelay = DAEMON_RESTART_DELAY_MS; // reset if it ran for a while
+    } else {
+      restartDelay = Math.min(restartDelay * 2, DAEMON_MAX_RESTART_DELAY_MS);
+    }
+
+    daemonLog(`child crashed (code=${code}, uptime=${Math.round(uptime / 1000)}s), restarting in ${Math.round(restartDelay / 1000)}s...`);
+    await new Promise(resolve => setTimeout(resolve, restartDelay));
+  }
+}
 
 function parseArgs(argv: string[]) {
   const args: Record<string, any> = {
-    channel: null, token: null, agent: null, model: null, workdir: null,
+    token: null, agent: null, model: null, workdir: null,
     fullAccess: null, safeMode: false, allowedIds: null,
     timeout: null, version: false, help: false, doctor: false, setup: false,
-    noDashboard: false, dashboardPort: null,
+    noDashboard: false, dashboardPort: null, daemon: true,
   };
   const it = argv[Symbol.iterator]();
   for (const arg of it) {
     switch (arg) {
-      case '-c': case '--channel': args.channel = it.next().value; break;
       case '-t': case '--token': args.token = it.next().value; break;
       case '-a': case '--agent': args.agent = it.next().value; break;
       case '-m': case '--model': args.model = it.next().value; break;
@@ -37,6 +152,8 @@ function parseArgs(argv: string[]) {
       case '--setup': args.setup = true; break;
       case '--no-dashboard': args.noDashboard = true; break;
       case '--dashboard-port': args.dashboardPort = parseInt(it.next().value ?? '', 10); break;
+      case '--daemon': args.daemon = true; break;
+      case '--no-daemon': args.daemon = false; break;
       case '-v': case '--version': args.version = true; break;
       case '-h': case '--help': args.help = true; break;
       default:
@@ -52,27 +169,40 @@ export async function main() {
 
   if (args.version) { process.stdout.write(`codeclaw ${VERSION}\n`); process.exit(0); }
 
+  // Daemon mode (default): become a watchdog that supervises the real bot process.
+  // The child is spawned via `npx codeclaw@latest` so restarts always pull latest code.
+  // Use --no-daemon to disable.
+  if (args.daemon && !process.env.CODECLAW_DAEMON_CHILD) {
+    await runDaemon(process.argv.slice(2));
+  }
+
+  const processLog = (message: string) => {
+    const ts = new Date().toTimeString().slice(0, 8);
+    process.stdout.write(`[codeclaw ${ts}] ${message}\n`);
+  };
+  const onSigusr2 = () => {
+    processLog('SIGUSR2 received, restarting...');
+    void requestProcessRestart({ log: processLog });
+  };
+  process.on('SIGUSR2', onSigusr2);
+  process.once('exit', () => {
+    process.off('SIGUSR2', onSigusr2);
+  });
+
   const configOverrides: Partial<UserConfig> = {};
   if (args.agent) configOverrides.defaultAgent = args.agent;
-  if (args.workdir) configOverrides.defaultWorkdir = args.workdir;
+  if (args.workdir) process.env.CODECLAW_WORKDIR = path.resolve(args.workdir);
 
   // Apply config early so managed env vars are populated from setting.json.
   applyUserConfig({ ...userConfig, ...configOverrides }, undefined, { overwrite: true, clearMissing: true });
 
   const effectiveConfig = () => ({ ...userConfig, ...configOverrides });
 
-  // Resolve channels: explicit flag > config > auto-detect from tokens
+  // Resolve channels from config / auto-detect from tokens
   let channels = resolveConfiguredChannels({
-    explicitChannels: args.channel,
     config: effectiveConfig(),
     tokenOverride: args.token,
   });
-  for (const ch of channels) {
-    if (!VALID_CHANNELS.has(ch)) {
-      process.stderr.write(`Unknown channel: ${ch}. Available: ${[...VALID_CHANNELS].join(', ')}\n`);
-      process.exit(1);
-    }
-  }
   // Primary channel used for setup wizard / doctor checks (feishu preferred)
   let channel: ChannelName = channels[0] || 'feishu';
   const tokenProvided = channels.length > 0 && hasConfiguredChannelToken(effectiveConfig(), channel, args.token);
@@ -89,12 +219,9 @@ Telegram tokens are present, both channels launch simultaneously.
 
 Usage:
   npx codeclaw                              # auto-detect from config/env
-  npx codeclaw -c feishu,telegram           # explicit multi-channel
-  npx codeclaw -c telegram -t <BOT_TOKEN>   # single channel with token
   npx codeclaw -w ~/project                 # set working directory
 
 Options:
-  -c, --channel <channels>  IM channel(s), comma-separated  [default: auto-detect]
   -t, --token <token>       Channel auth token (env: CODECLAW_TOKEN)
   -a, --agent <agent>       AI agent: claude | codex  [default: codex]
   -m, --model <model>       Default model, switchable in chat via /models
@@ -105,6 +232,7 @@ Options:
   --timeout <seconds>       Max seconds per agent request  [default: 1800]
   --doctor                  Run setup checks and exit
   --setup                   Run the interactive setup wizard
+  --no-daemon               Disable watchdog (auto-restart on crash is ON by default)
   --no-dashboard            Skip the web dashboard
   --dashboard-port <port>   Dashboard port  [default: 3939]
   -v, --version             Print version
@@ -157,8 +285,10 @@ Docs: https://github.com/xiaotonng/codeclaw
     process.exit(0);
   }
 
+  const listStartupAgents = () => listAgents().agents;
+  const listVerboseAgents = () => listAgents({ includeVersion: true }).agents;
   const setupState = collectSetupState({
-    agents: listAgents().agents,
+    agents: args.doctor ? listVerboseAgents() : listStartupAgents(),
     channel,
     tokenProvided,
   });
@@ -179,9 +309,8 @@ Docs: https://github.com/xiaotonng/codeclaw
   const useDashboard = !args.noDashboard && !args.setup;
   let dashboard: DashboardServer | null = null;
 
-  const needsAgentAttention = setupState.agents.filter(agent => agent.installed).every(agent => agent.authStatus !== 'ready');
   const noChannelsDetected = channels.length === 0;
-  const needsSetup = noChannelsDetected || !tokenProvided || !hasReadyAgent(setupState) || needsAgentAttention;
+  const needsSetup = noChannelsDetected || !tokenProvided || !hasReadyAgent(setupState);
 
   if (useDashboard) {
     // Start dashboard — always. If config is incomplete, it serves as the setup UI.
@@ -201,23 +330,18 @@ Docs: https://github.com/xiaotonng/codeclaw
         await new Promise(resolve => setTimeout(resolve, 1_000));
         userConfig = loadUserConfig();
         channels = resolveConfiguredChannels({
-          explicitChannels: args.channel,
           config: { ...userConfig, ...configOverrides },
           tokenOverride: args.token,
         });
         channel = channels[0] || 'feishu';
 
         const nextSetupState = collectSetupState({
-          agents: listAgents().agents,
+          agents: listStartupAgents(),
           channel,
           tokenProvided: channels.length > 0 && hasConfiguredChannelToken({ ...userConfig, ...configOverrides }, channel, args.token),
         });
-        const nextNeedsAgentAttention = nextSetupState.agents
-          .filter(agent => agent.installed)
-          .every(agent => agent.authStatus !== 'ready');
         const nextNeedsSetup = channels.length === 0
-          || !hasReadyAgent(nextSetupState)
-          || nextNeedsAgentAttention;
+          || !hasReadyAgent(nextSetupState);
         if (!nextNeedsSetup) break;
       }
 
@@ -236,7 +360,7 @@ Docs: https://github.com/xiaotonng/codeclaw
       argsAgent: args.agent || userConfig.defaultAgent || null,
       currentToken: args.token || userConfig.telegramBotToken || null,
       initialState: setupState,
-      listAgents: () => listAgents().agents,
+      listAgents: listVerboseAgents,
     });
     if (!wizard.completed) process.exit(1);
     userConfig = loadUserConfig();
@@ -248,7 +372,6 @@ Docs: https://github.com/xiaotonng/codeclaw
 
   // Re-resolve channels after wizard/dashboard may have changed configuration.
   channels = resolveConfiguredChannels({
-    explicitChannels: args.channel,
     config: effectiveConfig(),
     tokenOverride: args.token,
   });
@@ -256,7 +379,7 @@ Docs: https://github.com/xiaotonng/codeclaw
   const refreshedTokenProvided = channels.length > 0;
   if (!refreshedTokenProvided) {
     const refreshedSetupState = collectSetupState({
-      agents: listAgents().agents,
+      agents: listStartupAgents(),
       channel,
       tokenProvided: false,
     });
@@ -265,7 +388,7 @@ Docs: https://github.com/xiaotonng/codeclaw
   }
 
   const refreshedSetupState = collectSetupState({
-    agents: listAgents().agents,
+    agents: listStartupAgents(),
     channel,
     tokenProvided: refreshedTokenProvided,
   });

@@ -10,11 +10,10 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import {
-  Bot, VERSION, type Agent, type SessionRuntime, type StreamResult,
+  Bot, VERSION, normalizeAgent, type Agent, type SessionRuntime, type StreamResult,
   fmtTokens, buildPrompt,
-  parseAllowedChatIds, shellSplit,
+  parseAllowedChatIds,
 } from './bot.js';
 import {
   type BotArtifact,
@@ -28,22 +27,33 @@ import {
 import {
   getStartData,
   getSessionsPageData,
-  getAgentsListData,
   getModelsListData,
   getStatusDataAsync,
   getHostDataSync,
-  modelMatchesSelection,
   resolveSkillPrompt,
 } from './bot-commands.js';
+import {
+  buildAgentsCommandView,
+  buildModelsCommandView,
+  buildSessionsCommandView,
+  decodeCommandAction,
+  executeCommandAction,
+  type CommandActionResult,
+} from './bot-command-ui.js';
 import { LivePreview } from './bot-telegram-live-preview.js';
+import {
+  formatActiveTaskRestartError,
+  getActiveTaskCount,
+  registerProcessRuntime,
+  requestProcessRestart,
+} from './process-control.js';
 import {
   feishuPreviewRenderer,
   buildInitialPreviewMarkdown,
   buildFinalReplyRender,
+  renderCommandNotice,
+  renderCommandSelectionCard,
   renderStart,
-  renderSessionsPageCard,
-  renderAgentsListCard,
-  renderModelsListCard,
   renderStatus,
   renderHost,
 } from './bot-feishu-render.js';
@@ -76,6 +86,7 @@ export class FeishuBot extends Bot {
   private shutdownExitCode: number | null = null;
   private shutdownForceExitTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandlers: Partial<Record<string, () => void>> = {};
+  private processRuntimeCleanup: (() => void) | null = null;
 
   constructor() {
     super();
@@ -85,8 +96,8 @@ export class FeishuBot extends Bot {
       for (const id of parseAllowedChatIds(process.env.FEISHU_ALLOWED_CHAT_IDS)) this.allowedChatIds.add(id);
     }
 
-    this.appId = String(config.feishuAppId || '').trim();
-    this.appSecret = String(config.feishuAppSecret || '').trim();
+    this.appId = String(config.feishuAppId || process.env.FEISHU_APP_ID || '').trim();
+    this.appSecret = String(config.feishuAppSecret || process.env.FEISHU_APP_SECRET || '').trim();
     this.domain = (process.env.FEISHU_DOMAIN || 'https://open.feishu.cn').trim();
 
     if (!this.appId || !this.appSecret) {
@@ -95,8 +106,8 @@ export class FeishuBot extends Bot {
   }
 
   protected override onManagedConfigChange(config: Record<string, any>, opts: { initial?: boolean } = {}) {
-    const nextAppId = String(config.feishuAppId || '').trim();
-    const nextAppSecret = String(config.feishuAppSecret || '').trim();
+    const nextAppId = String(config.feishuAppId || process.env.FEISHU_APP_ID || '').trim();
+    const nextAppSecret = String(config.feishuAppSecret || process.env.FEISHU_APP_SECRET || '').trim();
     if (nextAppId && nextAppId !== this.appId) {
       this.appId = nextAppId;
       if (!opts.initial) this.log('feishu appId reloaded from setting.json');
@@ -150,9 +161,7 @@ export class FeishuBot extends Bot {
     this.shutdownExitCode = SHUTDOWN_EXIT_CODE[sig];
     this.log(`${sig}, shutting down...`);
 
-    try { this.channel.disconnect(); } catch {}
-    this.stopKeepAlive();
-    shutdownAllDrivers();
+    this.cleanupRuntimeForExit();
 
     if (this.shutdownForceExitTimer) clearTimeout(this.shutdownForceExitTimer);
     this.shutdownForceExitTimer = setTimeout(() => {
@@ -160,6 +169,18 @@ export class FeishuBot extends Bot {
       process.exit(this.shutdownExitCode ?? 1);
     }, SHUTDOWN_FORCE_EXIT_MS);
     this.shutdownForceExitTimer.unref?.();
+  }
+
+  private cleanupRuntimeForExit() {
+    try { this.channel.disconnect(); } catch {}
+    this.stopKeepAlive();
+    shutdownAllDrivers();
+  }
+
+  private buildRestartEnv(): Record<string, string> {
+    const knownIds = new Set(this.allowedChatIds);
+    for (const cid of this.channel.knownChats) knownIds.add(cid);
+    return knownIds.size ? { FEISHU_ALLOWED_CHAT_IDS: [...knownIds].join(',') } : {};
   }
 
   // ---- session tracking -----------------------------------------------------
@@ -205,13 +226,12 @@ export class FeishuBot extends Bot {
       agent: cs.agent,
       workdir: this.workdir,
       files: [],
-      localSessionId: null,
       sessionId: null,
       title: title || files[0] || 'New session',
     });
     const runtime = this.upsertSessionRuntime({
       agent: cs.agent,
-      localSessionId: staged.localSessionId,
+      sessionId: staged.sessionId,
       workspacePath: staged.workspacePath,
       modelId: this.modelForAgent(cs.agent),
     });
@@ -234,49 +254,75 @@ export class FeishuBot extends Bot {
     await ctx.reply(renderStart(d));
   }
 
+  private async sendCommandView(ctx: FeishuContext, view: Awaited<ReturnType<typeof buildSessionsCommandView>>) {
+    await ctx.channel.sendCard(ctx.chatId, renderCommandSelectionCard(view));
+  }
+
+  private async replyCommandResult(ctx: FeishuContext, result: CommandActionResult) {
+    if (result.kind === 'view') {
+      await this.sendCommandView(ctx, result.view);
+      return;
+    }
+    if (result.kind === 'notice') {
+      const sent = await ctx.reply(renderCommandNotice(result.notice));
+      if (result.session && sent) this.registerSessionMessage(ctx.chatId, sent, result.session);
+      return;
+    }
+    await ctx.reply(result.message);
+  }
+
+  private async applyCommandCallbackResult(ctx: FeishuCallbackContext, result: CommandActionResult) {
+    if (result.kind === 'noop') return;
+    if (result.kind === 'view') {
+      await ctx.channel.editCard(ctx.chatId, ctx.messageId, renderCommandSelectionCard(result.view));
+      return;
+    }
+    await ctx.editReply(ctx.messageId, renderCommandNotice(result.notice));
+    if (result.session) this.registerSessionMessage(ctx.chatId, ctx.messageId, result.session);
+  }
+
   private sessionsPageSize = 5;
 
   private async cmdSessions(ctx: FeishuContext, args: string) {
-    const cs = this.chat(ctx.chatId);
-
-    // Handle sub-commands: /sessions new, /sessions 3, /sessions p2
     const arg = args.trim().toLowerCase();
     if (arg === 'new') {
-      this.resetChatConversation(cs);
-      await ctx.reply('Session reset. Send a message to start.');
+      await this.replyCommandResult(
+        ctx,
+        await executeCommandAction(this, ctx.chatId, { kind: 'session.new' }, { sessionsPageSize: this.sessionsPageSize }),
+      );
       return;
     }
 
-    const res = await this.fetchSessions(cs.agent);
-    if (!res.ok) { await ctx.reply(`Error: ${res.error}`); return; }
-    if (!res.sessions.length) { await ctx.reply(`No ${cs.agent} sessions found in:\n\`${this.workdir}\``); return; }
-
-    // Parse page number from "p2", "p3"
-    let page = 0;
     const pageMatch = arg.match(/^p(\d+)$/);
-    if (pageMatch) page = parseInt(pageMatch[1], 10) - 1;
+    if (pageMatch) {
+      await this.replyCommandResult(
+        ctx,
+        await executeCommandAction(
+          this,
+          ctx.chatId,
+          { kind: 'sessions.page', page: parseInt(pageMatch[1], 10) - 1 },
+          { sessionsPageSize: this.sessionsPageSize },
+        ),
+      );
+      return;
+    }
 
-    // Parse session index selection
     const idx = parseInt(arg, 10);
     if (!isNaN(idx) && idx >= 1) {
       const d = await getSessionsPageData(this, ctx.chatId, 0, 100);
       const target = d.sessions[idx - 1];
       if (target) {
-        const session = res.sessions.find(s =>
-          s.localSessionId === target.key || s.sessionId === target.key,
+        await this.replyCommandResult(
+          ctx,
+          await executeCommandAction(this, ctx.chatId, { kind: 'session.switch', sessionId: target.key }),
         );
-        if (session) {
-          this.adoptSession(cs, session);
-          await ctx.reply(`Switched to session: \`${target.key.slice(0, 16)}\``);
-          return;
-        }
+        return;
       }
       await ctx.reply(`Session #${idx} not found.`);
       return;
     }
 
-    const d = await getSessionsPageData(this, ctx.chatId, page, this.sessionsPageSize);
-    await ctx.channel.sendCard(ctx.chatId, renderSessionsPageCard(d));
+    await this.sendCommandView(ctx, await buildSessionsCommandView(this, ctx.chatId, 0, this.sessionsPageSize));
   }
 
   private async cmdStatus(ctx: FeishuContext) {
@@ -290,66 +336,48 @@ export class FeishuBot extends Bot {
   }
 
   private async cmdAgents(ctx: FeishuContext, args: string) {
-    const cs = this.chat(ctx.chatId);
     const arg = args.trim().toLowerCase();
 
-    // Switch agent by name
     if (arg) {
       try {
-        const { normalizeAgent } = await import('./bot.js');
         const agent = normalizeAgent(arg);
-        if (cs.agent === agent) {
-          await ctx.reply(`Already using ${agent}.`);
-          return;
-        }
-        cs.agent = agent;
-        this.resetChatConversation(cs);
-        this.log(`agent switched to ${agent} chat=${ctx.chatId}`);
-        await ctx.reply(`**Switched to ${agent}**\n\nSession has been reset. Send a message to start.`);
+        await this.replyCommandResult(
+          ctx,
+          await executeCommandAction(this, ctx.chatId, { kind: 'agent.switch', agent }),
+        );
         return;
       } catch {
         // Not a valid agent name — show list
       }
     }
 
-    const d = getAgentsListData(this, ctx.chatId);
-    await ctx.channel.sendCard(ctx.chatId, renderAgentsListCard(d));
+    await this.sendCommandView(ctx, buildAgentsCommandView(this, ctx.chatId));
   }
 
   private async cmdModels(ctx: FeishuContext, args: string) {
-    const cs = this.chat(ctx.chatId);
     const arg = args.trim();
 
-    // Switch model by ID or index
     if (arg) {
       const d = await getModelsListData(this, ctx.chatId);
-      // Try by index
       const idx = parseInt(arg, 10);
       let modelId: string | null = null;
       if (!isNaN(idx) && idx >= 1 && idx <= d.models.length) {
         modelId = d.models[idx - 1].id;
       } else {
-        // Try by ID
         const match = d.models.find(m => m.id === arg || m.alias === arg);
         if (match) modelId = match.id;
       }
 
       if (modelId) {
-        const currentModel = this.modelForAgent(cs.agent);
-        if (modelMatchesSelection(cs.agent, modelId, currentModel)) {
-          await ctx.reply(`Already using ${modelId}.`);
-          return;
-        }
-        this.setModelForAgent(cs.agent, modelId);
-        this.resetChatConversation(cs);
-        this.log(`model switched to ${modelId} for ${cs.agent} chat=${ctx.chatId}`);
-        await ctx.reply(`**Model switched to \`${modelId}\`**\n\nAgent: ${cs.agent}\nSession has been reset.`);
+        await this.replyCommandResult(
+          ctx,
+          await executeCommandAction(this, ctx.chatId, { kind: 'model.switch', modelId }),
+        );
         return;
       }
     }
 
-    const d = await getModelsListData(this, ctx.chatId);
-    await ctx.channel.sendCard(ctx.chatId, renderModelsListCard(d));
+    await this.sendCommandView(ctx, await buildModelsCommandView(this, ctx.chatId));
   }
 
   private async cmdSwitch(ctx: FeishuContext, args: string) {
@@ -373,32 +401,13 @@ export class FeishuBot extends Bot {
   }
 
   private async cmdRestart(ctx: FeishuContext) {
-    if (this.activeTasks.size > 0) {
-      await ctx.reply(`⚠ ${this.activeTasks.size} task(s) still running. Wait for them to finish or try again.`);
+    const activeTasks = getActiveTaskCount();
+    if (activeTasks > 0) {
+      await ctx.reply(`⚠ ${formatActiveTaskRestartError(activeTasks)}`);
       return;
     }
     await ctx.reply('**Restarting codeclaw...**\n\nPulling latest version. The bot will be back shortly.');
-    this.performRestart();
-  }
-
-  private performRestart() {
-    this.log('restart: disconnecting...');
-    this.channel.disconnect();
-    this.stopKeepAlive();
-
-    const restartCmd = process.env.CODECLAW_RESTART_CMD || 'npx --yes codeclaw@latest';
-    const [bin, ...rawArgs] = shellSplit(restartCmd);
-    const allArgs = [...rawArgs, ...process.argv.slice(2)];
-
-    this.log(`restart: spawning \`${bin} ${allArgs.join(' ')}\``);
-    const child = spawn(bin, allArgs, {
-      stdio: 'inherit',
-      detached: true,
-      env: { ...process.env, npm_config_yes: process.env.npm_config_yes || 'true' },
-    });
-    child.unref();
-    this.log(`restart: new process spawned (PID ${child.pid}), exiting...`);
-    process.exit(0);
+    void requestProcessRestart({ log: msg => this.log(msg) });
   }
 
   // ---- streaming bridge -----------------------------------------------------
@@ -420,14 +429,13 @@ export class FeishuBot extends Bot {
             agent: session.agent,
             workdir: this.workdir,
             files: msg.files,
-            localSessionId: session.localSessionId,
             sessionId: session.sessionId,
             title: msg.files[0],
           });
           session.workspacePath = staged.workspacePath;
           this.syncSelectedChats(session);
           if (!staged.importedFiles.length) throw new Error('no files persisted');
-          this.log(`[handleMessage] staged files chat=${ctx.chatId} local_session=${staged.localSessionId} files=${staged.importedFiles.length}`);
+          this.log(`[handleMessage] staged files chat=${ctx.chatId} session=${staged.sessionId} files=${staged.importedFiles.length}`);
           this.registerSessionMessage(ctx.chatId, ctx.messageId, session);
         } catch (e: any) {
           this.log(`[handleMessage] stage files failed: ${e?.message || e}`);
@@ -660,65 +668,15 @@ export class FeishuBot extends Bot {
 
   private async handleCallback(data: string, ctx: FeishuCallbackContext) {
     try {
-      if (data.startsWith('ag:'))   return void await this.onAgentCallback(data.slice(3), ctx);
-      if (data.startsWith('mod:'))  return void await this.onModelCallback(data.slice(4), ctx);
-      if (data.startsWith('eff:'))  return void await this.onEffortCallback(data.slice(4), ctx);
-      if (data.startsWith('sess:')) return void await this.onSessionCallback(data.slice(5), ctx);
-      if (data.startsWith('sp:'))   return void await this.onSessionsPageCallback(data.slice(3), ctx);
+      const action = decodeCommandAction(data);
+      if (!action) return;
+      const result = await executeCommandAction(this, ctx.chatId, action, {
+        sessionsPageSize: this.sessionsPageSize,
+      });
+      await this.applyCommandCallbackResult(ctx, result);
     } catch (e: any) {
       this.log(`callback error: ${e}`);
     }
-  }
-
-  private async onAgentCallback(agent: string, ctx: FeishuCallbackContext) {
-    const cs = this.chat(ctx.chatId);
-    if (cs.agent === agent) return;
-    cs.agent = agent as Agent;
-    this.resetChatConversation(cs);
-    this.log(`agent switched to ${agent} chat=${ctx.chatId}`);
-    await ctx.editReply(ctx.messageId, `**Switched to ${agent}**\n\nSession has been reset. Send a message to start.`);
-  }
-
-  private async onModelCallback(modelId: string, ctx: FeishuCallbackContext) {
-    const cs = this.chat(ctx.chatId);
-    if (modelMatchesSelection(cs.agent, modelId, this.modelForAgent(cs.agent))) return;
-    this.setModelForAgent(cs.agent, modelId);
-    this.resetChatConversation(cs);
-    this.log(`model switched to ${modelId} for ${cs.agent} chat=${ctx.chatId}`);
-    await ctx.editReply(ctx.messageId, `**Model switched to \`${modelId}\`**\n\nAgent: ${cs.agent}\nSession has been reset.`);
-  }
-
-  private async onEffortCallback(effortId: string, ctx: FeishuCallbackContext) {
-    const cs = this.chat(ctx.chatId);
-    if (effortId === this.effortForAgent(cs.agent)) return;
-    this.setEffortForAgent(cs.agent, effortId);
-    this.log(`effort switched to ${effortId} for ${cs.agent} chat=${ctx.chatId}`);
-    await ctx.editReply(ctx.messageId, `**Thinking effort set to \`${effortId}\`**\n\nAgent: ${cs.agent}\nTakes effect on next message.`);
-  }
-
-  private async onSessionCallback(sessionKey: string, ctx: FeishuCallbackContext) {
-    const cs = this.chat(ctx.chatId);
-    if (sessionKey === 'new') {
-      this.resetChatConversation(cs);
-      await ctx.editReply(ctx.messageId, 'Session reset. Send a message to start.');
-      return;
-    }
-    const res = await this.fetchSessions(cs.agent);
-    if (!res.ok) return;
-    const session = res.sessions.find(s =>
-      s.localSessionId === sessionKey || s.sessionId === sessionKey,
-    );
-    if (!session) return;
-    this.adoptSession(cs, session);
-    const displayId = session.localSessionId || session.sessionId || sessionKey;
-    await ctx.editReply(ctx.messageId, `Switched to session: \`${displayId.slice(0, 16)}\``);
-  }
-
-  private async onSessionsPageCallback(pageStr: string, ctx: FeishuCallbackContext) {
-    const page = parseInt(pageStr, 10);
-    if (isNaN(page) || page < 0) return;
-    const d = await getSessionsPageData(this, ctx.chatId, page, this.sessionsPageSize);
-    await ctx.channel.editCard(ctx.chatId, ctx.messageId, renderSessionsPageCard(d));
   }
 
   // ---- lifecycle ------------------------------------------------------------
@@ -736,13 +694,19 @@ export class FeishuBot extends Bot {
         ? this.allowedChatIds as Set<string>
         : undefined,
     });
+    this.processRuntimeCleanup?.();
+    this.processRuntimeCleanup = registerProcessRuntime({
+      label: 'feishu',
+      getActiveTaskCount: () => this.activeTasks.size,
+      prepareForRestart: () => this.cleanupRuntimeForExit(),
+      buildRestartEnv: () => this.buildRestartEnv(),
+    });
     this.installSignalHandlers();
 
     try {
       const bot = await this.channel.connect();
+      this.connected = true;
       this.log(`bot: ${bot.displayName} (id=${bot.id})`);
-
-      await this.setupMenu();
 
       for (const ag of this.fetchAgents().agents) {
         this.log(`agent ${ag.agent}: ${ag.path || 'NOT FOUND'}`);
@@ -754,9 +718,9 @@ export class FeishuBot extends Bot {
       this.channel.onCallback((data, ctx) => this.handleCallback(data, ctx));
       this.channel.onError(err => this.log(`error: ${err}`));
 
-      await this.sendStartupNotice();
-
       this.startKeepAlive();
+      void this.setupMenu().catch(err => this.log(`menu setup failed: ${err}`));
+      void this.sendStartupNotice().catch(err => this.log(`startup notice failed: ${err}`));
       this.log('WebSocket listening started');
       await this.channel.listen();
       this.stopKeepAlive();
@@ -765,6 +729,8 @@ export class FeishuBot extends Bot {
       this.stopKeepAlive();
       if (this.shutdownForceExitTimer) clearTimeout(this.shutdownForceExitTimer);
       this.removeSignalHandlers();
+      this.processRuntimeCleanup?.();
+      this.processRuntimeCleanup = null;
       if (this.shutdownInFlight) process.exit(this.shutdownExitCode ?? 1);
     }
   }

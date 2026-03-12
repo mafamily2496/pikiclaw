@@ -8,10 +8,37 @@ describe('dashboard api', () => {
   });
 
   it('times out hung Feishu validation requests on the client side', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });
+      if (signal?.aborted) {
+        reject(abortError);
+        return;
+      }
+      signal?.addEventListener('abort', () => reject(abortError), { once: true });
+    })));
 
     await expect(
       api.validateFeishuConfig('cli_xxx', 'secret-value', { timeoutMs: 25 }),
     ).rejects.toThrow(/timed out/i);
+  });
+
+  it('builds paginated session requests per agent', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      sessions: [],
+      error: null,
+      page: 2,
+      limit: 6,
+      total: 0,
+      totalPages: 1,
+      hasMore: false,
+    })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.getSessionsPage('codex', 2, 6);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/codex?page=2&limit=6');
   });
 });

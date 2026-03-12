@@ -6,6 +6,14 @@
  */
 
 import type { Agent, StreamResult, StreamPreviewMeta } from './bot.js';
+import type {
+  CommandActionButton,
+  CommandItemState,
+  CommandNotice,
+  CommandSelectionItem,
+  CommandSelectionView,
+} from './bot-command-ui.js';
+import { encodeCommandAction } from './bot-command-ui.js';
 import { fmtUptime, fmtTokens, fmtBytes, formatThinkingForDisplay, thinkLabel } from './bot.js';
 import type { StartData, SessionsPageData, AgentsListData, ModelsListData, StatusData, HostData } from './bot-commands.js';
 import { summarizePromptForStatus } from './bot-commands.js';
@@ -97,6 +105,67 @@ function cardRows(actions: FeishuCardActionItem[], size = 3): FeishuCardActionRo
     rows.push({ actions: rowActions });
   }
   return rows;
+}
+
+function selectionStateSymbol(state: CommandItemState | undefined): string {
+  switch (state) {
+    case 'current': return '●';
+    case 'running': return '🟢';
+    case 'unavailable': return '❌';
+    default: return '○';
+  }
+}
+
+function formatCommandItemMarkdown(item: CommandSelectionItem, index: number): string {
+  const parts = [
+    selectionStateSymbol(item.state),
+    `**${index + 1}.**`,
+    item.label,
+  ];
+  if (item.detail) parts.push(item.detail);
+  return parts.join(' ');
+}
+
+function formatCommandButtonLabel(button: CommandActionButton): string {
+  const prefix = button.state && button.state !== 'default'
+    ? `${selectionStateSymbol(button.state)} `
+    : '';
+  return truncateLabel(`${prefix}${button.label}`.trim());
+}
+
+function actionButton(button: CommandActionButton): FeishuCardActionItem {
+  return cardButton(formatCommandButtonLabel(button), encodeCommandAction(button.action), !!button.primary);
+}
+
+export function renderCommandNotice(notice: CommandNotice): string {
+  const lines = [`**${notice.title}**`];
+  if (notice.value) {
+    lines.push(notice.valueMode === 'plain' ? notice.value : `\`${notice.value}\``);
+  }
+  if (notice.detail) lines.push(notice.detail);
+  return lines.join('\n\n');
+}
+
+export function renderCommandSelectionMarkdown(view: CommandSelectionView): string {
+  const title = view.detail ? `**${view.title}** · \`${view.detail}\`` : `**${view.title}**`;
+  const lines = [title];
+  if (view.metaLines.length) lines.push(...view.metaLines.map(line => `*${line}*`));
+
+  if (view.items.length) {
+    lines.push('', ...view.items.map((item, index) => formatCommandItemMarkdown(item, index)));
+  } else if (view.emptyText) {
+    lines.push('', `*${view.emptyText}*`);
+  }
+
+  if (view.helperText) lines.push('', `*${view.helperText}*`);
+  return lines.join('\n');
+}
+
+export function renderCommandSelectionCard(view: CommandSelectionView): FeishuCardView {
+  return {
+    markdown: renderCommandSelectionMarkdown(view),
+    rows: view.rows.map(row => ({ actions: row.map(actionButton) })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +413,7 @@ export function renderStatus(d: StatusData): string {
     '',
     `**Agent:** ${d.agent}`,
     `**Model:** ${d.model}`,
-    `**Session:** ${d.localSessionId ? `\`${d.localSessionId}\`` : d.sessionId ? `\`${d.sessionId.slice(0, 16)}\`` : '(new)'}`,
+    `**Session:** ${d.sessionId ? `\`${d.sessionId.slice(0, 16)}\`` : '(new)'}`,
     `**Active Tasks:** ${d.activeTasksCount}`,
   ];
   if (d.running) {

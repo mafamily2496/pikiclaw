@@ -1,72 +1,179 @@
-import { useEffect } from 'react';
+import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { createT } from '../i18n';
-import { SectionLabel, Dot, Badge } from './ui';
-import { fmtTime } from '../utils';
-import type { AgentInfo, SessionInfo } from '../types';
+import { api } from '../api';
+import { Badge, Button, Card, Dot, SectionLabel } from './ui';
+import { BrandBadge } from './BrandIcon';
+import { cn, fmtTime, getAgentMeta } from '../utils';
+import type { AgentInfo, SessionInfo, SessionsPageResult } from '../types';
 
-const agentMeta: Record<string, { label: string; color: string; bg: string; letter: string; border: string; glow: string }> = {
-  claude: { label: 'Claude Code', color: '#818cf8', bg: 'rgba(129,140,248,0.08)', letter: 'C', border: 'rgba(129,140,248,0.12)', glow: 'rgba(129,140,248,0.06)' },
-  codex: { label: 'Codex', color: '#34d399', bg: 'rgba(52,211,153,0.08)', letter: 'O', border: 'rgba(52,211,153,0.12)', glow: 'rgba(52,211,153,0.06)' },
-  gemini: { label: 'Gemini CLI', color: '#a78bfa', bg: 'rgba(167,139,250,0.08)', letter: 'G', border: 'rgba(167,139,250,0.12)', glow: 'rgba(167,139,250,0.06)' },
-};
+const PAGE_SIZE = 6;
 
-function SessionCard({ session, onOpen }: { session: SessionInfo; onOpen: () => void }) {
-  const sid = session.localSessionId || session.sessionId || '';
+function sessionErrorText(error: unknown, t: (key: string) => string): string {
+  if (error instanceof Error && /timed out/i.test(error.message)) return t('modal.requestTimeout');
+  return t('modal.loadFailed');
+}
+
+function SessionCard({
+  session,
+  onOpen,
+  dimmed = false,
+  t,
+}: {
+  session: SessionInfo;
+  onOpen: () => void;
+  dimmed?: boolean;
+  t: (key: string) => string;
+}) {
+  const sid = session.sessionId || '';
   const title = session.title || sid.slice(0, 16) || 'Session';
   const truncTitle = title.length > 28 ? title.slice(0, 28) + '...' : title;
+  const dotVariant = session.running ? 'ok' : session.isCurrent ? 'warn' : 'idle';
 
   return (
-    <div
+    <Card
       onClick={onOpen}
-      className="p-3 px-3.5 rounded-xl bg-panel-alt border border-edge cursor-pointer transition-all duration-200 mb-1.5 last:mb-0 backdrop-blur-lg hover:border-indigo-500/20 hover:bg-panel hover:shadow-[0_4px_16px_var(--th-glow-b)] hover:-translate-y-px"
+      interactive
+      className={cn('mb-2 bg-panel-alt p-4 last:mb-0 transition-all duration-200', dimmed && 'opacity-65')}
       title={title}
     >
-      <div className="flex items-center gap-2 mb-1">
-        <div className="text-xs font-medium text-fg-2 truncate flex-1">{truncTitle}</div>
-        {session.running ? <Dot variant="ok" pulse /> : <Dot />}
+      <div className="mb-1.5 flex items-center gap-2">
+        <div className="flex-1 truncate text-[14px] font-medium text-fg-2">{truncTitle}</div>
+        <Dot variant={dotVariant} pulse={session.running} />
       </div>
-      <div className="flex items-center gap-3 text-[10px] text-fg-5">
+      <div className="flex flex-wrap items-center gap-2.5 text-[12px] text-fg-5">
         <span>{fmtTime(session.createdAt)}</span>
         {session.model && <span className="font-mono">{session.model}</span>}
-        {session.running && <Badge variant="ok" className="!text-[9px] !py-0 !px-1.5">LIVE</Badge>}
+        {session.isCurrent && <Badge variant="accent" className="!h-5 !px-2 !text-[10px]">{t('sessions.current')}</Badge>}
+        {session.running && <Badge variant="ok" className="!h-5 !px-2 !text-[10px]">{t('status.running')}</Badge>}
       </div>
-      <div className="text-[10px] font-mono text-fg-6 mt-1 truncate">{sid}</div>
+      <div className="mt-1.5 truncate text-[11px] font-mono text-fg-6">{sid}</div>
+    </Card>
+  );
+}
+
+function SessionCardSkeleton() {
+  return (
+    <div className="mb-2 rounded-xl border border-edge bg-panel-alt p-4 last:mb-0">
+      <div className="mb-2 flex items-center gap-2">
+        <div className="h-4 flex-1 rounded-md bg-panel animate-shimmer" />
+        <div className="h-2 w-2 rounded-full bg-fg-5" />
+      </div>
+      <div className="mb-2 flex gap-2">
+        <div className="h-3 w-20 rounded-md bg-panel animate-shimmer" />
+        <div className="h-3 w-24 rounded-md bg-panel animate-shimmer" />
+      </div>
+      <div className="h-3 w-40 rounded-md bg-panel animate-shimmer" />
     </div>
   );
 }
 
-function SwimLanes({ onOpenSession }: { onOpenSession: (agent: string, sid: string, ses: SessionInfo) => void }) {
-  const { state, allSessions, locale } = useStore();
-  const t = createT(locale);
-  const agents = (state?.setupState?.agents || []).filter((a: AgentInfo) => a.installed);
+function SessionsLoadingState({ count = 3 }: { count?: number }) {
+  return (
+    <div>
+      {Array.from({ length: count }, (_, index) => (
+        <SessionCardSkeleton key={index} />
+      ))}
+    </div>
+  );
+}
 
-  if (!agents.length) return <div className="text-[13px] text-fg-5 py-8">{t('sessions.noAgent')}</div>;
+function SwimLanes({
+  agents,
+  pages,
+  loadingByAgent,
+  bootstrapping,
+  onOpenSession,
+  onRetry,
+  onPageChange,
+  t,
+}: {
+  agents: AgentInfo[];
+  pages: Record<string, SessionsPageResult>;
+  loadingByAgent: Record<string, boolean>;
+  bootstrapping: boolean;
+  onOpenSession: (agent: string, sid: string, ses: SessionInfo) => void;
+  onRetry: (agent: string) => void;
+  onPageChange: (agent: string, page: number) => void;
+  t: (key: string) => string;
+}) {
+  if (!agents.length) {
+    return <div className="py-8 text-[15px] text-fg-5">{bootstrapping ? t('sessions.loading') : t('sessions.noAgent')}</div>;
+  }
 
   return (
-    <div className="flex gap-4 overflow-x-auto pb-2" style={{ minHeight: 200 }}>
-      {agents.map((a: AgentInfo) => {
-        const m = agentMeta[a.agent] || { label: a.agent, color: '#888', bg: 'rgba(128,128,128,0.08)', letter: '?', border: 'var(--th-edge)', glow: 'var(--th-glow-b)' };
-        const sessions = ((allSessions[a.agent] as { sessions?: SessionInfo[] })?.sessions || []) as SessionInfo[];
+    <div className="flex gap-5 overflow-x-auto pb-2" style={{ minHeight: 200 }}>
+      {agents.map(agentInfo => {
+        const meta = getAgentMeta(agentInfo.agent);
+        const pageData = pages[agentInfo.agent];
+        const sessions = pageData?.sessions || [];
+        const loading = !!loadingByAgent[agentInfo.agent];
+        const total = pageData?.total ?? 0;
+        const showInitialLoading = loading && !pageData;
+
         return (
-          <div key={a.agent} className="flex-1 min-w-[260px] max-w-[340px] flex flex-col">
-            <div className="flex items-center gap-2 px-3.5 py-3 rounded-t-[14px] bg-panel border border-b-0 backdrop-blur-lg text-[13px] font-semibold text-fg-2" style={{ borderColor: m.border }}>
-              <div className="w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold" style={{ background: m.bg, color: m.color, boxShadow: `0 0 10px ${m.glow}` }}>{m.letter}</div>
-              <span>{m.label}</span>
-              <Badge variant="muted" className="ml-auto !text-[10px]">{sessions.length}</Badge>
-            </div>
-            <div className="flex-1 border border-t-0 rounded-b-[14px] bg-panel-alt p-2 overflow-y-auto max-h-[60vh] backdrop-blur-lg" style={{ borderColor: m.border }}>
-              {sessions.length === 0
-                ? <div className="text-xs text-fg-5 text-center py-6">{t('sessions.noSessions')}</div>
-                : sessions.map((s: SessionInfo) => (
-                    <SessionCard
-                      key={s.sessionId || s.localSessionId}
-                      session={s}
-                      onOpen={() => onOpenSession(a.agent, s.localSessionId || s.sessionId || '', s)}
-                    />
-                  ))
-              }
-            </div>
+          <div key={agentInfo.agent} className="flex min-w-[280px] max-w-[360px] flex-1 flex-col">
+            <Card className="flex flex-1 flex-col overflow-hidden !p-0">
+              <div className="flex items-center gap-2.5 border-b border-edge px-4 py-3.5 text-[15px] font-semibold text-fg-2">
+                <BrandBadge brand={agentInfo.agent} size={24} iconSize={14} className="rounded-md" />
+                <span>{meta.label}</span>
+                <Badge variant="muted" className="ml-auto !text-[11px]">{total}</Badge>
+              </div>
+
+              <div className="flex-1 bg-panel-alt p-2.5">
+                {loading && pageData && <div className="mb-2 h-1.5 rounded-full bg-panel animate-shimmer" />}
+                <div className="max-h-[56vh] overflow-y-auto">
+                  {showInitialLoading ? (
+                    <SessionsLoadingState />
+                  ) : pageData?.error ? (
+                    <div className="px-3 py-6 text-center">
+                      <div className="mb-3 text-[13px] text-fg-5">{pageData.error}</div>
+                      <Button size="sm" variant="ghost" onClick={() => onRetry(agentInfo.agent)}>
+                        {t('sessions.retry')}
+                      </Button>
+                    </div>
+                  ) : sessions.length === 0 ? (
+                    <div className="py-6 text-center text-[14px] text-fg-5">
+                      {loading ? t('sessions.loading') : t('sessions.noSessions')}
+                    </div>
+                  ) : (
+                    sessions.map(session => (
+                      <SessionCard
+                        key={session.sessionId}
+                        session={session}
+                        dimmed={loading}
+                        t={t}
+                        onOpen={() => onOpenSession(agentInfo.agent, session.sessionId || '', session)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 border-t border-edge px-3 py-2">
+                <div className="text-[11px] font-mono text-fg-5">
+                  {pageData ? `${pageData.page + 1} / ${Math.max(pageData.totalPages, 1)}` : t('sessions.loading')}
+                </div>
+                <div className="ml-auto flex items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={!pageData || loading || pageData.page <= 0}
+                    onClick={() => onPageChange(agentInfo.agent, Math.max((pageData?.page || 0) - 1, 0))}
+                  >
+                    {t('sessions.prev')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={!pageData || loading || pageData.page + 1 >= pageData.totalPages}
+                    onClick={() => onPageChange(agentInfo.agent, (pageData?.page || 0) + 1)}
+                  >
+                    {t('sessions.next')}
+                  </Button>
+                </div>
+              </div>
+            </Card>
           </div>
         );
       })}
@@ -74,17 +181,99 @@ function SwimLanes({ onOpenSession }: { onOpenSession: (agent: string, sid: stri
   );
 }
 
-export function SessionsTab({ onOpenSession }: { onOpenSession: (agent: string, sid: string, ses: SessionInfo) => void }) {
-  const { loadSessions, locale } = useStore();
-  const t = createT(locale);
+function installedAgentsFromState(state: { setupState?: { agents?: AgentInfo[] | null } | null } | null | undefined): AgentInfo[] {
+  return (state?.setupState?.agents || []).filter((agent): agent is AgentInfo => !!agent?.installed);
+}
 
-  useEffect(() => { loadSessions(); }, [loadSessions]);
+export function SessionsTab({ onOpenSession }: { onOpenSession: (agent: string, sid: string, ses: SessionInfo) => void }) {
+  const { state, reload, locale } = useStore();
+  const t = createT(locale);
+  const [pages, setPages] = useState<Record<string, SessionsPageResult>>({});
+  const [loadingByAgent, setLoadingByAgent] = useState<Record<string, boolean>>({});
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const requestSeqRef = useRef<Record<string, number>>({});
+  const hydratedAgentsKeyRef = useRef<string | null>(null);
+
+  const installedAgents = installedAgentsFromState(state);
+  const installedAgentsKey = installedAgents.map(agent => agent.agent).join(',');
+
+  const loadAgentPage = useEffectEvent(async (agent: string, page: number) => {
+    const seq = (requestSeqRef.current[agent] ?? 0) + 1;
+    requestSeqRef.current[agent] = seq;
+    setLoadingByAgent(prev => ({ ...prev, [agent]: true }));
+
+    try {
+      const result = await api.getSessionsPage(agent, page, PAGE_SIZE, { timeoutMs: 20_000 });
+      if (requestSeqRef.current[agent] !== seq) return;
+      startTransition(() => {
+        setPages(prev => ({ ...prev, [agent]: result }));
+      });
+    } catch (error) {
+      if (requestSeqRef.current[agent] !== seq) return;
+      const errorText = sessionErrorText(error, t);
+      startTransition(() => {
+        setPages(prev => ({
+          ...prev,
+          [agent]: {
+            ok: false,
+            sessions: [],
+            error: errorText,
+            page,
+            limit: PAGE_SIZE,
+            total: 0,
+            totalPages: 1,
+            hasMore: false,
+          },
+        }));
+      });
+    } finally {
+      if (requestSeqRef.current[agent] === seq) {
+        setLoadingByAgent(prev => ({ ...prev, [agent]: false }));
+      }
+    }
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrate = async () => {
+      const latestState = state ?? await reload();
+      if (cancelled) return;
+
+      const agents = installedAgentsFromState(latestState);
+      const nextKey = agents.map(agent => agent.agent).join(',');
+      if (nextKey === hydratedAgentsKeyRef.current) return;
+      hydratedAgentsKeyRef.current = nextKey;
+
+      if (!agents.length) {
+        startTransition(() => setPages({}));
+        setBootstrapping(false);
+        return;
+      }
+
+      setBootstrapping(true);
+      await Promise.all(agents.map(agent => loadAgentPage(agent.agent, 0)));
+      if (!cancelled) setBootstrapping(false);
+    };
+
+    void hydrate();
+    return () => { cancelled = true; };
+  }, [installedAgentsKey, reload, state]);
 
   return (
-    <div className="animate-in space-y-6">
+    <div className="animate-in space-y-8">
       <section>
         <SectionLabel>{t('sessions.agentSessions')}</SectionLabel>
-        <SwimLanes onOpenSession={onOpenSession} />
+        <SwimLanes
+          agents={installedAgents}
+          pages={pages}
+          loadingByAgent={loadingByAgent}
+          bootstrapping={bootstrapping}
+          onOpenSession={onOpenSession}
+          onRetry={agent => { void loadAgentPage(agent, 0); }}
+          onPageChange={(agent, page) => { void loadAgentPage(agent, page); }}
+          t={t}
+        />
       </section>
     </div>
   );

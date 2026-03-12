@@ -70,7 +70,7 @@ export interface MessagePipeline<TCtx> {
 
 export interface StageFilesResult {
   ok: boolean;
-  localSessionId: string;
+  sessionId: string;
   workspacePath: string | null;
   importedCount: number;
 }
@@ -84,14 +84,13 @@ export async function stageFilesIntoSession(
     agent: session.agent,
     workdir: bot.workdir,
     files,
-    localSessionId: session.localSessionId,
     sessionId: session.sessionId,
     title: files[0],
   });
   session.workspacePath = staged.workspacePath;
   return {
     ok: staged.importedFiles.length > 0,
-    localSessionId: staged.localSessionId,
+    sessionId: staged.sessionId,
     workspacePath: staged.workspacePath,
     importedCount: staged.importedFiles.length,
   };
@@ -142,7 +141,6 @@ export async function handleIncomingMessage<TCtx>(opts: HandleMessageOpts<TCtx>)
   cs.activeSessionKey = session.key;
   cs.agent = session.agent;
   cs.sessionId = session.sessionId;
-  cs.localSessionId = session.localSessionId;
   cs.workspacePath = session.workspacePath;
   cs.codexCumulative = session.codexCumulative;
   cs.modelId = session.modelId ?? null;
@@ -154,7 +152,7 @@ export async function handleIncomingMessage<TCtx>(opts: HandleMessageOpts<TCtx>)
       const result = await stageFilesIntoSession(bot, session, files);
       opts.syncSelectedChats(session);
       if (!result.ok) throw new Error('no files persisted');
-      opts.log(`[handleMessage] staged files session=${result.localSessionId} files=${result.importedCount}`);
+      opts.log(`[handleMessage] staged files session=${result.sessionId} files=${result.importedCount}`);
     });
     if (hadPendingWork) {
       void stageTask.catch(e => opts.log(`[handleMessage] stage queue failed: ${e}`));

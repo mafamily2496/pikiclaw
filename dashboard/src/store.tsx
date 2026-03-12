@@ -1,5 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { api } from './api';
+import { hasPendingChannelValidation } from './channel-status';
 import type { AppState, HostInfo, SessionInfo } from './types';
 import type { Locale } from './i18n';
 
@@ -58,7 +59,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [allSessions, setAllSessions] = useState<Record<string, { sessions: SessionInfo[] }>>({});
   const [theme, setThemeState] = useState<Theme>(getInitialTheme);
   const [locale, setLocaleState] = useState<Locale>(getInitialLocale);
-  const intervalRef = useRef<ReturnType<typeof setInterval>>();
 
   const setTheme = useCallback((t: Theme) => {
     setThemeState(t);
@@ -78,9 +78,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const reload = useCallback(async () => {
     try {
-      const [d, h] = await Promise.all([api.getState(), api.getHost()]);
+      // Load state first (fast) so UI can render immediately;
+      // host info loads in parallel but doesn't block state rendering
+      const statePromise = api.getState();
+      const hostPromise = api.getHost().then(h => setHost(h)).catch(() => {});
+      const d = await statePromise;
       setState(d);
-      setHost(h);
+      await hostPromise;
       return d;
     } catch (e) {
       console.error('loadState:', e);
@@ -122,9 +126,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     reload();
-    intervalRef.current = setInterval(reload, 15000);
-    return () => clearInterval(intervalRef.current);
   }, [reload]);
+
+  useEffect(() => {
+    if (!hasPendingChannelValidation(state?.setupState?.channels || null)) return;
+    const timer = setTimeout(() => {
+      void reload();
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [state, reload]);
 
   return (
     <Ctx.Provider value={{ state, tab, setTab, reload, reloadUntil, toasts, toast, host, allSessions, loadSessions, theme, setTheme, locale, setLocale }}>

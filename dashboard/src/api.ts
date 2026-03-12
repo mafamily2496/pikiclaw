@@ -1,36 +1,18 @@
-import type { AgentStatusResponse, AppState, HostInfo, LsDirResult, SessionTailMessage } from './types';
+import type {
+  AgentStatusResponse,
+  AppState,
+  HostInfo,
+  LsDirResult,
+  PermissionRequestResult,
+  SessionTailMessage,
+  SessionsPageResult,
+} from './types';
 
 export interface ApiRequestOptions extends RequestInit {
   timeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout?: () => void): Promise<T> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      onTimeout?.();
-      reject(new Error(`Request timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    promise
-      .then(value => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(value);
-      })
-      .catch(error => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
-  });
-}
 
 function forwardAbort(source: AbortSignal | null | undefined, controller: AbortController): () => void {
   if (!source) return () => {};
@@ -47,16 +29,11 @@ async function json<T>(url: string, opts: ApiRequestOptions = {}): Promise<T> {
   const { timeoutMs = DEFAULT_TIMEOUT_MS, signal, ...rest } = opts;
   const controller = new AbortController();
   const cleanupAbort = forwardAbort(signal, controller);
-  const timer = setTimeout(() => {
-    controller.abort(new Error(`Request timed out after ${timeoutMs}ms`));
-  }, timeoutMs);
+  const timer = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs);
 
   try {
-    const res = await withTimeout(fetch(url, {
-      ...rest,
-      signal: controller.signal,
-    }), timeoutMs, () => controller.abort());
-    const raw = await withTimeout(res.text(), Math.min(timeoutMs, 5_000), () => controller.abort());
+    const res = await fetch(url, { ...rest, signal: controller.signal });
+    const raw = await res.text();
     if (!raw) throw new Error(`Empty response (${res.status})`);
     try {
       return JSON.parse(raw) as T;
@@ -89,9 +66,15 @@ export const api = {
   getHost: () => json<HostInfo>('/api/host'),
   getAgentStatus: () => json<AgentStatusResponse>('/api/agent-status'),
   getSessions: () => json<Record<string, { sessions: unknown[] }>>('/api/sessions'),
-  getSessionDetail: (agent: string, sessionId: string, limit = 8) =>
+  getSessionsPage: (agent: string, page = 0, limit = 6, opts: ApiRequestOptions = {}) =>
+    json<SessionsPageResult>(
+      `/api/sessions/${agent}?page=${page}&limit=${limit}`,
+      opts,
+    ),
+  getSessionDetail: (agent: string, sessionId: string, limit = 8, opts: ApiRequestOptions = {}) =>
     json<{ ok: boolean; messages?: SessionTailMessage[]; error?: string }>(
-      `/api/session-detail/${agent}/${encodeURIComponent(sessionId)}?limit=${limit}`
+      `/api/session-detail/${agent}/${encodeURIComponent(sessionId)}?limit=${limit}`,
+      opts,
     ),
   updateRuntimeAgent: (patch: Record<string, unknown>) =>
     post<{ ok: boolean; error?: string } & AgentStatusResponse>('/api/runtime-agent', patch),
@@ -108,8 +91,8 @@ export const api = {
       { appId, appSecret },
       opts,
     ),
-  openPreferences: (permission: string) => post<{ ok: boolean }>('/api/open-preferences', { permission }),
-  restart: () => post<{ ok: boolean }>('/api/restart', {}),
+  requestPermission: (permission: string) => post<PermissionRequestResult>('/api/open-preferences', { permission }),
+  restart: () => post<{ ok: boolean; error?: string | null }>('/api/restart', {}),
   switchWorkdir: (path: string) => post<{ ok: boolean; workdir?: string; error?: string }>('/api/switch-workdir', { path }),
   lsDir: (dir?: string) => json<LsDirResult>(`/api/ls-dir${dir ? '?path=' + encodeURIComponent(dir) : ''}`),
 };

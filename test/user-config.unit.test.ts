@@ -21,9 +21,9 @@ describe('user config', () => {
     expect(process.env.TELEGRAM_ALLOWED_CHAT_IDS).toBe('1,2,-3');
   });
 
-  it('does not apply saved default workdir to the environment', () => {
-    applyUserConfig({ defaultWorkdir: '/tmp/codeclaw-saved-workdir' });
+  it('applies saved workdir to the environment', () => {
+    applyUserConfig({ workdir: '/tmp/codeclaw-saved-workdir' });
 
-    expect(process.env.CODECLAW_WORKDIR).toBeUndefined();
+    expect(process.env.CODECLAW_WORKDIR).toBe('/tmp/codeclaw-saved-workdir');
   });
 });

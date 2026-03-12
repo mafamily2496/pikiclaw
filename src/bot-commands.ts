@@ -14,6 +14,7 @@ import { VERSION, fmtTokens, fmtUptime, fmtBytes } from './bot.js';
 import { getDriver } from './agent-driver.js';
 import { buildWelcomeIntro, buildDefaultMenuCommands, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
 import { summarizePromptForStatus } from './bot-streaming.js';
+import { getSessionStatusForChat } from './session-status.js';
 
 // ---------------------------------------------------------------------------
 // Welcome / Start
@@ -74,21 +75,14 @@ export async function getSessionsPageData(bot: Bot, chatId: ChatId, page: number
 
   const entries: SessionEntry[] = [];
   for (const s of slice) {
-    const sessionKey = s.localSessionId || s.sessionId || '';
+    const sessionKey = s.sessionId || '';
     if (!sessionKey) continue;
-    const runtimeKey = s.localSessionId ? `${s.agent}:${s.localSessionId}` : null;
-    const runtime = runtimeKey ? (bot.sessionStates.get(runtimeKey) || null) : null;
-    const isCurrent = runtime ? cs.activeSessionKey === runtime.key : (
-      s.localSessionId
-        ? s.localSessionId === (cs.localSessionId ?? null)
-        : s.sessionId === (cs.sessionId ?? null)
-    );
-    const isRunning = !!runtime?.runningTaskIds.size || !!s.running;
+    const status = getSessionStatusForChat(bot, cs, s);
     const title = s.title ? s.title.replace(/\n/g, ' ').slice(0, 10) : sessionKey.slice(0, 10);
     const time = s.createdAt
       ? new Date(s.createdAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
       : '?';
-    entries.push({ key: sessionKey, title, time, isCurrent, isRunning });
+    entries.push({ key: sessionKey, title, time, isCurrent: status.isCurrent, isRunning: status.isRunning });
   }
 
   return { agent: cs.agent, total, page: pg, totalPages, sessions: entries };
@@ -230,7 +224,6 @@ export interface StatusData {
   agent: Agent;
   model: string;
   sessionId: string | null;
-  localSessionId: string | null;
   workspacePath: string | null;
   activeTasksCount: number;
   running: { prompt: string; startedAt: number } | null;

@@ -1,4 +1,12 @@
 import type { Agent, StreamPreviewMeta, StreamPreviewPlan, StreamResult } from './bot.js';
+import type {
+  CommandActionButton,
+  CommandItemState,
+  CommandNotice,
+  CommandSelectionItem,
+  CommandSelectionView,
+} from './bot-command-ui.js';
+import { encodeCommandAction } from './bot-command-ui.js';
 import { fmtUptime, formatThinkingForDisplay, thinkLabel } from './bot.js';
 import { formatActivityCommandSummary, parseActivitySummary, renderPlanForPreview, summarizeActivityForPreview } from './bot-streaming.js';
 
@@ -69,6 +77,66 @@ export function buildCompactSelectionNotice(
   const cleanDetail = String(detail || '').trim();
   if (cleanDetail) lines.push(`<i>${escapeHtml(cleanDetail)}</i>`);
   return lines.join('\n');
+}
+
+function selectionStateSymbol(state: CommandItemState | undefined): string {
+  switch (state) {
+    case 'current': return '●';
+    case 'running': return '◐';
+    case 'unavailable': return '✕';
+    default: return '○';
+  }
+}
+
+function formatCommandItemHtml(item: CommandSelectionItem, index: number): string {
+  const parts = [
+    selectionStateSymbol(item.state),
+    `<b>${index + 1}.</b>`,
+    escapeHtml(item.label),
+  ];
+  if (item.detail) parts.push(escapeHtml(item.detail));
+  return parts.join(' ');
+}
+
+function formatCommandButtonLabel(button: CommandActionButton, maxChars = 24): string {
+  const prefix = button.state && button.state !== 'default'
+    ? `${selectionStateSymbol(button.state)} `
+    : '';
+  return truncateMiddle(`${prefix}${button.label}`.trim(), maxChars);
+}
+
+export function renderCommandNoticeHtml(notice: CommandNotice): string {
+  const lines = [`<b>${escapeHtml(notice.title)}</b>`];
+  if (notice.value) {
+    if (notice.valueMode === 'plain') lines.push(escapeHtml(notice.value));
+    else lines.push(compactCode(notice.value, 40));
+  }
+  if (notice.detail) lines.push(`<i>${escapeHtml(notice.detail)}</i>`);
+  return lines.join('\n');
+}
+
+export function renderCommandSelectionHtml(view: CommandSelectionView): string {
+  const lines = [buildCompactSelectionTitle(view.title, view.detail)];
+  if (view.metaLines.length) lines.push(...view.metaLines.map(line => `<i>${escapeHtml(line)}</i>`));
+
+  if (view.items.length) {
+    lines.push('', ...view.items.map((item, index) => formatCommandItemHtml(item, index)));
+  } else if (view.emptyText) {
+    lines.push('', `<i>${escapeHtml(view.emptyText)}</i>`);
+  }
+
+  if (view.helperText) lines.push('', `<i>${escapeHtml(view.helperText)}</i>`);
+  return lines.join('\n');
+}
+
+export function renderCommandSelectionKeyboard(view: CommandSelectionView): { inline_keyboard: { text: string; callback_data: string }[][] } | undefined {
+  if (!view.rows.length) return undefined;
+  return {
+    inline_keyboard: view.rows.map(row => row.map(button => ({
+      text: formatCommandButtonLabel(button),
+      callback_data: encodeCommandAction(button.action),
+    }))),
+  };
 }
 
 function mdInline(line: string): string {
@@ -207,17 +275,8 @@ function formatFinalFooterHtml(status: FooterStatus, agent: Agent, elapsedMs: nu
   return escapeHtml(`${footerStatusSymbol(status)} ${formatFooterSummary(agent, elapsedMs, null, contextPercent ?? null)}`);
 }
 
-function humanizeUsageStatus(status: string | null | undefined): string {
-  return (status || '').replace(/_/g, ' ').trim();
-}
-
-function usageRemainingSeconds(capturedAt: string | null, resetAfterSeconds: number | null): number | null {
-  if (resetAfterSeconds == null) return null;
-  const capturedAtMs = capturedAt ? Date.parse(capturedAt) : Number.NaN;
-  if (Number.isFinite(capturedAtMs)) {
-    return Math.round((capturedAtMs + resetAfterSeconds * 1000 - Date.now()) / 1000);
-  }
-  return resetAfterSeconds;
+function rawUsageLine(parts: Array<string | null | undefined>): string {
+  return parts.filter(part => !!part && String(part).trim()).join(' ');
 }
 
 export function formatProviderUsageLines(usage: ProviderUsageSnapshot): string[] {
@@ -236,27 +295,17 @@ export function formatProviderUsageLines(usage: ProviderUsageSnapshot): string[]
   }
 
   if (!usage.windows.length) {
-    lines.push(`  ${escapeHtml(humanizeUsageStatus(usage.status) || 'No window data')}`);
+    lines.push(`  ${escapeHtml(usage.status ? `status=${usage.status}` : 'No window data')}`);
     return lines;
   }
 
   for (const window of usage.windows) {
-    const parts: string[] = [];
-    if (window.usedPercent != null && window.remainingPercent != null) {
-      parts.push(`${window.usedPercent}% used / ${window.remainingPercent}% left`);
-    } else if (window.usedPercent != null) {
-      parts.push(`${window.usedPercent}% used`);
-    }
-
-    const status = humanizeUsageStatus(window.status);
-    if (status) parts.push(status);
-
-    const remainingSeconds = usageRemainingSeconds(usage.capturedAt, window.resetAfterSeconds);
-    if (remainingSeconds != null) {
-      parts.push(remainingSeconds > 0 ? `resets in ${fmtUptime(remainingSeconds * 1000)}` : 'reset passed');
-    }
-
-    lines.push(`  ${escapeHtml(window.label)}: ${escapeHtml(parts.join(' | ') || 'No details')}`);
+    const details = rawUsageLine([
+      window.usedPercent != null ? `${window.usedPercent}% used` : null,
+      window.status ? `status=${window.status}` : null,
+      window.resetAfterSeconds != null ? `resetAfterSeconds=${window.resetAfterSeconds}` : null,
+    ]);
+    lines.push(`  ${escapeHtml(window.label)}: ${escapeHtml(details || 'No details')}`);
   }
 
   return lines;

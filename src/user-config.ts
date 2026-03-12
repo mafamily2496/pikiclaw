@@ -11,7 +11,12 @@ export interface UserConfig {
   /** Launch multiple channels simultaneously (comma-separated or array). */
   channels?: ChannelName[];
   defaultAgent?: Agent;
-  defaultWorkdir?: string;
+  claudeModel?: string;
+  claudeReasoningEffort?: string;
+  codexModel?: string;
+  codexReasoningEffort?: string;
+  geminiModel?: string;
+  workdir?: string;
   telegramBotToken?: string;
   telegramAllowedChatIds?: string;
   feishuAppId?: string;
@@ -34,8 +39,8 @@ type UserConfigChangeListener = (config: Partial<UserConfig>, changedKeys: strin
 
 const MANAGED_ENV_KEYS = [
   'CODECLAW_CHANNEL',
-  'DEFAULT_AGENT',
   'CODECLAW_WORKDIR',
+  'DEFAULT_AGENT',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_ALLOWED_CHAT_IDS',
   'FEISHU_APP_ID',
@@ -67,14 +72,30 @@ function loadJsonFile(filePath: string): Partial<UserConfig> {
   try {
     const raw = fs.readFileSync(filePath, 'utf-8');
     const parsed = JSON.parse(raw);
-    return typeof parsed === 'object' && parsed ? parsed : {};
+    return typeof parsed === 'object' && parsed ? normalizeUserConfig(parsed) : {};
   } catch {
     return {};
   }
 }
 
+function normalizeUserConfig(config: Partial<UserConfig>): Partial<UserConfig> {
+  const next = { ...config };
+  const workdir = typeof next.workdir === 'string' && next.workdir.trim() ? next.workdir.trim() : '';
+  if (workdir) next.workdir = resolveUserWorkdir({ workdir });
+  else delete next.workdir;
+  return next;
+}
+
 export function loadUserConfig(): Partial<UserConfig> {
   return loadJsonFile(getUserConfigPath());
+}
+
+export function hasUserConfigFile(): boolean {
+  try {
+    return fs.existsSync(getUserConfigPath());
+  } catch {
+    return false;
+  }
 }
 
 export function getActiveUserConfig(): Partial<UserConfig> {
@@ -84,7 +105,7 @@ export function getActiveUserConfig(): Partial<UserConfig> {
 export function saveUserConfig(config: Partial<UserConfig>): string {
   const filePath = getUserConfigPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify({ version: 1, ...config }, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(filePath, `${JSON.stringify({ version: 1, ...normalizeUserConfig(config) }, null, 2)}\n`, { mode: 0o600 });
   return filePath;
 }
 
@@ -99,7 +120,7 @@ export function resolveUserWorkdir(opts: {
 } = {}): string {
   const raw = String(
     opts.workdir
-    || opts.config?.defaultWorkdir
+    || opts.config?.workdir
     || process.env.CODECLAW_WORKDIR
     || opts.cwd
     || process.cwd(),
@@ -108,12 +129,11 @@ export function resolveUserWorkdir(opts: {
 }
 
 function buildManagedEnv(config: Partial<UserConfig>): Record<(typeof MANAGED_ENV_KEYS)[number], string> {
+  const configuredWorkdir = config.workdir || '';
   return {
     CODECLAW_CHANNEL: String(config.channel || '').trim(),
+    CODECLAW_WORKDIR: configuredWorkdir ? resolveUserWorkdir({ workdir: configuredWorkdir }) : '',
     DEFAULT_AGENT: String(config.defaultAgent || '').trim(),
-    CODECLAW_WORKDIR: String(config.defaultWorkdir || '').trim()
-      ? path.resolve(expandHomeDir(String(config.defaultWorkdir || '').trim()))
-      : '',
     TELEGRAM_BOT_TOKEN: String(config.telegramBotToken || '').trim(),
     TELEGRAM_ALLOWED_CHAT_IDS: String(config.telegramAllowedChatIds || '').trim(),
     FEISHU_APP_ID: String(config.feishuAppId || '').trim(),
@@ -142,12 +162,27 @@ export function onUserConfigChange(listener: UserConfigChangeListener): () => vo
   return () => userConfigListeners.delete(listener);
 }
 
+function configValuesEqual(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  return a === b;
+}
+
+function diffConfigKeys(prev: Partial<UserConfig>, next: Partial<UserConfig>): string[] {
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  const changed: string[] = [];
+  for (const key of keys) {
+    if (!configValuesEqual(prev[key as keyof UserConfig], next[key as keyof UserConfig])) changed.push(key);
+  }
+  return changed;
+}
+
 export function applyUserConfig(config: Partial<UserConfig>, _channel?: string, options: ApplyUserConfigOptions = {}): string[] {
   const overwrite = options.overwrite ?? true;
   const clearMissing = options.clearMissing ?? true;
   const notify = options.notify ?? true;
   const managed = buildManagedEnv(config);
   const changedKeys: string[] = [];
+  const prevConfig = activeUserConfig;
 
   for (const key of MANAGED_ENV_KEYS) {
     const next = managed[key];
@@ -167,8 +202,22 @@ export function applyUserConfig(config: Partial<UserConfig>, _channel?: string, 
   }
 
   activeUserConfig = { ...config };
-  if (notify && changedKeys.length) notifyUserConfigListeners(activeUserConfig, changedKeys);
+  const configChangedKeys = diffConfigKeys(prevConfig, activeUserConfig);
+  const notifyKeys = [...new Set([...changedKeys, ...configChangedKeys])];
+  if (notify && notifyKeys.length) notifyUserConfigListeners(activeUserConfig, notifyKeys);
   return changedKeys;
+}
+
+export function setUserWorkdir(workdir: string, options: { notify?: boolean } = {}): {
+  configPath: string;
+  workdir: string;
+  config: Partial<UserConfig>;
+} {
+  const resolvedWorkdir = resolveUserWorkdir({ workdir });
+  const config = normalizeUserConfig({ ...loadUserConfig(), workdir: resolvedWorkdir });
+  const configPath = saveUserConfig(config);
+  applyUserConfig(config, undefined, { overwrite: true, clearMissing: true, notify: options.notify ?? true });
+  return { configPath, workdir: resolvedWorkdir, config };
 }
 
 export function startUserConfigSync(options: SyncUserConfigOptions = {}): () => void {
