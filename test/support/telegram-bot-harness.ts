@@ -20,6 +20,16 @@ export function createTelegramBotHarness(): TelegramBotHarness {
   const files: Array<{ filePath: string; opts?: any }> = [];
   const reactions: Array<{ chatId: number; messageId: number; reactions: string[] }> = [];
   const channel = {
+    capabilities: {
+      editMessages: true,
+      typingIndicators: true,
+      commandMenu: true,
+      callbackActions: true,
+      messageReactions: true,
+      fileUpload: true,
+      fileDownload: true,
+      threads: true,
+    },
     editMessage: vi.fn(async (_chatId: number, _msgId: number, text: string, opts?: any) => {
       edits.push({ text, opts });
     }),

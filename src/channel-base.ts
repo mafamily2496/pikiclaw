@@ -74,7 +74,7 @@ export function supportsChannelCapability(
   channel: { capabilities?: Partial<ChannelCapabilities> } | null | undefined,
   capability: ChannelCapability,
 ): boolean {
-  return channel?.capabilities?.[capability] ?? true;
+  return channel?.capabilities?.[capability] ?? false;
 }
 
 export function splitText(text: string, max: number): string[] {

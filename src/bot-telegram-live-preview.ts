@@ -34,7 +34,7 @@ export interface LivePreviewRenderer {
 export interface LivePreviewOptions {
   agent: Agent;
   chatId: ChatId;
-  placeholderMessageId: number | string;
+  placeholderMessageId: number | string | null;
   channel: PreviewChannel;
   renderer: LivePreviewRenderer;
   streamEditIntervalMs: number;
@@ -56,7 +56,7 @@ export class LivePreview {
 
   private readonly agent: Agent;
   private readonly chatId: ChatId;
-  private readonly placeholderMessageId: number | string;
+  private readonly placeholderMessageId: number | string | null;
   private readonly channel: PreviewChannel;
   private readonly renderer: LivePreviewRenderer;
   private readonly streamEditIntervalMs: number;
@@ -209,7 +209,8 @@ export class LivePreview {
   }
 
   private queuePreviewEdit(force = false) {
-    if (!this.canEditMessages) return;
+    if (!this.canEditMessages || this.placeholderMessageId == null) return;
+    const placeholderMessageId = this.placeholderMessageId;
     const preview = this.renderPreview();
     if (!preview) return;
     if (!force && preview === this.lastPreview) return;
@@ -222,7 +223,7 @@ export class LivePreview {
       .then(async () => {
         if (version !== this.previewVersion) return;
         try {
-          await this.channel.editMessage(this.chatId, this.placeholderMessageId, preview, { parseMode: this.parseMode });
+          await this.channel.editMessage(this.chatId, placeholderMessageId, preview, { parseMode: this.parseMode });
         } catch (error: any) {
           this.log(`stream edit err: ${error?.message || error}`);
         }

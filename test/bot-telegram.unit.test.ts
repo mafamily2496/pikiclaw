@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { TelegramBot, buildArtifactPrompt } from '../src/bot-telegram.ts';
 import { TelegramChannel } from '../src/channel-telegram.ts';
+import * as agentDriver from '../src/agent-driver.ts';
 import type { Agent, StreamResult } from '../src/code-agent.ts';
 import { makeTmpDir } from './support/env.ts';
 import { makeStreamResult } from './support/stream-result.ts';
@@ -192,6 +193,56 @@ describe('TelegramBot.run shutdown handling', () => {
 });
 
 describe('TelegramBot status and session previews', () => {
+  it('renders compact agent and model pickers for mobile layouts', async () => {
+    const { bot, ctx } = createBot();
+    const replies: Array<{ text: string; opts?: any }> = [];
+    ctx.reply = vi.fn(async (text: string, opts?: any) => {
+      replies.push({ text, opts });
+      return 1;
+    });
+
+    vi.spyOn(bot, 'fetchAgents').mockReturnValue({
+      ok: true,
+      agents: [
+        { agent: 'claude', installed: true, version: '1.2.3', path: '/tmp/claude', authStatus: 'ready' } as any,
+        { agent: 'codex', installed: true, version: '9.9.9', path: '/tmp/codex', authStatus: 'ready' } as any,
+      ],
+      error: null,
+    });
+    bot.chat(ctx.chatId).agent = 'codex';
+
+    await (bot as any).cmdAgents(ctx);
+
+    expect(replies[0]?.text).toBe('<b>Agents</b>');
+    expect(replies[0]?.text).not.toContain('Version:');
+    expect(replies[0]?.text).not.toContain('Path:');
+    expect(replies[0]?.opts?.keyboard?.inline_keyboard).toEqual([
+      [{ text: 'claude', callback_data: 'ag:claude' }, { text: '● codex', callback_data: 'ag:codex' }],
+    ]);
+
+    replies.length = 0;
+    vi.spyOn(bot, 'fetchModels').mockResolvedValue({
+      agent: 'claude',
+      models: [
+        { id: 'claude-sonnet-4-6', alias: 'sonnet' },
+        { id: 'claude-opus-4-6[1m]', alias: 'opus-1m' },
+      ],
+      sources: ['app-server model/list'],
+      note: 'debug note should stay hidden while models exist',
+    });
+    bot.chat(ctx.chatId).agent = 'claude';
+
+    await (bot as any).cmdModels(ctx);
+
+    expect(replies[0]?.text).toBe('<b>Models</b> · <code>claude</code>');
+    expect(replies[0]?.text).not.toContain('Source:');
+    expect(replies[0]?.text).not.toContain('debug note');
+    expect(replies[0]?.opts?.keyboard?.inline_keyboard).toEqual([
+      [{ text: 'sonnet', callback_data: 'mod:claude-sonnet-4-6' }, { text: 'opus-1m', callback_data: 'mod:claude-opus-4-6[1m]' }],
+      [{ text: 'Low', callback_data: 'eff:low' }, { text: 'Medium', callback_data: 'eff:medium' }, { text: '● High', callback_data: 'eff:high' }],
+    ]);
+  });
+
   it('hides artifact system prompts from status output', async () => {
     const { bot, ctx } = createBot();
     const replies: Array<{ text: string; opts?: any }> = [];
@@ -249,7 +300,7 @@ describe('TelegramBot status and session previews', () => {
 
     expect(ctx.editReply).toHaveBeenCalledWith(
       ctx.messageId,
-      `Switched to session: <code>${localSessionId.slice(0, 16)}</code>`,
+      `<b>Session</b>\n<code>${localSessionId}</code>`,
       { parseMode: 'HTML' },
     );
     expect(bot.chat(ctx.chatId).sessionId).toBe(engineSessionId);
@@ -258,6 +309,26 @@ describe('TelegramBot status and session previews', () => {
     expect(sends[0].text).toContain('<blockquote expandable>请总结这次修改\n第二行保留原样</blockquote>');
     expect(sends[0].text).toContain('<b>Summary</b>');
     expect(sends[0].text).toContain('<pre><code class="language-ts">const x = 1;</code></pre>');
+  });
+
+  it('returns compact callback confirmations for agent and model switches', async () => {
+    const { bot, ctx } = createBot();
+    bot.chat(ctx.chatId).agent = 'claude';
+
+    await bot.handleCallback('ag:codex', ctx as any);
+    expect(ctx.editReply).toHaveBeenLastCalledWith(
+      ctx.messageId,
+      '<b>Agent</b>\n<code>codex</code>\n<i>Session reset</i>',
+      { parseMode: 'HTML' },
+    );
+
+    bot.chat(ctx.chatId).agent = 'claude';
+    await bot.handleCallback('mod:claude-opus-4-6[1m]', ctx as any);
+    expect(ctx.editReply).toHaveBeenLastCalledWith(
+      ctx.messageId,
+      '<b>Model</b>\n<code>claude-opus-4-6[1m]</code>\n<i>claude · session reset</i>',
+      { parseMode: 'HTML' },
+    );
   });
 });
 
@@ -406,6 +477,35 @@ describe('TelegramBot.handleMessage streaming', () => {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   });
 
+  it('skips placeholder previews on channels without message editing and falls back to a final send', async () => {
+    const { bot, ctx, channel, sends, edits } = createBot();
+    ctx.raw = { chat: { type: 'private' } };
+    channel.capabilities = {
+      ...channel.capabilities,
+      editMessages: false,
+      typingIndicators: true,
+    };
+
+    vi.spyOn(bot, 'runStream').mockImplementation(async (_prompt: string, _cs: any, _files: string[], onText: any) => {
+      onText('partial', '', 'running checks');
+      return claudeResult({
+        message: 'Final fallback reply.',
+        elapsedS: 1.2,
+        inputTokens: 5,
+        outputTokens: 9,
+      });
+    });
+
+    await (bot as any).handleMessage({ text: 'hello', files: [] }, ctx);
+
+    await vi.waitFor(() => {
+      expect(sends.some(entry => entry.text.includes('Final fallback reply.'))).toBe(true);
+    });
+    expect(vi.mocked(ctx.reply)).not.toHaveBeenCalled();
+    expect(edits).toHaveLength(0);
+    expect(vi.mocked(channel.sendTyping)).toHaveBeenCalled();
+  });
+
   it('runs different sessions concurrently in the same chat', async () => {
     const { bot, ctx } = createBot();
     let nextReplyId = 1000;
@@ -528,10 +628,11 @@ describe('TelegramBot.handleMessage streaming', () => {
 });
 
 describe('TelegramBot.performRestart', () => {
-  it('uses non-interactive npx restarts for both default and custom commands', () => {
+  it('uses non-interactive npx restarts for both default and custom commands and shuts down all drivers', () => {
     const spawnMock = vi.mocked(spawn);
     const oldArgv = process.argv;
     process.argv = ['node', 'codeclaw', '-c', 'telegram'];
+    const shutdownSpy = vi.spyOn(agentDriver, 'shutdownAllDrivers').mockImplementation(() => {});
 
     const defaultBot = createBot().bot;
     const defaultExitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as any);
@@ -541,6 +642,7 @@ describe('TelegramBot.performRestart', () => {
 
     try {
       (defaultBot as any).performRestart();
+      expect(shutdownSpy).toHaveBeenCalledTimes(1);
       expect(spawnMock).toHaveBeenCalledWith(
         'npx',
         ['--yes', 'codeclaw@latest', '-c', 'telegram'],
@@ -559,6 +661,7 @@ describe('TelegramBot.performRestart', () => {
       try {
         spawnMock.mockClear();
         (customBot as any).performRestart();
+        expect(shutdownSpy).toHaveBeenCalledTimes(2);
         expect(spawnMock).toHaveBeenCalledWith(
           'npx',
           ['--yes', 'tsx', 'src/cli.ts', '-c', 'telegram'],
@@ -572,6 +675,7 @@ describe('TelegramBot.performRestart', () => {
       }
     } finally {
       process.argv = oldArgv;
+      shutdownSpy.mockRestore();
       defaultExitSpy.mockRestore();
       defaultStopKeepAliveSpy.mockRestore();
     }

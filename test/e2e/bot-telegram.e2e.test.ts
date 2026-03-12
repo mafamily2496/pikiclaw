@@ -199,9 +199,7 @@ describe.skipIf(SKIP)('/agents', () => {
 
     expect(ctx.sentTexts.length).toBeGreaterThanOrEqual(1);
     const text = ctx.sentTexts[0];
-    expect(text).toContain('Available Agents');
-    if (HAS_CLAUDE) expect(text).toContain('claude');
-    if (HAS_CODEX) expect(text).toContain('codex');
+    expect(text).toContain('Agents');
     expect(ctx.sentKeyboards.length).toBeGreaterThan(0);
   }, TIMEOUT);
 });
@@ -224,9 +222,8 @@ describe.skipIf(SKIP)('/switch', () => {
 
     expect(ctx.sentTexts.length).toBeGreaterThanOrEqual(1);
     const text = ctx.sentTexts[0];
-    expect(text).toContain('Switch workdir');
-    expect(text).toContain('Current:');
-    expect(text).toContain('Browsing:');
+    expect(text).toContain('Workdir');
+    expect(text).toContain('●');
     expect(ctx.sentKeyboards.length).toBeGreaterThan(0);
   }, TIMEOUT);
 });

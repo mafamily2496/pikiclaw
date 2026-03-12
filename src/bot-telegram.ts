@@ -42,10 +42,13 @@ import {
   buildInitialPreviewHtml,
   buildStreamPreviewHtml,
   buildFinalReplyRender,
+  buildCompactSelectionNotice,
+  buildCompactSelectionTitle,
   escapeHtml,
   formatMenuLines,
   formatProviderUsageLines,
   renderSessionTurnHtml,
+  truncateMiddle,
 } from './bot-telegram-render.js';
 import { TelegramChannel, type TgContext, type TgCallbackContext, type TgMessage } from './channel-telegram.js';
 import { splitText, supportsChannelCapability } from './channel-base.js';
@@ -67,6 +70,17 @@ function ensureNonInteractiveRestartArgs(bin: string, args: string[]): string[] 
   if (!isNpxBinary(bin)) return args;
   if (args.includes('--yes') || args.includes('-y')) return args;
   return ['--yes', ...args];
+}
+
+function chunkInlineButtons<T>(items: T[], columns: number): T[][] {
+  const rows: T[][] = [];
+  const count = Math.max(1, columns);
+  for (let i = 0; i < items.length; i += count) rows.push(items.slice(i, i + count));
+  return rows;
+}
+
+function compactButtonLabel(text: string, maxChars = 20): string {
+  return truncateMiddle(text.replace(/\s+/g, ' ').trim(), maxChars);
 }
 
 type ShutdownSignal = 'SIGINT' | 'SIGTERM';
@@ -168,6 +182,12 @@ export class TelegramBot extends Bot {
     process.on('SIGUSR2', onSigusr2);
   }
 
+  private cleanupRuntimeForExit() {
+    try { this.channel.disconnect(); } catch {}
+    this.stopKeepAlive();
+    shutdownAllDrivers();
+  }
+
   private beginShutdown(sig: ShutdownSignal) {
     if (this.shutdownInFlight) return;
 
@@ -175,9 +195,7 @@ export class TelegramBot extends Bot {
     this.shutdownExitCode = SHUTDOWN_EXIT_CODE[sig];
     this.log(`${sig}, shutting down...`);
 
-    try { this.channel.disconnect(); } catch {}
-    this.stopKeepAlive();
-    shutdownAllDrivers();
+    this.cleanupRuntimeForExit();
 
     this.clearShutdownForceExitTimer();
     this.shutdownForceExitTimer = setTimeout(() => {
@@ -294,14 +312,15 @@ export class TelegramBot extends Bot {
 
   private async buildSessionsPage(chatId: number, page: number): Promise<{ text: string; keyboard: { inline_keyboard: { text: string; callback_data: string }[][] } }> {
     const d = await getSessionsPageData(this, chatId, page, this.sessionsPageSize);
-    const text = `<b>${escapeHtml(d.agent)} sessions</b> (${d.total})  p${d.page + 1}/${d.totalPages}`;
+    const text = buildCompactSelectionTitle('Sessions', d.agent);
     const rows: { text: string; callback_data: string }[][] = [];
 
     for (const s of d.sessions) {
-      const icon = s.isRunning ? '🟢' : s.isCurrent ? '● ' : '';
+      const icon = s.isRunning ? '● ' : s.isCurrent ? '○ ' : '';
+      const prefix = compactButtonLabel(s.title, 18);
       let cbData = `sess:${s.key}`;
       if (cbData.length > 64) cbData = cbData.slice(0, 64);
-      rows.push([{ text: `${icon}${s.title}  ${s.time}`, callback_data: cbData }]);
+      rows.push([{ text: `${icon}${prefix} ${s.time}`, callback_data: cbData }]);
     }
 
     const navRow: { text: string; callback_data: string }[] = [];
@@ -381,54 +400,46 @@ export class TelegramBot extends Bot {
 
   private async cmdAgents(ctx: TgContext) {
     const d = getAgentsListData(this, ctx.chatId);
-    const lines = [`<b>Available Agents</b>\n`];
-    const rows: { text: string; callback_data: string }[][] = [];
+    const buttons: { text: string; callback_data: string }[] = [];
     for (const a of d.agents) {
-      const status = !a.installed ? '\u274C' : a.isCurrent ? '\u25CF' : '\u25CB';
-      lines.push(`${status} <b>${escapeHtml(a.agent)}</b>${a.isCurrent ? ' (current)' : ''}`);
       if (a.installed) {
-        if (a.version) lines.push(`   Version: <code>${escapeHtml(a.version)}</code>`);
-        if (a.path) lines.push(`   Path: <code>${escapeHtml(a.path)}</code>`);
-        const label = a.isCurrent ? `\u25CF ${a.agent} (current)` : a.agent;
-        rows.push([{ text: label, callback_data: `ag:${a.agent}` }]);
-      } else {
-        lines.push(`   Not installed`);
+        buttons.push({
+          text: a.isCurrent ? `● ${a.agent}` : a.agent,
+          callback_data: `ag:${a.agent}`,
+        });
       }
     }
-    await ctx.reply(lines.join('\n'), { parseMode: 'HTML', keyboard: { inline_keyboard: rows } });
+    const text = buildCompactSelectionTitle('Agents');
+    const keyboard = buttons.length ? { inline_keyboard: chunkInlineButtons(buttons, 3) } : undefined;
+    await ctx.reply(text, { parseMode: 'HTML', keyboard });
   }
 
   private async cmdModels(ctx: TgContext) {
     const d = await getModelsListData(this, ctx.chatId);
-    const lines = [`<b>Models for ${escapeHtml(d.agent)}</b>`];
-    if (d.sources.length) lines.push(`<i>Source: ${escapeHtml(d.sources.join(', '))}</i>`);
-    if (d.note) lines.push(`<i>${escapeHtml(d.note)}</i>`);
-    lines.push('');
-    const rows: { text: string; callback_data: string }[][] = [];
+    const models = [...d.models].sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent));
+    const buttons: { text: string; callback_data: string }[] = [];
     if (!d.models.length) {
-      lines.push('<i>No discoverable models found.</i>');
+      const detail = d.note || 'No discoverable models found.';
+      await ctx.reply(`${buildCompactSelectionTitle('Models', d.agent)}\n<i>${escapeHtml(detail)}</i>`, { parseMode: 'HTML' });
+      return;
     }
-    for (const m of d.models) {
-      const status = m.isCurrent ? '\u25CF' : '\u25CB';
-      const display = m.alias ? `${m.alias} (${m.id})` : m.id;
-      const currentSuffix = m.isCurrent
-        ? (m.id === d.currentModel ? ' \u2190 current' : ` \u2190 current (${escapeHtml(d.currentModel)})`)
-        : '';
-      lines.push(`${status} <code>${escapeHtml(display)}</code>${currentSuffix}`);
-      const label = m.isCurrent ? `\u25CF ${m.alias || m.id}` : (m.alias || m.id);
-      rows.push([{ text: label, callback_data: `mod:${m.id}` }]);
+    for (const m of models) {
+      buttons.push({
+        text: m.isCurrent ? `● ${compactButtonLabel(m.alias || m.id, 24)}` : compactButtonLabel(m.alias || m.id, 24),
+        callback_data: `mod:${m.id}`,
+      });
     }
+    const rows = chunkInlineButtons(buttons, buttons.some(button => button.text.length > 14) ? 1 : 2);
     if (d.effort) {
-      lines.push('');
-      lines.push(`<b>Thinking Effort</b>: <code>${escapeHtml(d.effort.current)}</code>`);
-      const effortRow: { text: string; callback_data: string }[] = [];
-      for (const l of d.effort.levels) {
-        const prefix = l.isCurrent ? '\u25CF ' : '';
-        effortRow.push({ text: `${prefix}${l.label}`, callback_data: `eff:${l.id}` });
-      }
-      rows.push(effortRow);
+      rows.push(d.effort.levels.map(level => ({
+        text: level.isCurrent ? `● ${level.label}` : level.label,
+        callback_data: `eff:${level.id}`,
+      })));
     }
-    await ctx.reply(lines.join('\n'), { parseMode: 'HTML', keyboard: { inline_keyboard: rows } });
+    await ctx.reply(
+      buildCompactSelectionTitle('Models', d.agent),
+      { parseMode: 'HTML', keyboard: { inline_keyboard: rows } },
+    );
   }
 
   private async cmdRestart(ctx: TgContext) {
@@ -451,8 +462,7 @@ export class TelegramBot extends Bot {
   /** Disconnect, spawn a new process, and exit. */
   private performRestart() {
     this.log('restart: disconnecting...');
-    this.channel.disconnect();
-    this.stopKeepAlive();
+    this.cleanupRuntimeForExit();
 
     const restartCmd = process.env.CODECLAW_RESTART_CMD || 'npx --yes codeclaw@latest';
     const [bin, ...rawArgs] = shellSplit(restartCmd);
@@ -524,14 +534,21 @@ export class TelegramBot extends Bot {
     const files = msg.files;
     const prompt = buildPrompt(text, files);
     const start = Date.now();
+    const canEditMessages = supportsChannelCapability((this as any).channel, 'editMessages');
+    const canSendTyping = supportsChannelCapability((this as any).channel, 'typingIndicators');
     this.log(`[handleMessage] queued chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} local_session=${session.localSessionId} prompt="${prompt.slice(0, 100)}" files=${files.length}`);
-    const placeholderId = await ctx.reply(buildInitialPreviewHtml(session.agent), { parseMode: 'HTML', messageThreadId });
-    const phId = typeof placeholderId === 'number' ? placeholderId : null;
-    if (phId != null) {
-      this.registerSessionMessage(ctx.chatId, phId, session);
-      this.log(`[handleMessage] placeholder sent msg_id=${phId}, task queued`);
+    let phId: number | null = null;
+    if (canEditMessages) {
+      const placeholderId = await ctx.reply(buildInitialPreviewHtml(session.agent), { parseMode: 'HTML', messageThreadId });
+      phId = typeof placeholderId === 'number' ? placeholderId : null;
+      if (phId != null) {
+        this.registerSessionMessage(ctx.chatId, phId, session);
+        this.log(`[handleMessage] placeholder sent msg_id=${phId}, task queued`);
+      } else {
+        this.log(`[handleMessage] placeholder unavailable for chat=${ctx.chatId}; continuing without live preview`);
+      }
     } else {
-      this.log(`[handleMessage] placeholder unavailable for chat=${ctx.chatId}; continuing without live preview`);
+      this.log(`[handleMessage] skipping placeholder for chat=${ctx.chatId}; channel does not support message edits`);
     }
 
     const taskId = this.createTaskId(session);
@@ -548,7 +565,7 @@ export class TelegramBot extends Bot {
     void this.queueSessionTask(session, async () => {
       let livePreview: LivePreview | null = null;
       try {
-        if (phId != null) {
+        if (phId != null || canSendTyping) {
           livePreview = new LivePreview({
             agent: session.agent,
             chatId: ctx.chatId,
@@ -557,8 +574,8 @@ export class TelegramBot extends Bot {
             renderer: telegramPreviewRenderer,
             streamEditIntervalMs: session.agent === 'codex' ? 400 : 800,
             startTimeMs: start,
-            canEditMessages: supportsChannelCapability((this as any).channel, 'editMessages'),
-            canSendTyping: supportsChannelCapability((this as any).channel, 'typingIndicators'),
+            canEditMessages,
+            canSendTyping,
             messageThreadId,
             log: (message: string) => this.log(message),
           });
@@ -741,7 +758,7 @@ export class TelegramBot extends Bot {
     await ctx.answerCallback('Switched!');
     await ctx.editReply(
       ctx.messageId,
-      `<b>Workdir switched</b>\n\n<code>${escapeHtml(oldPath)}</code>\n↓\n<code>${escapeHtml(dirPath)}</code>`,
+      `<b>Workdir</b>\n● <code>${escapeHtml(truncateMiddle(oldPath, 42))}</code>\n→ <code>${escapeHtml(truncateMiddle(dirPath, 42))}</code>`,
       { parseMode: 'HTML' },
     );
     return true;
@@ -797,7 +814,7 @@ export class TelegramBot extends Bot {
     if (requestedSessionId === 'new') {
       this.resetChatConversation(cs);
       await ctx.answerCallback('New session');
-      await ctx.editReply(ctx.messageId, 'Session reset. Send a message to start.', {});
+      await ctx.editReply(ctx.messageId, '<b>New session</b>', { parseMode: 'HTML' });
       return true;
     }
 
@@ -823,7 +840,7 @@ export class TelegramBot extends Bot {
     await ctx.answerCallback(`Session: ${displayId.slice(0, 12)}`);
     await ctx.editReply(
       ctx.messageId,
-      `Switched to session: <code>${escapeHtml(displayId.slice(0, 16))}</code>`,
+      buildCompactSelectionNotice('Session', displayId),
       { parseMode: 'HTML' },
     );
     if (runtime) this.registerSessionMessage(ctx.chatId, ctx.messageId, runtime);
@@ -847,7 +864,7 @@ export class TelegramBot extends Bot {
     await ctx.answerCallback(`Switched to ${agent}`);
     await ctx.editReply(
       ctx.messageId,
-      `<b>Switched to ${escapeHtml(agent)}</b>\n\nSession has been reset. Previous conversation history will not carry over.\nSend a message to start a new conversation.`,
+      buildCompactSelectionNotice('Agent', agent, 'Session reset'),
       { parseMode: 'HTML' },
     );
     return true;
@@ -870,7 +887,7 @@ export class TelegramBot extends Bot {
     await ctx.answerCallback(`Switched to ${modelId}`);
     await ctx.editReply(
       ctx.messageId,
-      `<b>Model switched to <code>${escapeHtml(modelId)}</code></b>\n\nAgent: ${escapeHtml(cs.agent)}\nSession has been reset. Send a message to start a new conversation.`,
+      buildCompactSelectionNotice('Model', modelId, `${cs.agent} · session reset`),
       { parseMode: 'HTML' },
     );
     return true;

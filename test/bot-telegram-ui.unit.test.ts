@@ -3,9 +3,13 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildSwitchWorkdirView, resolveRegisteredPath } from '../src/bot-telegram-directory.ts';
 import {
+  buildCompactSelectionNotice,
+  buildCompactSelectionTitle,
   buildStreamPreviewHtml,
+  compactCode,
   formatMenuLines,
   formatProviderUsageLines,
+  truncateMiddle,
 } from '../src/bot-telegram-render.ts';
 import { makeTmpDir } from './support/env.ts';
 
@@ -33,6 +37,16 @@ describe('bot-telegram render helpers', () => {
     expect(usageLines.join('\n')).toContain('Claude: 40% used / 60% left');
     expect(usageLines.join('\n')).toContain('rate limited');
     expect(formatMenuLines([{ command: 'status', description: 'Show status' }])[0]).toBe('/status — Show status');
+  });
+
+  it('builds compact selection copy and middle-truncated labels for mobile layouts', () => {
+    const shortened = truncateMiddle('/Users/xiaoxiao/Desktop/work/codeclaw/project', 24);
+    expect(shortened).toContain('...');
+    expect(shortened.startsWith('/Users')).toBe(true);
+    expect(shortened.endsWith('project')).toBe(true);
+    expect(compactCode('/Users/xiaoxiao/Desktop/work/codeclaw/project', 24)).toContain('<code>');
+    expect(buildCompactSelectionTitle('Agents', 'codex')).toBe('<b>Agents</b> · <code>codex</code>');
+    expect(buildCompactSelectionNotice('Model', 'claude-sonnet-4-6[1m]', 'claude · session reset')).toContain('<b>Model</b>');
   });
 
   it('keeps longer activity visible when the preview has no body text', () => {
@@ -69,8 +83,9 @@ describe('bot-telegram directory helpers', () => {
     fs.mkdirSync(path.join(root, 'beta'));
 
     const view = buildSwitchWorkdirView(root, root, 0);
-    expect(view.text).toContain('<b>Switch workdir</b>');
-    expect(view.text).toContain(`<code>${root}</code>`);
+    expect(view.text).toContain('<b>Workdir</b>');
+    expect(view.text).toContain('<code>');
+    expect(view.text).toContain('●');
     expect(view.keyboard.inline_keyboard.length).toBeGreaterThanOrEqual(2);
 
     const childCallback = view.keyboard.inline_keyboard[0][0].callback_data;
@@ -80,5 +95,6 @@ describe('bot-telegram directory helpers', () => {
     const selectCallback = view.keyboard.inline_keyboard.at(-1)?.[0]?.callback_data ?? '';
     const selectId = parseInt(selectCallback.split(':')[2], 10);
     expect(resolveRegisteredPath(selectId)).toBe(root);
+    expect(view.keyboard.inline_keyboard.at(-1)?.[0]?.text).toBe('Use This');
   });
 });

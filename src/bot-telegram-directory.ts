@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { listSubdirs } from './bot.js';
-import { escapeHtml } from './bot-telegram-render.js';
+import { buildCompactSelectionTitle, compactCode } from './bot-telegram-render.js';
 
 export interface TelegramInlineKeyboard {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
@@ -64,7 +64,7 @@ function buildDirKeyboard(browsePath: string, page: number): TelegramInlineKeybo
   }
   if (navRow.length) rows.push(navRow);
 
-  rows.push([{ text: '✅ Select this directory', callback_data: `sw:s:${pathRegistry.register(browsePath)}` }]);
+  rows.push([{ text: 'Use This', callback_data: `sw:s:${pathRegistry.register(browsePath)}` }]);
   return { inline_keyboard: rows };
 }
 
@@ -72,8 +72,11 @@ export function buildSwitchWorkdirView(currentWorkdir: string, browsePath: strin
   text: string;
   keyboard: TelegramInlineKeyboard;
 } {
+  const lines = [buildCompactSelectionTitle('Workdir')];
+  lines.push(`● ${compactCode(currentWorkdir, 42)}`);
+  if (browsePath !== currentWorkdir) lines.push(`○ ${compactCode(browsePath, 42)}`);
   return {
-    text: `<b>Switch workdir</b>\nCurrent: <code>${escapeHtml(currentWorkdir)}</code>\n\nBrowsing: <code>${escapeHtml(browsePath)}</code>`,
+    text: lines.join('\n'),
     keyboard: buildDirKeyboard(browsePath, page),
   };
 }
