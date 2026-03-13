@@ -17,7 +17,7 @@ describe('bot-menu', () => {
     expect(index.get('sk_another_skill')?.source).toBe('commands');
   });
 
-  it('builds the default command menu with skills and restart at the end', () => {
+  it('builds the default command menu with a skills browser and restart at the end', () => {
     const commands = buildDefaultMenuCommands(2, [
       { name: 'My-Skill', label: 'Ship It', description: null, source: 'skills' as const },
     ]);
@@ -29,10 +29,10 @@ describe('bot-menu', () => {
       'models',
       'status',
       'host',
-      'sk_my_skill',
+      'skills',
       'restart',
     ]);
-    expect(commands[6]).toEqual({ command: 'sk_my_skill', description: '⚡ Ship It' });
+    expect(commands[6]).toEqual({ command: 'skills', description: 'Browse skills' });
     expect(commands[7]).toEqual({ command: 'restart', description: 'Restart bot' });
   });
 

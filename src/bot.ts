@@ -10,7 +10,7 @@ import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import { getActiveUserConfig, onUserConfigChange, resolveUserWorkdir, setUserWorkdir } from './user-config.js';
 import {
-  doStream, getSessions, getSessionTail, getUsage, listAgents, listModels, listSkills,
+  doStream, getSessions, getSessionTail, getUsage, initializeProjectSkills, listAgents, listModels, listSkills,
   type Agent, type CodexCumulativeUsage, type StreamOpts, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult,
   type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult,
   type SkillInfo, type SkillListResult, type AgentDetectOptions,
@@ -20,7 +20,7 @@ import { terminateProcessTree } from './process-control.js';
 
 export { type Agent, type CodexCumulativeUsage, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
 export type ChatId = number | string;
-export const VERSION = '0.2.31';
+export const VERSION = '0.2.32';
 const MACOS_USER_ACTIVITY_PULSE_INTERVAL_MS = 20_000;
 const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 
@@ -29,15 +29,30 @@ const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 // ---------------------------------------------------------------------------
 
 /**
- * If `dir` has a .gitignore, ensure `.codeclaw` is listed so artifacts don't pollute git.
+ * If `dir` has a .gitignore, ensure runtime state is ignored while `.codeclaw/skills`
+ * stays trackable as the canonical project skill location.
  */
 function ensureGitignore(dir: string) {
   try {
     const gi = path.join(dir, '.gitignore');
     if (!fs.existsSync(gi)) return;
-    const txt = fs.readFileSync(gi, 'utf8');
-    if (txt.split('\n').some(l => l.trim() === '.codeclaw' || l.trim() === '.codeclaw/')) return;
-    fs.appendFileSync(gi, `${txt.endsWith('\n') ? '' : '\n'}.codeclaw/\n`);
+    const managedLines = [
+      '.codeclaw/*',
+      '!.codeclaw/skills/',
+      '!.codeclaw/skills/**',
+      '.claude/skills/',
+      '.codex/skills/',
+    ];
+    const legacyLines = new Set(['.codeclaw/']);
+    const rawLines = fs.readFileSync(gi, 'utf8').split(/\r?\n/);
+    const normalized = rawLines.filter(line => {
+      const trimmed = line.trim();
+      return trimmed && !managedLines.includes(trimmed) && !legacyLines.has(trimmed);
+    });
+    const next = [...normalized, ...managedLines, ''].join('\n');
+    const current = fs.readFileSync(gi, 'utf8');
+    if (current === next) return;
+    fs.writeFileSync(gi, next);
   } catch { /* best-effort */ }
 }
 
@@ -454,6 +469,8 @@ export class Bot {
 
   constructor() {
     this.workdir = resolveUserWorkdir();
+    ensureGitignore(this.workdir);
+    initializeProjectSkills(this.workdir);
     const config = getActiveUserConfig();
 
     // Initialize per-agent configs
@@ -687,6 +704,7 @@ export class Bot {
   }
 
   fetchSkills() {
+    initializeProjectSkills(this.workdir);
     return listSkills(this.workdir);
   }
 
@@ -782,6 +800,7 @@ export class Bot {
       if (session.workdir === old && !session.runningTaskIds.size) this.sessionStates.delete(key);
     }
     ensureGitignore(resolvedPath);
+    initializeProjectSkills(resolvedPath);
     this.log(`switch workdir: ${old} -> ${resolvedPath}`);
     this.afterSwitchWorkdir(old, resolvedPath);
     return old;
@@ -796,6 +815,7 @@ export class Bot {
     if (opts.initial) {
       this.workdir = nextWorkdir;
       ensureGitignore(this.workdir);
+      initializeProjectSkills(this.workdir);
     } else if (nextWorkdir !== this.workdir) {
       this.switchWorkdir(nextWorkdir, { persist: false });
     }

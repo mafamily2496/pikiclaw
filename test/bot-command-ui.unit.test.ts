@@ -4,6 +4,7 @@ import {
   buildAgentsCommandView,
   buildModelsCommandView,
   buildSessionsCommandView,
+  buildSkillsCommandView,
   decodeCommandAction,
   encodeCommandAction,
   executeCommandAction,
@@ -33,6 +34,7 @@ describe('bot-command-ui action codec', () => {
       { kind: 'agent.switch', agent: 'codex' } as const,
       { kind: 'model.switch', modelId: 'claude-sonnet-4-6' } as const,
       { kind: 'effort.set', effort: 'high' } as const,
+      { kind: 'skill.run', command: 'sk_ship_it' } as const,
     ];
 
     for (const action of actions) {
@@ -45,7 +47,7 @@ describe('bot-command-ui action codec', () => {
 });
 
 describe('bot-command-ui views', () => {
-  it('builds shared selection views for sessions, agents, and models', async () => {
+  it('builds shared selection views for sessions, agents, models, and skills', async () => {
     const bot = new Bot();
     const chatId = 100;
     bot.chat(chatId).agent = 'claude';
@@ -88,6 +90,13 @@ describe('bot-command-ui views', () => {
       note: 'local registry',
     } as any);
 
+    vi.spyOn(bot, 'fetchSkills').mockReturnValue({
+      skills: [
+        { name: 'ship-it', label: 'Ship It', description: 'release helper', source: 'skills' },
+      ],
+      workdir: process.env.CODECLAW_WORKDIR!,
+    } as any);
+
     const sessionsView = await buildSessionsCommandView(bot, chatId, 0, 5);
     expect(sessionsView.kind).toBe('sessions');
     expect(sessionsView.items[0]).toMatchObject({ label: 'alpha work' });
@@ -104,6 +113,11 @@ describe('bot-command-ui views', () => {
     expect(modelsView.metaLines).toContain('Thinking Effort: high');
     expect(modelsView.rows[0][0].action).toEqual({ kind: 'model.switch', modelId: 'claude-sonnet-4-6' });
     expect(modelsView.rows[1][2].action).toEqual({ kind: 'effort.set', effort: 'high' });
+
+    const skillsView = buildSkillsCommandView(bot, chatId);
+    expect(skillsView.kind).toBe('skills');
+    expect(skillsView.items[0]).toMatchObject({ label: 'Ship It', detail: 'release helper' });
+    expect(skillsView.rows[0][0].action).toEqual({ kind: 'skill.run', command: 'sk_ship_it' });
   });
 });
 
@@ -136,6 +150,15 @@ describe('bot-command-ui execution', () => {
       sessionId: 'sess-42',
     });
     expect(sessionResult.kind).toBe('notice');
+    if (sessionResult.kind === 'notice') {
+      expect(sessionResult.notice).toEqual({
+        title: 'Session Switched',
+        value: 'sess-42',
+        detail: 'Switched successfully',
+        valueMode: 'code',
+      });
+      expect(sessionResult.previewSession).toEqual({ agent: 'claude', sessionId: 'sess-42' });
+    }
     expect(bot.chat(chatId).sessionId).toBe('sess-42');
 
     const agentResult = await executeCommandAction(bot, chatId, {
@@ -166,5 +189,22 @@ describe('bot-command-ui execution', () => {
       effort: 'medium',
     });
     expect(noopResult).toEqual({ kind: 'noop', message: 'Already using medium effort' });
+
+    vi.spyOn(bot, 'fetchSkills').mockReturnValue({
+      skills: [
+        { name: 'ship-it', label: 'Ship It', description: 'release helper', source: 'skills' },
+      ],
+      workdir: process.env.CODECLAW_WORKDIR!,
+    } as any);
+    const skillResult = await executeCommandAction(bot, chatId, {
+      kind: 'skill.run',
+      command: 'sk_ship_it',
+    });
+    expect(skillResult).toEqual({
+      kind: 'skill',
+      prompt: 'In this project, the ship-it skill is defined in `ship-it/SKILL.md`. Please read that SKILL.md file and execute the instructions.',
+      skillName: 'ship-it',
+      callbackText: 'Run ship-it',
+    });
   });
 });

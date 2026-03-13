@@ -51,13 +51,12 @@ export function buildDefaultMenuCommands(agentCount: number, skills: SkillInfo[]
     { command: 'host', description: 'Host info' },
   );
 
-  if (agentCount === 1) {
-    commands.push({ command: 'agents', description: 'Switch agents' });
+  if (skills.length) {
+    commands.push({ command: 'skills', description: 'Browse skills' });
   }
 
-  for (const [cmdName, skill] of indexSkillsByCommand(skills)) {
-    const displayName = skill.label || skill.name.charAt(0).toUpperCase() + skill.name.slice(1);
-    commands.push({ command: cmdName, description: `⚡ ${displayName}` });
+  if (agentCount === 1) {
+    commands.push({ command: 'agents', description: 'Switch agents' });
   }
 
   commands.push({ command: 'restart', description: 'Restart bot' });

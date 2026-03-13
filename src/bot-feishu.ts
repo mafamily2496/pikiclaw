@@ -28,6 +28,7 @@ import {
   getStartData,
   getSessionsPageData,
   getModelsListData,
+  getSessionTurnPreviewData,
   getStatusDataAsync,
   getHostDataSync,
   resolveSkillPrompt,
@@ -36,9 +37,11 @@ import {
   buildAgentsCommandView,
   buildModelsCommandView,
   buildSessionsCommandView,
+  buildSkillsCommandView,
   decodeCommandAction,
   executeCommandAction,
   type CommandActionResult,
+  type CommandSelectionView,
 } from './bot-command-ui.js';
 import { LivePreview } from './bot-telegram-live-preview.js';
 import {
@@ -53,6 +56,7 @@ import {
   buildFinalReplyRender,
   renderCommandNotice,
   renderCommandSelectionCard,
+  renderSessionTurnMarkdown,
   renderStart,
   renderStatus,
   renderHost,
@@ -68,6 +72,26 @@ const SHUTDOWN_EXIT_CODE: Record<ShutdownSignal, number> = {
   SIGTERM: 143,
 };
 const SHUTDOWN_FORCE_EXIT_MS = 3_000;
+
+function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err ?? 'unknown error');
+
+  const parts = [`${err.name}: ${err.message}`];
+  for (const key of ['code', 'errno', 'syscall', 'address', 'port', 'host', 'hostname', 'path']) {
+    const value = (err as any)?.[key];
+    if (value != null && value !== '') parts.push(`${key}=${value}`);
+  }
+
+  const cause = (err as any)?.cause;
+  if (cause && cause !== err) parts.push(`cause=${describeError(cause)}`);
+  return parts.join(' | ');
+}
+
+function formatArtifactUploadError(err: unknown, max = 240): string {
+  const text = describeError(err).replace(/\s+/g, ' ').trim();
+  if (!text) return 'unknown error';
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
 
 // ---------------------------------------------------------------------------
 // FeishuBot
@@ -254,7 +278,11 @@ export class FeishuBot extends Bot {
     await ctx.reply(renderStart(d));
   }
 
-  private async sendCommandView(ctx: FeishuContext, view: Awaited<ReturnType<typeof buildSessionsCommandView>>) {
+  private async cmdSkills(ctx: FeishuContext) {
+    await this.sendCommandView(ctx, buildSkillsCommandView(this, ctx.chatId));
+  }
+
+  private async sendCommandView(ctx: FeishuContext, view: CommandSelectionView) {
     await ctx.channel.sendCard(ctx.chatId, renderCommandSelectionCard(view));
   }
 
@@ -263,9 +291,16 @@ export class FeishuBot extends Bot {
       await this.sendCommandView(ctx, result.view);
       return;
     }
+    if (result.kind === 'skill') {
+      await this.handleMessage({ text: result.prompt, files: [] }, ctx);
+      return;
+    }
     if (result.kind === 'notice') {
       const sent = await ctx.reply(renderCommandNotice(result.notice));
       if (result.session && sent) this.registerSessionMessage(ctx.chatId, sent, result.session);
+      if (result.previewSession) {
+        await this.previewCurrentSessionTurn(ctx.chatId, result.previewSession.agent, result.previewSession.sessionId);
+      }
       return;
     }
     await ctx.reply(result.message);
@@ -277,8 +312,15 @@ export class FeishuBot extends Bot {
       await ctx.channel.editCard(ctx.chatId, ctx.messageId, renderCommandSelectionCard(result.view));
       return;
     }
+    if (result.kind === 'skill') {
+      await this.handleMessage({ text: result.prompt, files: [] }, this.callbackToMessageContext(ctx));
+      return;
+    }
     await ctx.editReply(ctx.messageId, renderCommandNotice(result.notice));
     if (result.session) this.registerSessionMessage(ctx.chatId, ctx.messageId, result.session);
+    if (result.previewSession) {
+      await this.previewCurrentSessionTurn(ctx.chatId, result.previewSession.agent, result.previewSession.sessionId);
+    }
   }
 
   private sessionsPageSize = 5;
@@ -618,8 +660,12 @@ export class FeishuBot extends Bot {
         });
         if (sent) messageIds.push(sent);
       } catch (e) {
-        this.log(`artifact upload failed for ${artifact.filename}: ${e}`);
-        const sent = await this.channel.send(ctx.chatId, `Artifact upload failed: \`${artifact.filename}\``).catch(() => null);
+        const detail = formatArtifactUploadError(e);
+        this.log(`artifact upload failed for ${artifact.filename}: ${detail}`);
+        const sent = await this.channel.send(
+          ctx.chatId,
+          `Artifact upload failed: ${artifact.filename}\nError: ${detail}`,
+        ).catch(() => null);
         if (sent) messageIds.push(sent);
       }
     }
@@ -635,6 +681,7 @@ export class FeishuBot extends Bot {
         case 'sessions': await this.cmdSessions(ctx, args); return;
         case 'agents':   await this.cmdAgents(ctx, args); return;
         case 'models':   await this.cmdModels(ctx, args); return;
+        case 'skills':   await this.cmdSkills(ctx); return;
         case 'status':   await this.cmdStatus(ctx); return;
         case 'host':     await this.cmdHost(ctx); return;
         case 'switch':   await this.cmdSwitch(ctx, args); return;
@@ -664,6 +711,19 @@ export class FeishuBot extends Bot {
     await this.handleMessage({ text: resolved.prompt, files: [] }, ctx);
   }
 
+  private callbackToMessageContext(ctx: FeishuCallbackContext): FeishuContext {
+    return {
+      chatId: ctx.chatId,
+      messageId: ctx.messageId,
+      from: ctx.from,
+      chatType: 'p2p',
+      reply: (text, opts) => ctx.channel.send(ctx.chatId, text, opts),
+      editReply: (msgId, text, opts) => ctx.channel.editMessage(ctx.chatId, msgId, text, opts),
+      channel: ctx.channel,
+      raw: ctx.raw,
+    };
+  }
+
   // ---- callback handlers ----------------------------------------------------
 
   private async handleCallback(data: string, ctx: FeishuCallbackContext) {
@@ -676,6 +736,22 @@ export class FeishuBot extends Bot {
       await this.applyCommandCallbackResult(ctx, result);
     } catch (e: any) {
       this.log(`callback error: ${e}`);
+    }
+  }
+
+  private async previewCurrentSessionTurn(chatId: string, agent: Agent, sessionId: string | null) {
+    try {
+      const preview = await getSessionTurnPreviewData(this, agent, sessionId, 50);
+      if (!preview) return;
+      const previewMarkdown = renderSessionTurnMarkdown(preview.userText, preview.assistantText);
+      if (!previewMarkdown) return;
+      const sent = await this.channel.send(chatId, previewMarkdown);
+      if (sessionId) {
+        const runtime = this.getSessionRuntimeByKey(this.sessionKey(agent, sessionId));
+        if (runtime && sent) this.registerSessionMessage(chatId, sent, runtime);
+      }
+    } catch {
+      // non-critical
     }
   }
 

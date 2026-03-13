@@ -1,4 +1,5 @@
 import type { Agent, StreamPreviewMeta, StreamPreviewPlan, StreamResult } from './bot.js';
+import type { SkillsListData } from './bot-commands.js';
 import type {
   CommandActionButton,
   CommandItemState,
@@ -233,6 +234,7 @@ export function renderSessionTurnHtml(userText: string | null | undefined, assis
   const parts: string[] = [];
   const user = String(userText || '').trim();
   const assistant = String(assistantText || '').trim();
+  if (user || assistant) parts.push('<b>Recent Context</b>');
   if (user) parts.push(`<blockquote expandable>${escapeHtml(user)}</blockquote>`);
   if (assistant) parts.push(mdToTgHtml(assistant));
   return parts.join('\n\n');
@@ -240,6 +242,27 @@ export function renderSessionTurnHtml(userText: string | null | undefined, assis
 
 export function formatMenuLines(commands: { command: string; description: string }[]): string[] {
   return commands.map(cmd => `/${cmd.command} — ${escapeHtml(cmd.description)}`);
+}
+
+export function renderSkillsListHtml(d: SkillsListData): string {
+  const lines = [
+    `<b>Project Skills</b> (${d.skills.length})`,
+    '',
+    `<b>Agent:</b> ${escapeHtml(d.agent)}`,
+    `<b>Workdir:</b> <code>${escapeHtml(d.workdir)}</code>`,
+  ];
+
+  if (!d.skills.length) {
+    lines.push('', '<i>No project skills found in .codeclaw/skills/ or .claude/commands/.</i>');
+    return lines.join('\n');
+  }
+
+  lines.push('');
+  for (const skill of d.skills) {
+    lines.push(`<b>/${escapeHtml(skill.command)}</b> — ${escapeHtml(skill.label)}`);
+    if (skill.description) lines.push(escapeHtml(skill.description));
+  }
+  return lines.join('\n');
 }
 
 function fmtCompactUptime(ms: number): string {

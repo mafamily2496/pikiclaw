@@ -136,6 +136,25 @@ function isRetryableWsStartError(err: unknown): boolean {
   ].some(token => text.includes(token));
 }
 
+function isRetryableUploadError(err: unknown): boolean {
+  const text = describeError(err).toLowerCase();
+  return [
+    'socket hang up',
+    'econnreset',
+    'etimedout',
+    'econnrefused',
+    'enotfound',
+    'eai_again',
+    'fetch failed',
+    'timeout',
+    'temporarily unavailable',
+    'internal server error',
+    'bad gateway',
+    'service unavailable',
+    'gateway timeout',
+  ].some(token => text.includes(token));
+}
+
 // ---------------------------------------------------------------------------
 // Card builder helper
 // ---------------------------------------------------------------------------
@@ -806,16 +825,21 @@ class FeishuChannel extends Channel {
     const isPhoto = opts.asPhoto ?? PHOTO_EXTS.has(path.extname(filename).toLowerCase());
 
     if (isPhoto) {
-      const imageKey = await this.uploadImage(content);
-      const resp = await this.client.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: String(chatId),
-          msg_type: 'image',
-          content: JSON.stringify({ image_key: imageKey }),
-        },
-      });
-      return resp?.data?.message_id ?? null;
+      try {
+        const imageKey = await this.uploadImage(content);
+        const resp = await this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: String(chatId),
+            msg_type: 'image',
+            content: JSON.stringify({ image_key: imageKey }),
+          },
+        });
+        return resp?.data?.message_id ?? null;
+      } catch (err) {
+        if (isRetryableUploadError(err)) throw err;
+        this._log(`[send] image upload rejected file=${filename}: ${describeError(err)}; retrying as file`);
+      }
     }
 
     const fileKey = await this.uploadFile(content, filename);

@@ -12,7 +12,7 @@ version: 8.0.0
 ./scripts/release.sh
 ```
 
-This script handles: version bump → build → npm link → verify → git commit/tag/push → wait for CI.
+This script handles: version bump -> build -> npm link -> verify -> git commit/tag/push -> wait for CI.
 
 If the script fails, diagnose and fix the issue, then re-run it.
 
@@ -22,10 +22,10 @@ After CI creates the GitHub Release, update it with meaningful release notes:
 
 1. Run `git log v<previous-version>..v<new-version> --oneline --no-merges` to collect all commits since the last release.
 2. Summarize changes into categories (use only relevant ones, skip empty categories):
-   - **New Features** — new user-facing functionality
-   - **Improvements** — enhancements to existing features
-   - **Bug Fixes** — resolved issues
-   - **Internal** — refactors, dependency updates, CI changes
+   - **New Features** - new user-facing functionality
+   - **Improvements** - enhancements to existing features
+   - **Bug Fixes** - resolved issues
+   - **Internal** - refactors, dependency updates, CI changes
 3. Write concise, user-friendly descriptions (not raw commit messages).
 4. Update the GitHub Release using:
    ```
@@ -46,7 +46,7 @@ After CI creates the GitHub Release, update it with meaningful release notes:
 
 ## Notes
 
-- `npm link` creates a global symlink — rebuild with `npm run build` after code changes.
+- `npm link` creates a global symlink - rebuild with `npm run build` after code changes.
 - The `files` field in `package.json` controls what gets published: `dist/`, `LICENSE`, `README.md`.
 - CI pipeline (`.github/workflows/release.yml`): builds, publishes to npm, and creates GitHub Release on `v*` tag push.
 - To uninstall locally: `npm unlink -g codeclaw`.

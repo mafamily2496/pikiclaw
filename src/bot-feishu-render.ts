@@ -15,7 +15,7 @@ import type {
 } from './bot-command-ui.js';
 import { encodeCommandAction } from './bot-command-ui.js';
 import { fmtUptime, fmtTokens, fmtBytes, formatThinkingForDisplay, thinkLabel } from './bot.js';
-import type { StartData, SessionsPageData, AgentsListData, ModelsListData, StatusData, HostData } from './bot-commands.js';
+import type { StartData, SessionsPageData, AgentsListData, ModelsListData, SkillsListData, StatusData, HostData } from './bot-commands.js';
 import { summarizePromptForStatus } from './bot-commands.js';
 import { formatProviderUsageLines } from './bot-telegram-render.js';
 import type { LivePreviewRenderer } from './bot-telegram-live-preview.js';
@@ -166,6 +166,27 @@ export function renderCommandSelectionCard(view: CommandSelectionView): FeishuCa
     markdown: renderCommandSelectionMarkdown(view),
     rows: view.rows.map(row => ({ actions: row.map(actionButton) })),
   };
+}
+
+function escapeFeishuMarkdownText(text: string): string {
+  return text.replace(/([\\`*_{}[\]()#+\-.!|>~])/g, '\\$1');
+}
+
+function renderFeishuQuote(text: string): string {
+  return text
+    .split('\n')
+    .map(line => `> ${escapeFeishuMarkdownText(line)}`)
+    .join('\n');
+}
+
+export function renderSessionTurnMarkdown(userText: string | null | undefined, assistantText: string | null | undefined): string {
+  const parts: string[] = [];
+  const user = String(userText || '').trim();
+  const assistant = String(assistantText || '').trim();
+  if (user || assistant) parts.push('**Recent Context**');
+  if (user) parts.push('**User**', renderFeishuQuote(user));
+  if (assistant) parts.push('**Assistant**', assistant);
+  return parts.join('\n\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +379,22 @@ export function renderModelsList(d: ModelsListData): string {
   return lines.join('\n');
 }
 
+export function renderSkillsList(d: SkillsListData): string {
+  const lines = [`**Project Skills** (${d.skills.length})`, '', `**Agent:** ${d.agent}`, `**Workdir:** \`${d.workdir}\``];
+  if (!d.skills.length) {
+    lines.push('', '*No project skills found in `.codeclaw/skills/` or `.claude/commands/`.*');
+    return lines.join('\n');
+  }
+
+  lines.push('');
+  for (const skill of d.skills) {
+    lines.push(`**/${skill.command}** — ${skill.label}`);
+    if (skill.description) lines.push(skill.description);
+  }
+  lines.push('', '*Tap a button below or send the command directly.*');
+  return lines.join('\n');
+}
+
 export function renderSessionsPageCard(d: SessionsPageData): FeishuCardView {
   const sessionButtons = d.sessions.map(s => {
     const prefix = s.isCurrent ? '● ' : s.isRunning ? '🟢 ' : '';
@@ -399,6 +436,13 @@ export function renderModelsListCard(d: ModelsListData): FeishuCardView {
   return {
     markdown: renderModelsList(d),
     rows: [...modelRows, ...effortRows],
+  };
+}
+
+export function renderSkillsCard(d: SkillsListData): FeishuCardView {
+  return {
+    markdown: renderSkillsList(d),
+    rows: cardRows(d.skills.map(skill => cardButton(skill.label, `skill:${skill.command}`)), 2),
   };
 }
 

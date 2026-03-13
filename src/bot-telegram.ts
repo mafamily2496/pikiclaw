@@ -29,6 +29,7 @@ import {
   getStartData,
   getStatusDataAsync,
   getHostDataSync,
+  getSessionTurnPreviewData,
   resolveSkillPrompt,
   summarizePromptForStatus,
 } from './bot-commands.js';
@@ -36,9 +37,11 @@ import {
   buildAgentsCommandView,
   buildModelsCommandView,
   buildSessionsCommandView,
+  buildSkillsCommandView,
   decodeCommandAction,
   executeCommandAction,
   type CommandActionResult,
+  type CommandSelectionView,
 } from './bot-command-ui.js';
 import { buildSwitchWorkdirView, resolveRegisteredPath } from './bot-telegram-directory.js';
 import { LivePreview, type LivePreviewRenderer } from './bot-telegram-live-preview.js';
@@ -317,7 +320,11 @@ export class TelegramBot extends Bot {
     await ctx.reply(lines.join('\n'), { parseMode: 'HTML' });
   }
 
-  private async sendCommandView(ctx: TgContext, view: Awaited<ReturnType<typeof buildSessionsCommandView>>) {
+  private async cmdSkills(ctx: TgContext) {
+    await this.sendCommandView(ctx, buildSkillsCommandView(this, ctx.chatId));
+  }
+
+  private async sendCommandView(ctx: TgContext, view: CommandSelectionView) {
     await ctx.reply(
       renderCommandSelectionHtml(view),
       { parseMode: 'HTML', keyboard: renderCommandSelectionKeyboard(view) },
@@ -327,6 +334,10 @@ export class TelegramBot extends Bot {
   private async replyCommandResult(ctx: TgContext, result: CommandActionResult) {
     if (result.kind === 'view') {
       await this.sendCommandView(ctx, result.view);
+      return;
+    }
+    if (result.kind === 'skill') {
+      await this.handleMessage({ text: result.prompt, files: [] }, ctx);
       return;
     }
     if (result.kind === 'notice') {
@@ -352,6 +363,11 @@ export class TelegramBot extends Bot {
         { parseMode: 'HTML', keyboard: renderCommandSelectionKeyboard(result.view) },
       );
       await ctx.answerCallback(result.callbackText ?? undefined);
+      return;
+    }
+    if (result.kind === 'skill') {
+      await ctx.answerCallback(result.callbackText ?? undefined);
+      await this.handleMessage({ text: result.prompt, files: [] }, ctx);
       return;
     }
     await ctx.answerCallback(result.callbackText ?? undefined);
@@ -739,25 +755,9 @@ export class TelegramBot extends Bot {
 
   private async previewCurrentSessionTurn(chatId: number, agent: Agent, sessionId: string | null) {
     try {
-      const tail = sessionId ? await this.fetchSessionTail(agent, sessionId, 50) : { ok: true, messages: [], error: null };
-      if (!tail.ok || !tail.messages.length) return;
-
-      const messages = tail.messages;
-      let lastUserIndex = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          lastUserIndex = i;
-          break;
-        }
-      }
-
-      const lastUserText = lastUserIndex >= 0 ? messages[lastUserIndex].text : '';
-      const assistantTexts: string[] = [];
-      for (let i = lastUserIndex >= 0 ? lastUserIndex + 1 : 0; i < messages.length; i++) {
-        if (messages[i].role === 'assistant' && messages[i].text) assistantTexts.push(messages[i].text);
-      }
-
-      const previewHtml = renderSessionTurnHtml(lastUserText, assistantTexts.join('\n\n'));
+      const preview = await getSessionTurnPreviewData(this, agent, sessionId, 50);
+      if (!preview) return;
+      const previewHtml = renderSessionTurnHtml(preview.userText, preview.assistantText);
       if (!previewHtml) return;
       const sent = await this.channel.send(chatId, previewHtml, { parseMode: 'HTML' });
       if (sessionId) {
@@ -778,6 +778,7 @@ export class TelegramBot extends Bot {
         case 'sessions': await this.cmdSessions(ctx); return;
         case 'agents':   await this.cmdAgents(ctx); return;
         case 'models':   await this.cmdModels(ctx); return;
+        case 'skills':   await this.cmdSkills(ctx); return;
         case 'status':   await this.cmdStatus(ctx); return;
         case 'host':     await this.cmdHost(ctx); return;
         case 'switch':   await this.cmdSwitch(ctx); return;

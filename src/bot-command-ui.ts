@@ -4,7 +4,9 @@ import {
   getAgentsListData,
   getModelsListData,
   getSessionsPageData,
+  getSkillsListData,
   modelMatchesSelection,
+  resolveSkillPrompt,
 } from './bot-commands.js';
 
 export type CommandAction =
@@ -13,7 +15,8 @@ export type CommandAction =
   | { kind: 'session.switch'; sessionId: string }
   | { kind: 'agent.switch'; agent: Agent }
   | { kind: 'model.switch'; modelId: string }
-  | { kind: 'effort.set'; effort: string };
+  | { kind: 'effort.set'; effort: string }
+  | { kind: 'skill.run'; command: string };
 
 export type CommandItemState = 'default' | 'current' | 'running' | 'unavailable';
 
@@ -31,7 +34,7 @@ export interface CommandSelectionItem {
 }
 
 export interface CommandSelectionView {
-  kind: 'sessions' | 'agents' | 'models';
+  kind: 'sessions' | 'agents' | 'models' | 'skills';
   title: string;
   detail?: string | null;
   metaLines: string[];
@@ -51,6 +54,7 @@ export interface CommandNotice {
 export type CommandActionResult =
   | { kind: 'view'; view: CommandSelectionView; callbackText?: string | null }
   | { kind: 'notice'; notice: CommandNotice; callbackText?: string | null; session?: SessionRuntime | null; previewSession?: { agent: Agent; sessionId: string | null } | null }
+  | { kind: 'skill'; prompt: string; skillName: string; callbackText?: string | null }
   | { kind: 'noop'; message: string };
 
 function chunkRows<T>(items: T[], columns: number): T[][] {
@@ -81,6 +85,8 @@ export function encodeCommandAction(action: CommandAction): string {
       return `mod:${action.modelId}`;
     case 'effort.set':
       return `eff:${action.effort}`;
+    case 'skill.run':
+      return `skr:${action.command}`;
   }
 }
 
@@ -112,6 +118,11 @@ export function decodeCommandAction(data: string): CommandAction | null {
     const effort = data.slice(4);
     if (!effort) return null;
     return { kind: 'effort.set', effort };
+  }
+  if (data.startsWith('skr:')) {
+    const command = data.slice(4);
+    if (!command) return null;
+    return { kind: 'skill.run', command };
   }
   return null;
 }
@@ -218,6 +229,28 @@ export async function buildModelsCommandView(bot: Bot, chatId: ChatId): Promise<
   };
 }
 
+export function buildSkillsCommandView(bot: Bot, chatId: ChatId): CommandSelectionView {
+  const data = getSkillsListData(bot, chatId);
+  const buttons = data.skills.map(skill => ({
+    label: skill.label,
+    action: { kind: 'skill.run', command: skill.command } as CommandAction,
+  }));
+
+  return {
+    kind: 'skills',
+    title: 'Skills',
+    detail: data.agent,
+    metaLines: [`Workdir: ${data.workdir}`],
+    items: data.skills.map(skill => ({
+      label: skill.label,
+      detail: skill.description || `/${skill.command}`,
+    })),
+    emptyText: 'No project skills found.',
+    helperText: data.skills.length ? 'Use the controls below to run a skill.' : null,
+    rows: chunkRows(buttons, buttons.some(button => button.label.length > 14) ? 1 : 2),
+  };
+}
+
 export async function executeCommandAction(
   bot: Bot,
   chatId: ChatId,
@@ -257,10 +290,11 @@ export async function executeCommandAction(
       const displayId = session.sessionId || action.sessionId;
       return {
         kind: 'notice',
-        callbackText: `Session: ${displayId.slice(0, 12)}`,
+        callbackText: `Switched: ${displayId.slice(0, 12)}`,
         notice: {
-          title: 'Session',
+          title: 'Session Switched',
           value: displayId,
+          detail: 'Switched successfully',
           valueMode: 'code',
         },
         session: runtime,
@@ -319,6 +353,17 @@ export async function executeCommandAction(
           detail: `${chat.agent} · takes effect on next message`,
           valueMode: 'code',
         },
+      };
+    }
+
+    case 'skill.run': {
+      const resolved = resolveSkillPrompt(bot, chatId, action.command, '');
+      if (!resolved) return { kind: 'noop', message: 'Skill not found' };
+      return {
+        kind: 'skill',
+        prompt: resolved.prompt,
+        skillName: resolved.skillName,
+        callbackText: `Run ${resolved.skillName}`,
       };
     }
   }

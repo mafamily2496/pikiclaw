@@ -1109,6 +1109,13 @@ export interface SkillInfo {
 
 export interface SkillListResult { skills: SkillInfo[]; workdir: string; }
 
+export interface ProjectSkillPaths {
+  sharedSkillFile: string | null;
+  claudeSkillFile: string | null;
+  codexSkillFile: string | null;
+  claudeCommandFile: string | null;
+}
+
 function parseSkillMeta(content: string): { label: string | null; description: string | null } {
   let label: string | null = null;
   let description: string | null = null;
@@ -1123,29 +1130,221 @@ function parseSkillMeta(content: string): { label: string | null; description: s
   return { label, description };
 }
 
+function hasFile(filePath: string): boolean {
+  try { return fs.statSync(filePath).isFile(); } catch { return false; }
+}
+
+function hasDir(dirPath: string): boolean {
+  try { return fs.statSync(dirPath).isDirectory(); } catch { return false; }
+}
+
+function readSortedDir(dirPath: string): string[] {
+  try {
+    return fs.readdirSync(dirPath).sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+  } catch {
+    return [];
+  }
+}
+
+function listRelativeFiles(dirPath: string, prefix = ''): string[] {
+  const files: string[] = [];
+  for (const entry of readSortedDir(dirPath)) {
+    const abs = path.join(dirPath, entry);
+    const rel = prefix ? path.join(prefix, entry) : entry;
+    let stat: fs.Stats;
+    try { stat = fs.statSync(abs); } catch { continue; }
+    if (stat.isDirectory()) files.push(...listRelativeFiles(abs, rel));
+    else if (stat.isFile()) files.push(rel);
+  }
+  return files;
+}
+
+function directoryFingerprint(dirPath: string): string | null {
+  if (!hasDir(dirPath)) return null;
+  const hash = crypto.createHash('sha1');
+  for (const rel of listRelativeFiles(dirPath)) {
+    hash.update(rel.replace(/\\/g, '/'));
+    hash.update('\0');
+    hash.update(fs.readFileSync(path.join(dirPath, rel)));
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+function ensureRealDirectory(dirPath: string) {
+  try {
+    const stat = fs.lstatSync(dirPath);
+    if (stat.isSymbolicLink()) fs.unlinkSync(dirPath);
+  } catch {}
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function replaceDirContents(srcDir: string, destDir: string) {
+  try { fs.rmSync(destDir, { recursive: true, force: true }); } catch {}
+  fs.mkdirSync(path.dirname(destDir), { recursive: true });
+  fs.cpSync(srcDir, destDir, { recursive: true });
+}
+
+interface ProjectSkillCandidate {
+  source: 'canonical' | 'claude' | 'codex';
+  dirPath: string;
+  skillFile: string;
+  mtimeMs: number;
+}
+
+interface ProjectSkillFileCandidate {
+  source: ProjectSkillCandidate['source'];
+  relPath: string;
+  absPath: string;
+  mtimeMs: number;
+}
+
+function listProjectSkillCandidates(rootDir: string, source: ProjectSkillCandidate['source']): Map<string, ProjectSkillCandidate> {
+  const entries = new Map<string, ProjectSkillCandidate>();
+  for (const name of readSortedDir(rootDir)) {
+    const dirPath = path.join(rootDir, name);
+    const skillFile = path.join(dirPath, 'SKILL.md');
+    if (!hasDir(dirPath) || !hasFile(skillFile)) continue;
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(skillFile).mtimeMs; } catch {}
+    entries.set(name, { source, dirPath, skillFile, mtimeMs });
+  }
+  return entries;
+}
+
+function preferredFileCandidate(candidates: ProjectSkillFileCandidate[]): ProjectSkillFileCandidate | null {
+  if (!candidates.length) return null;
+  const canonical = candidates.find(candidate => candidate.source === 'canonical');
+  if (canonical) return canonical;
+  return [...candidates].sort((a, b) => {
+    if (b.mtimeMs !== a.mtimeMs) return b.mtimeMs - a.mtimeMs;
+    return a.source.localeCompare(b.source);
+  })[0] || null;
+}
+
+function listProjectSkillFiles(candidate: ProjectSkillCandidate): Map<string, ProjectSkillFileCandidate[]> {
+  const files = new Map<string, ProjectSkillFileCandidate[]>();
+  for (const relPath of listRelativeFiles(candidate.dirPath)) {
+    const absPath = path.join(candidate.dirPath, relPath);
+    let mtimeMs = candidate.mtimeMs;
+    try { mtimeMs = fs.statSync(absPath).mtimeMs; } catch {}
+    files.set(relPath, [
+      ...(files.get(relPath) || []),
+      { source: candidate.source, relPath, absPath, mtimeMs },
+    ]);
+  }
+  return files;
+}
+
+function copyFileContents(srcFile: string, destFile: string) {
+  fs.mkdirSync(path.dirname(destFile), { recursive: true });
+  fs.copyFileSync(srcFile, destFile);
+}
+
+export function initializeProjectSkills(workdir: string, opts: { log?: (message: string) => void } = {}): void {
+  const canonicalRoot = path.join(workdir, '.codeclaw', 'skills');
+  const claudeRoot = path.join(workdir, '.claude', 'skills');
+  const codexRoot = path.join(workdir, '.codex', 'skills');
+  const candidatesByName = new Map<string, ProjectSkillCandidate[]>();
+
+  for (const [name, candidate] of listProjectSkillCandidates(canonicalRoot, 'canonical')) {
+    candidatesByName.set(name, [candidate]);
+  }
+  for (const [name, candidate] of listProjectSkillCandidates(claudeRoot, 'claude')) {
+    candidatesByName.set(name, [...(candidatesByName.get(name) || []), candidate]);
+  }
+  for (const [name, candidate] of listProjectSkillCandidates(codexRoot, 'codex')) {
+    candidatesByName.set(name, [...(candidatesByName.get(name) || []), candidate]);
+  }
+
+  if (!candidatesByName.size) return;
+
+  ensureRealDirectory(canonicalRoot);
+  let merged = 0;
+  let synced = 0;
+
+  for (const [name, candidates] of candidatesByName) {
+    const canonicalDir = path.join(canonicalRoot, name);
+    const filesByPath = new Map<string, ProjectSkillFileCandidate[]>();
+
+    for (const candidate of candidates) {
+      for (const [relPath, fileCandidates] of listProjectSkillFiles(candidate)) {
+        filesByPath.set(relPath, [...(filesByPath.get(relPath) || []), ...fileCandidates]);
+      }
+    }
+
+    let mergedSkill = false;
+    for (const [relPath, fileCandidates] of filesByPath) {
+      const chosen = preferredFileCandidate(fileCandidates);
+      if (!chosen || chosen.source === 'canonical') continue;
+      const destFile = path.join(canonicalDir, relPath);
+      const current = hasFile(destFile) ? fs.readFileSync(destFile) : null;
+      const next = fs.readFileSync(chosen.absPath);
+      if (current && Buffer.compare(current, next) === 0) continue;
+      copyFileContents(chosen.absPath, destFile);
+      mergedSkill = true;
+    }
+    if (mergedSkill) merged += 1;
+
+    const sourceDir = path.join(canonicalRoot, name);
+    const sourceFingerprint = directoryFingerprint(sourceDir);
+    if (!sourceFingerprint) continue;
+
+    for (const targetRoot of [claudeRoot, codexRoot]) {
+      ensureRealDirectory(targetRoot);
+      const targetDir = path.join(targetRoot, name);
+      if (directoryFingerprint(targetDir) === sourceFingerprint) continue;
+      replaceDirContents(sourceDir, targetDir);
+      synced += 1;
+    }
+  }
+
+  if (merged || synced) opts.log?.(`skills initialized: merged=${merged} synced=${synced} workdir=${workdir}`);
+}
+
+export function getProjectSkillPaths(workdir: string, skillName: string): ProjectSkillPaths {
+  const sharedSkillFile = path.join(workdir, '.codeclaw', 'skills', skillName, 'SKILL.md');
+  const claudeSkillFile = path.join(workdir, '.claude', 'skills', skillName, 'SKILL.md');
+  const codexSkillFile = path.join(workdir, '.codex', 'skills', skillName, 'SKILL.md');
+  const claudeCommandFile = path.join(workdir, '.claude', 'commands', `${skillName}.md`);
+  return {
+    sharedSkillFile: hasFile(sharedSkillFile) ? sharedSkillFile : null,
+    claudeSkillFile: hasFile(claudeSkillFile) ? claudeSkillFile : null,
+    codexSkillFile: hasFile(codexSkillFile) ? codexSkillFile : null,
+    claudeCommandFile: hasFile(claudeCommandFile) ? claudeCommandFile : null,
+  };
+}
+
 export function listSkills(workdir: string): SkillListResult {
   const skills: SkillInfo[] = [];
-  const claudeDir = path.join(workdir, '.claude');
-  const commandsDir = path.join(claudeDir, 'commands');
-  try {
-    for (const entry of fs.readdirSync(commandsDir)) {
-      if (!entry.endsWith('.md')) continue;
-      const name = entry.replace(/\.md$/, '');
-      let meta = { label: null as string | null, description: null as string | null };
-      try { meta = parseSkillMeta(fs.readFileSync(path.join(commandsDir, entry), 'utf-8')); } catch {}
-      skills.push({ name, label: meta.label, description: meta.description, source: 'commands' });
-    }
-  } catch {}
-  const skillsDir = path.join(claudeDir, 'skills');
-  try {
-    for (const entry of fs.readdirSync(skillsDir)) {
-      const skillFile = path.join(skillsDir, entry, 'SKILL.md');
-      try { if (!fs.statSync(path.join(skillsDir, entry)).isDirectory()) continue; } catch { continue; }
+  const seen = new Set<string>();
+  const commandsDir = path.join(workdir, '.claude', 'commands');
+  for (const entry of readSortedDir(commandsDir)) {
+    if (!entry.endsWith('.md')) continue;
+    const name = entry.replace(/\.md$/, '');
+    if (!name || seen.has(name)) continue;
+    let meta = { label: null as string | null, description: null as string | null };
+    try { meta = parseSkillMeta(fs.readFileSync(path.join(commandsDir, entry), 'utf-8')); } catch {}
+    skills.push({ name, label: meta.label, description: meta.description, source: 'commands' });
+    seen.add(name);
+  }
+
+  const skillRoots = [
+    path.join(workdir, '.codeclaw', 'skills'),
+  ];
+  for (const skillsDir of skillRoots) {
+    for (const entry of readSortedDir(skillsDir)) {
+      if (!entry || seen.has(entry)) continue;
+      const skillDir = path.join(skillsDir, entry);
+      const skillFile = path.join(skillDir, 'SKILL.md');
+      try { if (!fs.statSync(skillDir).isDirectory()) continue; } catch { continue; }
+      if (!hasFile(skillFile)) continue;
       let meta = { label: null as string | null, description: null as string | null };
       try { meta = parseSkillMeta(fs.readFileSync(skillFile, 'utf-8')); } catch {}
       skills.push({ name: entry, label: meta.label, description: meta.description, source: 'skills' });
+      seen.add(entry);
     }
-  } catch {}
+  }
   return { skills, workdir };
 }
 

@@ -122,7 +122,7 @@ describe('TelegramBot.run shutdown handling', () => {
       username: 'codeclaw_test_bot',
       displayName: 'Codeclaw Test Bot',
     });
-    const drainSpy = vi.spyOn(TelegramChannel.prototype, 'drain').mockResolvedValue(0);
+    const skipPendingSpy = vi.spyOn(TelegramChannel.prototype, 'skipPendingUpdatesOnNextListen').mockImplementation(() => {});
     const listenSpy = vi.spyOn(TelegramChannel.prototype, 'listen').mockImplementation(async () => {
       await new Promise<void>(resolve => {
         releaseListen = resolve;
@@ -154,7 +154,7 @@ describe('TelegramBot.run shutdown handling', () => {
       await new Promise(resolve => setImmediate(resolve));
 
       expect(connectSpy).toHaveBeenCalledTimes(1);
-      expect(drainSpy).toHaveBeenCalledTimes(1);
+      expect(skipPendingSpy).toHaveBeenCalledTimes(1);
       expect(listenSpy).toHaveBeenCalledTimes(1);
       expect(setupMenuSpy).toHaveBeenCalledTimes(1);
       expect(startupSpy).toHaveBeenCalledTimes(1);
@@ -186,7 +186,7 @@ describe('TelegramBot.run shutdown handling', () => {
       onceSpy.mockRestore();
       disconnectSpy.mockRestore();
       listenSpy.mockRestore();
-      drainSpy.mockRestore();
+      skipPendingSpy.mockRestore();
       connectSpy.mockRestore();
     }
   });
@@ -297,11 +297,12 @@ describe('TelegramBot status and session previews', () => {
 
     expect(ctx.editReply).toHaveBeenCalledWith(
       ctx.messageId,
-      `<b>Session</b>\n<code>${sessionId}</code>`,
+      `<b>Session Switched</b>\n<code>${sessionId}</code>\n<i>Switched successfully</i>`,
       { parseMode: 'HTML' },
     );
     expect(bot.chat(ctx.chatId).sessionId).toBe(sessionId);
     expect(sends).toHaveLength(1);
+    expect(sends[0].text).toContain('<b>Recent Context</b>');
     expect(sends[0].text).toContain('<blockquote expandable>请总结这次修改\n第二行保留原样</blockquote>');
     expect(sends[0].text).toContain('<b>Summary</b>');
     expect(sends[0].text).toContain('<pre><code class="language-ts">const x = 1;</code></pre>');

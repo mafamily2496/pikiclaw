@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FeishuChannel, type FeishuCardView } from '../src/channel-feishu.ts';
 import { makeTmpDir } from './support/env.ts';
@@ -134,5 +136,23 @@ describe('FeishuChannel cards', () => {
     expect(wsStart).toHaveBeenCalledTimes(2);
     expect(wsClose).toHaveBeenCalled();
     expect(sleepSpy).toHaveBeenCalled();
+  });
+});
+
+describe('FeishuChannel files', () => {
+  it('falls back to a file message when image upload is rejected', async () => {
+    const { ch, createCalls } = createTestChannel();
+    const pngPath = path.join(makeTmpDir('feishu-file-'), 'desktop.png');
+    fs.writeFileSync(pngPath, 'fake-png');
+
+    const uploadImage = vi.spyOn(ch, 'uploadImage').mockRejectedValue(new Error('Image upload failed: invalid image'));
+    const uploadFile = vi.spyOn(ch, 'uploadFile').mockResolvedValue('file-key-1');
+
+    expect(await ch.sendFile('chat-1', pngPath, { asPhoto: true })).toBe('msg-1');
+    expect(uploadImage).toHaveBeenCalledTimes(1);
+    expect(uploadFile).toHaveBeenCalledTimes(1);
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0].data.msg_type).toBe('file');
+    expect(JSON.parse(createCalls[0].data.content)).toEqual({ file_key: 'file-key-1' });
   });
 });

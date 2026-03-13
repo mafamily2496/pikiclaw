@@ -9,10 +9,12 @@
  *   const rendered = renderSessionsPage(data); // channel-specific renderer
  */
 
+import path from 'node:path';
 import type { Bot, ChatId, Agent, SessionRuntime, ChatState, StreamResult } from './bot.js';
 import { VERSION, fmtTokens, fmtUptime, fmtBytes } from './bot.js';
+import { getProjectSkillPaths } from './code-agent.js';
 import { getDriver } from './agent-driver.js';
-import { buildWelcomeIntro, buildDefaultMenuCommands, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
+import { buildWelcomeIntro, buildDefaultMenuCommands, buildSkillCommandName, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
 import { summarizePromptForStatus } from './bot-streaming.js';
 import { getSessionStatusForChat } from './session-status.js';
 
@@ -64,6 +66,11 @@ export interface SessionsPageData {
   sessions: SessionEntry[];
 }
 
+export interface SessionTurnPreviewData {
+  userText: string | null;
+  assistantText: string | null;
+}
+
 export async function getSessionsPageData(bot: Bot, chatId: ChatId, page: number, pageSize = 5): Promise<SessionsPageData> {
   const cs = bot.chat(chatId);
   const res = await bot.fetchSessions(cs.agent);
@@ -86,6 +93,42 @@ export async function getSessionsPageData(bot: Bot, chatId: ChatId, page: number
   }
 
   return { agent: cs.agent, total, page: pg, totalPages, sessions: entries };
+}
+
+export function extractLastSessionTurn(
+  messages: Array<{ role: 'user' | 'assistant'; text: string }>,
+): SessionTurnPreviewData | null {
+  if (!messages.length) return null;
+
+  let lastUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      lastUserIndex = i;
+      break;
+    }
+  }
+
+  const userText = String(lastUserIndex >= 0 ? messages[lastUserIndex].text : '').trim() || null;
+  const assistantTexts: string[] = [];
+  for (let i = lastUserIndex >= 0 ? lastUserIndex + 1 : 0; i < messages.length; i++) {
+    if (messages[i].role === 'assistant' && messages[i].text) assistantTexts.push(messages[i].text);
+  }
+  const assistantText = assistantTexts.join('\n\n').trim() || null;
+
+  if (!userText && !assistantText) return null;
+  return { userText, assistantText };
+}
+
+export async function getSessionTurnPreviewData(
+  bot: Bot,
+  agent: Agent,
+  sessionId: string | null,
+  limit = 50,
+): Promise<SessionTurnPreviewData | null> {
+  if (!sessionId) return null;
+  const tail = await bot.fetchSessionTail(agent, sessionId, limit);
+  if (!tail.ok || !tail.messages.length) return null;
+  return extractLastSessionTurn(tail.messages);
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +161,42 @@ export function getAgentsListData(bot: Bot, chatId: ChatId): AgentsListData {
       isCurrent: a.agent === cs.agent,
     })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export interface SkillEntryData {
+  name: string;
+  label: string;
+  description: string | null;
+  command: string;
+  source: 'commands' | 'skills';
+}
+
+export interface SkillsListData {
+  agent: Agent;
+  workdir: string;
+  skills: SkillEntryData[];
+}
+
+export function getSkillsListData(bot: Bot, chatId: ChatId): SkillsListData {
+  const cs = bot.chat(chatId);
+  const skills = bot.fetchSkills().skills
+    .map(skill => {
+      const command = buildSkillCommandName(skill.name);
+      if (!command) return null;
+      return {
+        name: skill.name,
+        label: skill.label || skill.name.charAt(0).toUpperCase() + skill.name.slice(1),
+        description: skill.description,
+        command,
+        source: skill.source,
+      };
+    })
+    .filter((skill): skill is SkillEntryData => !!skill);
+  return { agent: cs.agent, workdir: bot.workdir, skills };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,17 +339,37 @@ export function getHostDataSync(bot: Bot): HostData {
 
 export { SKILL_CMD_PREFIX, indexSkillsByCommand };
 
+function relSkillPath(workdir: string, filePath: string): string {
+  const relative = path.relative(workdir, filePath).replace(/\\/g, '/');
+  return relative && !relative.startsWith('..') ? relative : filePath;
+}
+
 export function resolveSkillPrompt(bot: Bot, chatId: ChatId, cmd: string, args: string): { prompt: string; skillName: string } | null {
   const skills = bot.fetchSkills().skills;
   const skill = indexSkillsByCommand(skills).get(cmd);
   if (!skill) return null;
   const cs = bot.chat(chatId);
-  const extra = args.trim() ? ` ${args.trim()}` : '';
+  const extra = args.trim();
+  const suffix = extra ? ` Additional context: ${extra}` : '';
   let prompt: string;
-  if (cs.agent === 'claude') {
-    prompt = `Please execute the /${skill.name} skill defined in this project.${extra ? ` Additional context: ${extra.trim()}` : ''}`;
+  if (skill.source === 'commands') {
+    prompt = `In this project's .claude/commands/${skill.name}.md file, there is a custom command definition. Please read and execute the instructions defined there.${suffix}`;
+    return { prompt, skillName: skill.name };
+  }
+
+  const paths = getProjectSkillPaths(bot.workdir, skill.name);
+  if (cs.agent === 'claude' && paths.claudeSkillFile) {
+    prompt = `Please execute the /${skill.name} skill defined in this project.${suffix}`;
   } else {
-    prompt = `In this project's .claude/skills/${skill.name}/ directory (or .claude/commands/${skill.name}.md), there is a custom skill definition. Please read and execute the instructions defined in that skill file.${extra ? ` Additional context: ${extra.trim()}` : ''}`;
+    const canonicalPath = paths.sharedSkillFile
+      ? `\`${relSkillPath(bot.workdir, paths.sharedSkillFile)}\``
+      : `\`.codeclaw/skills/${skill.name}/SKILL.md\``;
+    const locationText = paths.sharedSkillFile
+      ? canonicalPath
+      : paths.codexSkillFile || paths.claudeSkillFile
+        ? canonicalPath
+        : `\`${skill.name}/SKILL.md\``;
+    prompt = `In this project, the ${skill.name} skill is defined in ${locationText}. Please read that SKILL.md file and execute the instructions.${suffix}`;
   }
   return { prompt, skillName: skill.name };
 }

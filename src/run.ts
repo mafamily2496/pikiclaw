@@ -9,7 +9,7 @@
  */
 
 import { VERSION, formatThinkingForDisplay } from './bot.js';
-import { listAgents, listModels, listSkills, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
+import { initializeProjectSkills, listAgents, listModels, listSkills, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
 import type { Agent, StreamOpts } from './code-agent.js';
 import { loadUserConfig, resolveUserWorkdir } from './user-config.js';
 
@@ -46,7 +46,7 @@ Usage:
   npm run command -- <command> [options]
 
 Commands:
-  skills          List project-defined custom skills (.claude/commands & .claude/skills)
+  skills          List project-defined custom skills (.codeclaw/skills)
   claude-run      Run a single Claude prompt and print the result
   codex-run       Run a single Codex prompt and print the result
   claude-status   Show Claude agent info and API usage
@@ -79,6 +79,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const userConfig = loadUserConfig();
   const workdir = resolveUserWorkdir({ workdir: args.workdir, config: userConfig });
+  initializeProjectSkills(workdir);
 
   if (args.help || !args.command) {
     process.stdout.write(HELP);
@@ -89,7 +90,7 @@ async function main() {
     case 'skills': {
       const result = listSkills(workdir);
       if (!result.skills.length) {
-        process.stdout.write(`No custom skills found in ${workdir}/.claude/\n`);
+        process.stdout.write(`No custom skills found in ${workdir} (.codeclaw/skills, .claude/commands)\n`);
         break;
       }
       process.stdout.write(`Project skills (${result.skills.length}):\n\n`);
