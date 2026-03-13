@@ -348,7 +348,7 @@ set -a && source .env && npx tsx src/cli.ts
 npm test
 ```
 
-架构详情参见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+架构详情参见 [ARCHITECTURE.md](ARCHITECTURE.md)。MCP session bridge 设计参见 [MCP-SESSION-BRIDGE.md](MCP-SESSION-BRIDGE.md)。
 
 ---
 

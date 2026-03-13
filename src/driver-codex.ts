@@ -19,7 +19,7 @@ import {
   buildStreamPreviewMeta, pushRecentActivity, normalizeActivityLine,
   firstNonEmptyLine, shortValue, numberOrNull,
   IMAGE_EXTS,
-  listCodeclawSessions, findCodeclawSession,
+  listCodeclawSessions, findCodeclawSession, isPendingSessionId,
   stripInjectedPrompts, computeContext, readTailLines,
   roundPercent, toIsoFromEpochSeconds, labelFromWindowMinutes,
   usageWindowFromRateLimit, parseJsonTail, emptyUsage,
@@ -328,7 +328,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
         contextUsedTokens: null, contextPercent: null, error: 'Failed to start codex app-server.',
-        codexCumulative: null, stopReason: null, incomplete: true, activity: null, artifacts: [],
+        codexCumulative: null, stopReason: null, incomplete: true, activity: null,
       };
     }
 
@@ -376,7 +376,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
         contextUsedTokens: null, contextPercent: null, error: errMsg,
-        codexCumulative: null, stopReason: null, incomplete: true, activity: null, artifacts: [],
+        codexCumulative: null, stopReason: null, incomplete: true, activity: null,
       };
     }
 
@@ -510,7 +510,18 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       unsubscribeNotifications = srv.onNotification(handleNotification);
     });
 
-    agentLog(`[codex-rpc] turn/start prompt="${opts.prompt.slice(0, 120)}" effort=${mapEffort(opts.thinkingEffort)}`);
+    // Log equivalent CLI command for reproducibility
+    const cliParts = ['codex'];
+    if (opts.codexModel) cliParts.push('--model', opts.codexModel);
+    if (opts.codexFullAccess) cliParts.push('--full-access');
+    const effort = mapEffort(opts.thinkingEffort);
+    if (effort) cliParts.push('--effort', effort);
+    if (opts.sessionId) cliParts.push('--resume', opts.sessionId);
+    if (opts.codexExtraArgs?.length) cliParts.push(...opts.codexExtraArgs);
+    cliParts.push('-p', `"${opts.prompt.slice(0, 300)}${opts.prompt.length > 300 ? '…' : ''}"`);
+    agentLog(`[codex-rpc] full command: cd ${Q(opts.workdir)} && ${cliParts.join(' ')}`);
+
+    agentLog(`[codex-rpc] turn/start prompt="${opts.prompt.slice(0, 300)}${opts.prompt.length > 300 ? '…' : ''}" effort=${effort}`);
     const turnResp = await srv.call('turn/start', {
       threadId: s.sessionId, input,
       model: opts.codexModel || undefined,
@@ -528,7 +539,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
         elapsedS: (Date.now() - start) / 1000, inputTokens: null, outputTokens: null,
         cachedInputTokens: null, cacheCreationInputTokens: null, contextWindow: null,
         contextUsedTokens: null, contextPercent: null, error: errMsg,
-        codexCumulative: null, stopReason: null, incomplete: true, activity: null, artifacts: [],
+        codexCumulative: null, stopReason: null, incomplete: true, activity: null,
       };
     }
     s.turnId = turnResp.result?.turn?.id ?? null;
@@ -557,7 +568,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       cachedInputTokens: s.cachedInputTokens, cacheCreationInputTokens: s.cacheCreationInputTokens,
       contextWindow: s.contextWindow, ...computeContext(s),
       codexCumulative: s.codexCumulative, error, stopReason, incomplete: !ok,
-      activity: s.activity.trim() || null, artifacts: [],
+      activity: s.activity.trim() || null,
     };
   } finally {
     unsubscribeNotifications();
@@ -743,9 +754,11 @@ function getCodexSessions(workdir: string, limit?: number): SessionListResult {
   const nativeSessions = getNativeCodexSessions(resolvedWorkdir);
 
   // Merge: codeclaw records take precedence
+  // Filter out pending sessions — they haven't been confirmed by the agent yet
   const seen = new Set<string>();
   const merged: SessionInfo[] = [];
   for (const s of codeclawSessions) {
+    if (isPendingSessionId(s.sessionId)) continue;
     if (s.sessionId) seen.add(s.sessionId);
     merged.push(s);
   }

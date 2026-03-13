@@ -164,6 +164,12 @@ function parseArgs(argv: string[]) {
 }
 
 export async function main() {
+  // ── MCP server mode: launched by agent CLI via --mcp-config ──
+  if (process.argv.includes('--mcp-serve')) {
+    await import('./mcp-session-server.js');
+    return;
+  }
+
   const args = parseArgs(process.argv.slice(2));
   let userConfig = loadUserConfig();
 

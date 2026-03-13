@@ -16,9 +16,9 @@ import {
   parseAllowedChatIds,
 } from './bot.js';
 import {
-  type BotArtifact,
   stageSessionFiles,
 } from './code-agent.js';
+import type { McpSendFileCallback } from './mcp-bridge.js';
 import { shutdownAllDrivers } from './agent-driver.js';
 import {
   buildDefaultMenuCommands,
@@ -69,7 +69,6 @@ import { TelegramChannel, type TgContext, type TgCallbackContext, type TgMessage
 import { splitText, supportsChannelCapability } from './channel-base.js';
 import { getActiveUserConfig } from './user-config.js';
 
-export { buildArtifactPrompt, buildArtifactSystemPrompt, collectArtifacts } from './code-agent.js';
 
 /** Telegram HTML renderer for LivePreview. */
 const telegramPreviewRenderer: LivePreviewRenderer = {
@@ -554,28 +553,22 @@ export class TelegramBot extends Bot {
           livePreview.start();
         }
 
+        // MCP sendFile callback: sends files to IM in real-time during the stream
+        const mcpSendFile = this.createMcpSendFileCallback(ctx, messageThreadId);
+
         const result = await this.runStream(prompt, session, files, (nextText, nextThinking, nextActivity = '', meta, plan) => {
           livePreview?.update(nextText, nextThinking, nextActivity, meta, plan);
-        });
+        }, undefined, mcpSendFile);
         await livePreview?.settle();
-        const artifacts = result.artifacts || [];
 
         this.log(
           `[handleMessage] done agent=${session.agent} ok=${result.ok} session=${result.sessionId || '?'} elapsed=${result.elapsedS.toFixed(1)}s edits=${livePreview?.getEditCount() || 0} ` +
-          `tokens=in:${fmtTokens(result.inputTokens)}/cached:${fmtTokens(result.cachedInputTokens)}/out:${fmtTokens(result.outputTokens)} artifacts=${artifacts.length}`
+          `tokens=in:${fmtTokens(result.inputTokens)}/cached:${fmtTokens(result.cachedInputTokens)}/out:${fmtTokens(result.outputTokens)}`
         );
         this.log(`[handleMessage] response preview: "${result.message.slice(0, 150)}"`);
 
-        if (artifacts.length && result.incomplete && result.message.trim()) {
-          result.incomplete = false;
-          this.log(`[handleMessage] suppressed incomplete flag: artifacts present`);
-        }
-
         const finalReply = await this.sendFinalReply(ctx, phId, session.agent, result, { messageThreadId });
         this.registerSessionMessages(ctx.chatId, finalReply.messageIds, session);
-        const artifactReplyTo = finalReply.primaryMessageId ?? phId ?? ctx.messageId;
-        const artifactResult = await this.sendArtifacts(ctx, artifactReplyTo, artifacts, messageThreadId);
-        this.registerSessionMessages(ctx.chatId, artifactResult.messageIds, session);
         this.log(`[handleMessage] final reply sent to chat=${ctx.chatId}`);
       } catch (e: any) {
         const msgText = String(e?.message || e || 'Unknown error');
@@ -605,31 +598,22 @@ export class TelegramBot extends Bot {
     });
   }
 
-  private async sendArtifacts(ctx: TgContext, replyTo: number, artifacts: BotArtifact[], messageThreadId?: number): Promise<{ failed: BotArtifact[]; messageIds: number[] }> {
-    const failed: BotArtifact[] = [];
-    const messageIds: number[] = [];
-    for (const artifact of artifacts) {
-      const caption = artifact.caption;
+  /** Create an MCP sendFile callback bound to a Telegram chat context. */
+  private createMcpSendFileCallback(ctx: TgContext, messageThreadId?: number): McpSendFileCallback {
+    return async (filePath, opts) => {
       try {
-        const sent = await this.channel.sendFile(ctx.chatId, artifact.filePath, {
-          caption,
-          replyTo,
+        await this.channel.sendFile(ctx.chatId, filePath, {
+          caption: opts?.caption,
+          replyTo: ctx.messageId,
           messageThreadId,
-          asPhoto: artifact.kind === 'photo',
+          asPhoto: opts?.kind === 'photo',
         });
-        if (typeof sent === 'number') messageIds.push(sent);
-      } catch (e) {
-        failed.push(artifact);
-        this.log(`artifact upload failed for ${artifact.filename}: ${e}`);
-        const sent = await this.channel.send(
-          ctx.chatId,
-          `Artifact upload failed: <code>${escapeHtml(artifact.filename)}</code>`,
-          { parseMode: 'HTML', replyTo, messageThreadId },
-        ).catch(() => {});
-        if (typeof sent === 'number') messageIds.push(sent);
+        return { ok: true };
+      } catch (e: any) {
+        this.log(`[mcp] sendFile failed: ${filePath} error=${e?.message || e}`);
+        return { ok: false, error: e?.message || 'send failed' };
       }
-    }
-    return { failed, messageIds };
+    };
   }
 
   private async safeSetMessageReaction(chatId: number, messageId: number, reactions: string[]) {
@@ -851,7 +835,7 @@ export class TelegramBot extends Bot {
       this.startKeepAlive();
       void this.setupMenu().catch(err => this.log(`menu setup failed: ${err}`));
       void this.sendStartupNotice().catch(err => this.log(`startup notice failed: ${err}`));
-      this.log('polling started');
+      this.log('✓ Telegram connected, polling started — ready to receive messages');
       await this.channel.listen();
       this.stopKeepAlive();
       this.log('stopped');

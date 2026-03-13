@@ -20,7 +20,7 @@ import { terminateProcessTree } from './process-control.js';
 
 export { type Agent, type CodexCumulativeUsage, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
 export type ChatId = number | string;
-export const VERSION = '0.2.33';
+export const VERSION = '0.2.34';
 const MACOS_USER_ACTIVITY_PULSE_INTERVAL_MS = 20_000;
 const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 
@@ -845,6 +845,7 @@ export class Bot {
     prompt: string, cs: Pick<SessionRuntime, 'key' | 'agent' | 'sessionId' | 'workspacePath' | 'codexCumulative' | 'modelId'> | ChatState, attachments: string[],
     onText: (text: string, thinking: string, activity?: string, meta?: StreamPreviewMeta, plan?: StreamPreviewPlan | null) => void,
     systemPrompt?: string,
+    mcpSendFile?: import('./mcp-bridge.js').McpSendFileCallback,
   ): Promise<StreamResult> {
     const resolvedModel = cs.modelId || this.modelForAgent(cs.agent);
     const agentConfig = this.agentConfigs[cs.agent] || {};
@@ -870,6 +871,8 @@ export class Bot {
       // gemini-specific
       geminiModel: cs.agent === 'gemini' ? resolvedModel : (this.agentConfigs.gemini?.model || ''),
       geminiExtraArgs: this.agentConfigs.gemini?.extraArgs?.length ? this.agentConfigs.gemini.extraArgs : undefined,
+      // MCP bridge
+      mcpSendFile,
     };
     const result = await doStream(opts);
     this.stats.totalTurns++;

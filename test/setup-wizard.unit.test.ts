@@ -75,10 +75,6 @@ describe('setup wizard', () => {
         ];
         return 0;
       }
-      if (command === 'codex') {
-        process.env.OPENAI_API_KEY = 'test-key';
-        return 0;
-      }
       return 0;
     };
 
@@ -120,7 +116,6 @@ describe('setup wizard', () => {
     });
     expect(io.commands).toEqual([
       { command: 'npm', args: ['install', '-g', '@openai/codex'] },
-      { command: 'codex', args: [] },
     ]);
     expect(io.output).toContain('Telegram rejected this token: Unauthorized');
     expect(io.output).toContain('Telegram bot verified: @codeclaw_test_bot (Codeclaw Test)');

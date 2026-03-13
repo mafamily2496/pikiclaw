@@ -17,7 +17,7 @@ import {
   appendSystemPrompt, buildStreamPreviewMeta, pushRecentActivity,
   summarizeClaudeToolUse, summarizeClaudeToolResult,
   IMAGE_EXTS, mimeForExt,
-  listCodeclawSessions, findCodeclawSession,
+  listCodeclawSessions, findCodeclawSession, isPendingSessionId,
   readTailLines, stripInjectedPrompts,
   roundPercent, toIsoFromEpochSeconds, modelFamily, emptyUsage, normalizeUsageStatus,
 } from './code-agent.js';
@@ -63,6 +63,7 @@ function claudeCmd(o: StreamOpts): string[] {
   }
   if (o.thinkingEffort) args.push('--effort', o.thinkingEffort);
   if (o.claudeAppendSystemPrompt) args.push('--append-system-prompt', o.claudeAppendSystemPrompt);
+  if (o.mcpConfigPath) args.push('--mcp-config', o.mcpConfigPath);
   if (o.claudeExtraArgs?.length) args.push(...o.claudeExtraArgs);
   return args;
 }
@@ -250,9 +251,11 @@ function getClaudeSessions(workdir: string, limit?: number): SessionListResult {
   const nativeSessions = getNativeClaudeSessions(resolvedWorkdir);
 
   // Merge: codeclaw records take precedence (they have workspacePath etc.)
+  // Filter out pending sessions — they haven't been confirmed by the agent yet
   const seen = new Set<string>();
   const merged: SessionInfo[] = [];
   for (const s of codeclawSessions) {
+    if (isPendingSessionId(s.sessionId)) continue;
     if (s.sessionId) seen.add(s.sessionId);
     merged.push(s);
   }

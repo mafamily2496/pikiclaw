@@ -10,7 +10,7 @@ vi.mock('node:child_process', async importOriginal => {
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { TelegramBot, buildArtifactPrompt } from '../src/bot-telegram.ts';
+import { TelegramBot } from '../src/bot-telegram.ts';
 import { TelegramChannel } from '../src/channel-telegram.ts';
 import * as agentDriver from '../src/agent-driver.ts';
 import type { Agent, StreamResult } from '../src/code-agent.ts';
@@ -252,7 +252,7 @@ describe('TelegramBot status and session previews', () => {
     });
 
     bot.activeTasks.set(ctx.chatId, {
-      prompt: buildArtifactPrompt('进度怎么样\n第二行', '/tmp/codeclaw-artifacts/turn-1', '/tmp/codeclaw-artifacts/turn-1/manifest.json'),
+      prompt: '进度怎么样\n第二行',
       startedAt: Date.now() - 65_000,
     });
 
@@ -261,8 +261,6 @@ describe('TelegramBot status and session previews', () => {
     expect(replies).toHaveLength(1);
     expect(replies[0].text).toContain('<b>Running:</b>');
     expect(replies[0].text).toContain('进度怎么样 第二行');
-    expect(replies[0].text).not.toContain('[Telegram Artifact Return]');
-    expect(replies[0].text).not.toContain('manifest.json');
   });
 
   it('renders resumed history as quoted user text plus normal assistant markdown', async () => {
@@ -443,34 +441,7 @@ describe('TelegramBot.handleMessage streaming', () => {
       expect(stagedRunStream).toHaveBeenCalledOnce();
     });
 
-    const artifactDir = makeTmpDir('bot-tg-artifacts-fail-');
-    const shotPath = path.join(artifactDir, 'shot.png');
-    fs.writeFileSync(shotPath, Buffer.from('png-bytes'));
-
-    const artifactHarness = createBot();
-    vi.spyOn(artifactHarness.bot, 'runStream').mockResolvedValue(claudeResult({
-      message: 'Artifacts ready.',
-      sessionId: 'sess-artifacts-fail',
-      workspacePath: artifactDir,
-      elapsedS: 1.5,
-      inputTokens: 10,
-      outputTokens: 20,
-      artifacts: [
-        { filePath: shotPath, filename: 'shot.png', kind: 'photo', caption: 'Screenshot' },
-      ],
-    }));
-    vi.mocked(artifactHarness.channel.sendFile).mockRejectedValueOnce(new Error('telegram send failed'));
-
-    await (artifactHarness.bot as any).handleMessage({ text: 'Take a screenshot', files: [] }, artifactHarness.ctx);
-
-    await vi.waitFor(() => {
-      expect(artifactHarness.channel.sendFile).toHaveBeenCalledTimes(1);
-    });
-    expect(artifactHarness.sends.some(entry => entry.text.includes('Artifact upload failed'))).toBe(true);
-    expect(fs.existsSync(artifactDir)).toBe(true);
-
     fs.rmSync(uploadDir, { recursive: true, force: true });
-    fs.rmSync(artifactDir, { recursive: true, force: true });
   });
 
   it('skips placeholder previews on channels without message editing and falls back to a final send', async () => {

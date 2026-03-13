@@ -2,16 +2,20 @@
  * bot-handler.ts — channel-agnostic message handling pipeline.
  *
  * Defines the `MessagePipeline` interface that each IM implements to plug in
- * its own placeholder, live preview, final reply, and artifact upload logic.
+ * its own placeholder, live preview, final reply, and MCP file-send logic.
  *
  * The generic `handleIncomingMessage()` orchestrates the shared flow:
  *   resolve session → create placeholder → start live preview → run stream →
- *   settle preview → send final reply → upload artifacts → cleanup
+ *   settle preview → send final reply → cleanup
+ *
+ * File return is handled in real-time by the MCP bridge during the stream,
+ * not as a post-stream batch.
  */
 
 import type { Bot, ChatId, Agent, SessionRuntime, StreamResult, StreamPreviewMeta, StreamPreviewPlan } from './bot.js';
 import { buildPrompt } from './bot.js';
-import { stageSessionFiles, type BotArtifact } from './code-agent.js';
+import { stageSessionFiles } from './code-agent.js';
+import type { McpSendFileCallback } from './mcp-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Pipeline interface — implement per IM
@@ -54,8 +58,8 @@ export interface MessagePipeline<TCtx> {
   /** Send the final reply (edit placeholder or send new message). */
   sendFinalReply(ctx: TCtx, placeholder: PlaceholderHandle | null, session: SessionRuntime, result: StreamResult): Promise<void>;
 
-  /** Upload artifacts (files/images) after the response. */
-  sendArtifacts(ctx: TCtx, placeholder: PlaceholderHandle | null, artifacts: BotArtifact[], session: SessionRuntime): Promise<void>;
+  /** Create an MCP sendFile callback bound to the current chat context. */
+  createMcpSendFile(ctx: TCtx, session: SessionRuntime): McpSendFileCallback;
 
   /** Handle errors during message processing. */
   onError(ctx: TCtx, placeholder: PlaceholderHandle | null, session: SessionRuntime, error: Error): Promise<void>;
@@ -126,7 +130,7 @@ export interface HandleMessageOpts<TCtx> {
  * Generic message handling orchestration. Call this from your IM-specific bot.
  *
  * This handles the full lifecycle: session resolution → task registration →
- * placeholder → live preview → stream → final reply → artifacts → cleanup.
+ * placeholder → live preview → stream (with MCP bridge) → final reply → cleanup.
  */
 export async function handleIncomingMessage<TCtx>(opts: HandleMessageOpts<TCtx>): Promise<void> {
   const { bot, pipeline, ctx, files, systemPrompt } = opts;
@@ -178,6 +182,9 @@ export async function handleIncomingMessage<TCtx>(opts: HandleMessageOpts<TCtx>)
     sourceMessageId: messageId,
   });
 
+  // Create MCP sendFile callback bound to this chat context
+  const mcpSendFile = pipeline.createMcpSendFile(ctx, session);
+
   void opts.queueSessionTask(session, async () => {
     let preview: LivePreviewController | null = null;
     try {
@@ -188,19 +195,12 @@ export async function handleIncomingMessage<TCtx>(opts: HandleMessageOpts<TCtx>)
 
       const result = await bot.runStream(prompt, session, files, (nextText, nextThinking, nextActivity = '', meta, plan) => {
         preview?.update(nextText, nextThinking, nextActivity, meta, plan);
-      }, systemPrompt);
+      }, systemPrompt, mcpSendFile);
       await preview?.settle();
 
-      const artifacts = result.artifacts || [];
-      opts.log(`[handleMessage] done agent=${session.agent} ok=${result.ok} elapsed=${result.elapsedS.toFixed(1)}s artifacts=${artifacts.length}`);
-
-      if (artifacts.length && result.incomplete && result.message.trim()) {
-        result.incomplete = false;
-        opts.log(`[handleMessage] suppressed incomplete flag: artifacts present`);
-      }
+      opts.log(`[handleMessage] done agent=${session.agent} ok=${result.ok} elapsed=${result.elapsedS.toFixed(1)}s`);
 
       await pipeline.sendFinalReply(ctx, placeholder, session, result);
-      await pipeline.sendArtifacts(ctx, placeholder, artifacts, session);
     } catch (e: any) {
       opts.log(`[handleMessage] task failed chat=${chatId} error=${e?.message || e}`);
       await pipeline.onError(ctx, placeholder, session, e instanceof Error ? e : new Error(String(e)));

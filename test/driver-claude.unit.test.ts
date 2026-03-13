@@ -31,14 +31,17 @@ describe('Claude usage resolution', () => {
     else process.env.HOME = originalHome;
   });
 
-  it('prefers explicit OAuth API errors over stale telemetry fallback', async () => {
+  it('falls through to telemetry when OAuth API returns a rate_limit_error', async () => {
+    // OAuth returns an error object — the code intentionally ignores this
+    // (it's a query-API rate limit, not the user's actual usage) and falls
+    // through to telemetry.
     const telemetryDir = path.join(homeDir, '.claude', 'telemetry');
     fs.mkdirSync(telemetryDir, { recursive: true });
     fs.writeFileSync(path.join(telemetryDir, 'events.json'), JSON.stringify({
       event_type: 'ClaudeCodeInternalEvent',
       event_data: {
         event_name: 'tengu_claudeai_limits_status_changed',
-        client_timestamp: '2026-03-08T03:00:00.000Z',
+        client_timestamp: new Date(Date.now() - 60_000).toISOString(), // 1 minute ago
         model: 'claude-opus-4-6',
         additional_metadata: JSON.stringify({ status: 'allowed_warning', hoursTillReset: 39 }),
       },
@@ -62,21 +65,21 @@ describe('Claude usage resolution', () => {
     const { getUsage } = await import('../src/code-agent.ts');
     const usage = getUsage({ agent: 'claude', model: 'claude-opus-4-6' });
 
-    expect(usage.ok).toBe(false);
-    expect(usage.source).toBe('oauth-api');
-    expect(usage.status).toBe('limit_reached');
-    expect(usage.error).toBe('rate_limit_error: Rate limited. Please try again later.');
-    expect(usage.windows).toEqual([]);
+    // Should fall through to telemetry, not report the OAuth error
+    expect(usage.ok).toBe(true);
+    expect(usage.source).toBe('telemetry');
+    expect(usage.status).toBe('warning');
   });
 
-  it('marks telemetry fallback as last seen instead of current', async () => {
+  it('generates age-based labels for telemetry fallback', async () => {
     const telemetryDir = path.join(homeDir, '.claude', 'telemetry');
     fs.mkdirSync(telemetryDir, { recursive: true });
+    // Write a recent telemetry event (5 minutes ago) so label is deterministic
     fs.writeFileSync(path.join(telemetryDir, 'events.json'), JSON.stringify({
       event_type: 'ClaudeCodeInternalEvent',
       event_data: {
         event_name: 'tengu_claudeai_limits_status_changed',
-        client_timestamp: '2026-03-08T03:00:00.000Z',
+        client_timestamp: new Date(Date.now() - 5 * 60_000).toISOString(), // 5 minutes ago
         model: 'claude-opus-4-6',
         additional_metadata: JSON.stringify({ status: 'allowed_warning', hoursTillReset: 39 }),
       },
@@ -91,7 +94,7 @@ describe('Claude usage resolution', () => {
 
     expect(usage.ok).toBe(true);
     expect(usage.source).toBe('telemetry');
-    expect(usage.windows[0]?.label).toBe('Last seen');
+    expect(usage.windows[0]?.label).toMatch(/^\d+m ago$/); // e.g. "5m ago"
     expect(usage.windows[0]?.status).toBe('warning');
   });
 });

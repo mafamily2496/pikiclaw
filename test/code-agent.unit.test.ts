@@ -123,7 +123,6 @@ describe('stageSessionFiles', () => {
     const migratedDir = path.join(tmpDir, '.codeclaw', 'sessions', 'claude', legacySessionId);
     expect(migrated.workspacePath).toBe(path.join(migratedDir, 'workspace'));
     expect(fs.existsSync(path.join(migrated.workspacePath, 'legacy.txt'))).toBe(true);
-    expect(fs.existsSync(path.join(migratedDir, 'return.json'))).toBe(true);
     expect(fs.existsSync(path.join(migratedDir, 'session.json'))).toBe(true);
     expect(fs.existsSync(legacyWorkspacePath)).toBe(false);
   });
@@ -596,8 +595,6 @@ describe('doStream and attachments', () => {
     }));
     expect(routed.ok).toBe(true);
     expect(routed.message).toBe('via claude');
-    expect(routed.artifacts).toEqual([]);
-    expect(fs.existsSync(manifestPath)).toBe(false);
 
     const argsFile = path.join(tmpDir, 'claude-args.txt');
     const stdinFile = path.join(tmpDir, 'claude-stdin.txt');

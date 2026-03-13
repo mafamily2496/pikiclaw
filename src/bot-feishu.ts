@@ -16,9 +16,9 @@ import {
   parseAllowedChatIds,
 } from './bot.js';
 import {
-  type BotArtifact,
   stageSessionFiles,
 } from './code-agent.js';
+import type { McpSendFileCallback } from './mcp-bridge.js';
 import { shutdownAllDrivers } from './agent-driver.js';
 import {
   buildDefaultMenuCommands,
@@ -85,12 +85,6 @@ function describeError(err: unknown): string {
   const cause = (err as any)?.cause;
   if (cause && cause !== err) parts.push(`cause=${describeError(cause)}`);
   return parts.join(' | ');
-}
-
-function formatArtifactUploadError(err: unknown, max = 240): string {
-  const text = describeError(err).replace(/\s+/g, ' ').trim();
-  if (!text) return 'unknown error';
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,9 +528,12 @@ export class FeishuBot extends Bot {
           livePreview.start();
         }
 
+        // MCP sendFile callback: sends files to IM in real-time during the stream
+        const mcpSendFile = this.createMcpSendFileCallback(ctx);
+
         const result = await this.runStream(prompt, session, files, (nextText, nextThinking, nextActivity = '', meta, plan) => {
           livePreview?.update(nextText, nextThinking, nextActivity, meta, plan);
-        });
+        }, undefined, mcpSendFile);
         await livePreview?.settle();
 
         // End streaming mode — finalize the card before sending final reply
@@ -545,23 +542,13 @@ export class FeishuBot extends Bot {
           await this.channel.endStreaming(placeholderId, summary);
         }
 
-        const artifacts = result.artifacts || [];
-
         this.log(
           `[handleMessage] done agent=${session.agent} ok=${result.ok} elapsed=${result.elapsedS.toFixed(1)}s ` +
-          `tokens=in:${fmtTokens(result.inputTokens)}/out:${fmtTokens(result.outputTokens)} artifacts=${artifacts.length}`,
+          `tokens=in:${fmtTokens(result.inputTokens)}/out:${fmtTokens(result.outputTokens)}`,
         );
-
-        if (artifacts.length && result.incomplete && result.message.trim()) {
-          result.incomplete = false;
-          this.log(`[handleMessage] suppressed incomplete flag: artifacts present`);
-        }
 
         const finalReplyIds = await this.sendFinalReply(ctx, placeholderId, session.agent, result);
         this.registerSessionMessages(ctx.chatId, finalReplyIds, session);
-
-        const artifactIds = await this.sendArtifacts(ctx, artifacts);
-        this.registerSessionMessages(ctx.chatId, artifactIds, session);
 
         this.log(`[handleMessage] final reply sent to chat=${ctx.chatId}`);
       } catch (e: any) {
@@ -650,26 +637,20 @@ export class FeishuBot extends Bot {
     return messageIds;
   }
 
-  private async sendArtifacts(ctx: FeishuContext, artifacts: BotArtifact[]): Promise<string[]> {
-    const messageIds: string[] = [];
-    for (const artifact of artifacts) {
+  /** Create an MCP sendFile callback bound to a Feishu chat context. */
+  private createMcpSendFileCallback(ctx: FeishuContext): McpSendFileCallback {
+    return async (filePath, opts) => {
       try {
-        const sent = await this.channel.sendFile(ctx.chatId, artifact.filePath, {
-          caption: artifact.caption,
-          asPhoto: artifact.kind === 'photo',
+        await this.channel.sendFile(ctx.chatId, filePath, {
+          caption: opts?.caption,
+          asPhoto: opts?.kind === 'photo',
         });
-        if (sent) messageIds.push(sent);
-      } catch (e) {
-        const detail = formatArtifactUploadError(e);
-        this.log(`artifact upload failed for ${artifact.filename}: ${detail}`);
-        const sent = await this.channel.send(
-          ctx.chatId,
-          `Artifact upload failed: ${artifact.filename}\nError: ${detail}`,
-        ).catch(() => null);
-        if (sent) messageIds.push(sent);
+        return { ok: true };
+      } catch (e: any) {
+        this.log(`[mcp] sendFile failed: ${filePath} error=${e?.message || e}`);
+        return { ok: false, error: e?.message || 'send failed' };
       }
-    }
-    return messageIds;
+    };
   }
 
   // ---- command router -------------------------------------------------------
@@ -797,7 +778,7 @@ export class FeishuBot extends Bot {
       this.startKeepAlive();
       void this.setupMenu().catch(err => this.log(`menu setup failed: ${err}`));
       void this.sendStartupNotice().catch(err => this.log(`startup notice failed: ${err}`));
-      this.log('WebSocket listening started');
+      this.log('✓ Feishu connected, WebSocket listening — ready to receive messages');
       await this.channel.listen();
       this.stopKeepAlive();
       this.log('stopped');

@@ -73,7 +73,7 @@ export function TelegramModal({ open, onClose }: { open: boolean; onClose: () =>
       setResult({ ok: true, text: '\u2713 @' + (r.bot?.username || 'bot') + (r.bot?.displayName ? ' (' + r.bot.displayName + ')' : '') });
       const channels = new Set<string>(
         (state?.setupState?.channels || [])
-          .filter(item => item.ready && item.channel !== 'telegram')
+          .filter(item => (item.ready || item.configured) && item.channel !== 'telegram')
           .map(item => item.channel),
       );
       channels.add('telegram');
@@ -202,7 +202,7 @@ export function FeishuModal({ open, onClose }: { open: boolean; onClose: () => v
       setResult({ ok: true, text: '\u2713 ' + (validated.app?.displayName || validated.app?.appId || appId.trim()) });
       const channels = new Set<string>(
         (state?.setupState?.channels || [])
-          .filter(item => item.ready && item.channel !== 'feishu')
+          .filter(item => (item.ready || item.configured) && item.channel !== 'feishu')
           .map(item => item.channel),
       );
       channels.add('feishu');

@@ -25,7 +25,6 @@ export function makeStreamResult(
     stopReason: null,
     incomplete: false,
     activity: null,
-    artifacts: [],
     ...overrides,
   };
 }

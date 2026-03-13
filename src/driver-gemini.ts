@@ -15,7 +15,7 @@ import {
   type UsageOpts, type UsageResult,
   run, agentLog, detectAgentBin, buildStreamPreviewMeta,
   pushRecentActivity,
-  listCodeclawSessions, findCodeclawSession,
+  listCodeclawSessions, findCodeclawSession, isPendingSessionId,
   emptyUsage,
 } from './code-agent.js';
 
@@ -27,6 +27,7 @@ function geminiCmd(o: StreamOpts): string[] {
   const args = ['gemini', '--output-format', 'stream-json'];
   if (o.geminiModel) args.push('--model', o.geminiModel);
   if (o.sessionId) args.push('--resume', o.sessionId);
+  if (o.mcpConfigPath) args.push('--mcp-config', o.mcpConfigPath);
   if (o.geminiExtraArgs?.length) args.push(...o.geminiExtraArgs);
   // gemini's -p requires the prompt as its value (not via stdin)
   args.push('-p', o.prompt);
@@ -171,9 +172,11 @@ function getGeminiSessions(workdir: string, limit?: number): SessionListResult {
   const nativeSessions = getNativeGeminiSessions(resolvedWorkdir);
 
   // Merge: codeclaw records take precedence
+  // Filter out pending sessions — they haven't been confirmed by the agent yet
   const seen = new Set<string>();
   const merged: SessionInfo[] = [];
   for (const s of codeclawSessions) {
+    if (isPendingSessionId(s.sessionId)) continue;
     if (s.sessionId) seen.add(s.sessionId);
     merged.push(s);
   }

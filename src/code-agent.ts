@@ -92,6 +92,10 @@ export interface StreamOpts {
   geminiExtraArgs?: string[];
   /** Override stdin payload (used for stream-json multimodal input) */
   _stdinOverride?: string;
+  /** MCP bridge: callback when agent requests file send via MCP tool. Enables MCP bridge when provided. */
+  mcpSendFile?: import('./mcp-bridge.js').McpSendFileCallback;
+  /** Path to MCP config JSON — set by prepareStreamOpts, consumed by drivers. */
+  mcpConfigPath?: string;
 }
 
 export interface StreamResult {
@@ -115,16 +119,6 @@ export interface StreamResult {
   stopReason: string | null;
   incomplete: boolean;
   activity: string | null;
-  artifacts: BotArtifact[];
-}
-
-export type ArtifactKind = 'photo' | 'document';
-
-export interface BotArtifact {
-  filePath: string;
-  filename: string;
-  kind: ArtifactKind;
-  caption?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,7 +483,7 @@ export function readTailLines(filePath: string, maxBytes = 256 * 1024): string[]
 }
 
 export function stripInjectedPrompts(text: string): string {
-  const markers = ['\n[Session Workspace]', '\n[Telegram Artifact Return]', '\n[Artifact Return]'];
+  const markers = ['\n[Session Workspace]'];
   for (const m of markers) {
     const idx = text.indexOf(m);
     if (idx >= 0) return text.slice(0, idx).trim();
@@ -528,7 +522,6 @@ interface EnsureSessionWorkspaceOpts {
 interface SessionWorkspaceInfo {
   sessionId: string;
   workspacePath: string;
-  manifestPath: string;
   record: LocalSessionRecord;
 }
 
@@ -538,10 +531,7 @@ const CODECLAW_SESSION_INDEX = path.join(CODECLAW_SESSIONS_DIR, 'index.json');
 const CODECLAW_LEGACY_WORKSPACES_DIR = path.join(CODECLAW_DIR, 'workspaces');
 const SESSION_WORKSPACE_DIR = 'workspace';
 const SESSION_META_FILE = 'session.json';
-const SESSION_RETURN_MANIFEST = 'return.json';
-const ARTIFACT_MAX_FILES = 8;
-const ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
-const ARTIFACT_PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+// return.json and artifact constants removed — file return is now handled by MCP bridge
 
 function sessionIndexPath(workdir: string): string { return path.join(workdir, CODECLAW_SESSION_INDEX); }
 function sessionDirPath(workdir: string, agent: Agent, sessionId: string): string { return path.join(workdir, CODECLAW_SESSIONS_DIR, agent, sessionId); }
@@ -551,10 +541,8 @@ function sessionRootFromWorkspacePath(workspacePath: string): string {
   const resolved = path.resolve(workspacePath);
   return path.basename(resolved) === SESSION_WORKSPACE_DIR ? path.dirname(resolved) : resolved;
 }
-function sessionManifestPath(workspacePath: string): string { return path.join(sessionRootFromWorkspacePath(workspacePath), SESSION_RETURN_MANIFEST); }
 function sessionMetaPath(workspacePath: string): string { return path.join(sessionRootFromWorkspacePath(workspacePath), SESSION_META_FILE); }
 function legacySessionMetaPath(workspacePath: string): string { return path.join(workspacePath, CODECLAW_DIR, SESSION_META_FILE); }
-function legacySessionManifestPath(workspacePath: string): string { return path.join(workspacePath, CODECLAW_DIR, SESSION_RETURN_MANIFEST); }
 
 /** Generate a temporary session ID for new sessions before the agent assigns one. */
 function nextPendingSessionId(): string { return `pending_${crypto.randomBytes(6).toString('hex')}`; }
@@ -602,7 +590,6 @@ function writeSessionMeta(record: LocalSessionRecord) {
     workspacePath: record.workspacePath,
     createdAt: record.createdAt, updatedAt: record.updatedAt,
     title: record.title, model: record.model, stagedFiles: record.stagedFiles,
-    returnManifestPath: sessionManifestPath(record.workspacePath),
   });
 }
 
@@ -616,7 +603,6 @@ function copyPath(sourcePath: string, targetPath: string) {
 function migrateSessionLayout(workdir: string, record: LocalSessionRecord): LocalSessionRecord {
   const targetSessionDir = sessionDirPath(workdir, record.agent, record.sessionId);
   const targetWorkspacePath = sessionWorkspacePath(workdir, record.agent, record.sessionId);
-  const targetManifestPath = sessionManifestPath(targetWorkspacePath);
   const currentWorkspacePath = path.resolve(record.workspacePath || targetWorkspacePath);
   const legacyWp = path.resolve(legacySessionWorkspacePath(workdir, record.agent, record.sessionId));
 
@@ -630,12 +616,8 @@ function migrateSessionLayout(workdir: string, record: LocalSessionRecord): Loca
       if (entry === CODECLAW_DIR) continue;
       copyPath(path.join(sourceWorkspacePath, entry), path.join(targetWorkspacePath, entry));
     }
-    const sourceManifestPath = legacySessionManifestPath(sourceWorkspacePath);
-    if (fs.existsSync(sourceManifestPath) && !fs.existsSync(targetManifestPath)) copyPath(sourceManifestPath, targetManifestPath);
     if (sourceWorkspacePath === legacyWp) fs.rmSync(sourceWorkspacePath, { recursive: true, force: true });
   }
-  const currentManifestPath = legacySessionManifestPath(currentWorkspacePath);
-  if (fs.existsSync(currentManifestPath) && !fs.existsSync(targetManifestPath)) copyPath(currentManifestPath, targetManifestPath);
   record.workspacePath = path.resolve(targetWorkspacePath);
   return record;
 }
@@ -735,7 +717,7 @@ function ensureSessionWorkspace(opts: EnsureSessionWorkspaceOpts): SessionWorksp
   if (!record.title && opts.title) record.title = summarizePromptTitle(opts.title);
   record.workspacePath = path.resolve(record.workspacePath);
   saveSessionRecord(workdir, record);
-  return { sessionId: record.sessionId, workspacePath: record.workspacePath, manifestPath: sessionManifestPath(record.workspacePath), record };
+  return { sessionId: record.sessionId, workspacePath: record.workspacePath, record };
 }
 
 // Exported for drivers
@@ -748,72 +730,6 @@ export function listCodeclawSessions(workdir: string, agent: Agent, limit?: numb
 
 export function findCodeclawSession(workdir: string, agent: Agent, sessionId: string): LocalSessionRecord | null {
   return listCodeclawSessions(workdir, agent).find(entry => entry.sessionId === sessionId) || null;
-}
-
-// ---------------------------------------------------------------------------
-// Artifact helpers
-// ---------------------------------------------------------------------------
-
-function isPhotoFilename(filename: string): boolean {
-  return ARTIFACT_PHOTO_EXTS.has(path.extname(filename).toLowerCase());
-}
-
-export function collectArtifacts(dirPath: string, manifestPath = sessionManifestPath(dirPath), log?: (msg: string) => void): BotArtifact[] {
-  const _log = log || (() => {});
-  if (!fs.existsSync(manifestPath)) return [];
-  let parsed: any;
-  try { parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')); } catch (e) { _log(`artifact manifest parse error: ${e}`); return []; }
-  const entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.files) ? parsed.files : [];
-  if (!entries.length) return [];
-
-  const realDir = fs.realpathSync(dirPath);
-  const artifacts: BotArtifact[] = [];
-  for (const entry of entries.slice(0, ARTIFACT_MAX_FILES)) {
-    const rawPath = typeof entry?.path === 'string' ? entry.path : typeof entry?.name === 'string' ? entry.name : '';
-    const relPath = rawPath.trim();
-    if (!relPath || path.isAbsolute(relPath)) { _log(`artifact skipped: invalid path "${rawPath}"`); continue; }
-    if (relPath === SESSION_RETURN_MANIFEST || relPath === SESSION_META_FILE || relPath.startsWith(`${CODECLAW_DIR}/`)) { _log(`artifact skipped: reserved path "${relPath}"`); continue; }
-    const resolved = path.resolve(dirPath, relPath);
-    const realResolved = path.resolve(resolved);
-    const relative = path.relative(realDir, realResolved);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) { _log(`artifact skipped: outside workspace "${relPath}"`); continue; }
-    if (!fs.existsSync(resolved)) { _log(`artifact skipped: missing file "${relPath}"`); continue; }
-    let realFile: string;
-    try { realFile = fs.realpathSync(resolved); } catch (e) { _log(`artifact skipped: realpath failed "${relPath}" (${e})`); continue; }
-    const realRelative = path.relative(realDir, realFile);
-    if (!realRelative || realRelative.startsWith('..') || path.isAbsolute(realRelative)) { _log(`artifact skipped: symlink outside workspace "${relPath}"`); continue; }
-    let stat: fs.Stats;
-    try { stat = fs.statSync(realFile); } catch { _log(`artifact skipped: missing file "${relPath}"`); continue; }
-    if (!stat.isFile()) { _log(`artifact skipped: not a file "${relPath}"`); continue; }
-    if (stat.size > ARTIFACT_MAX_BYTES) { _log(`artifact skipped: too large "${relPath}" (${stat.size} bytes)`); continue; }
-
-    const filename = path.basename(realFile);
-    const requestedKind = typeof entry?.kind === 'string' ? entry.kind.toLowerCase() : typeof entry?.type === 'string' ? entry.type.toLowerCase() : '';
-    let kind: ArtifactKind = requestedKind === 'document' ? 'document' : requestedKind === 'photo' ? 'photo' : isPhotoFilename(filename) ? 'photo' : 'document';
-    if (kind === 'photo' && !isPhotoFilename(filename)) kind = 'document';
-    const caption = typeof entry?.caption === 'string' ? entry.caption.trim().slice(0, 1024) || undefined : undefined;
-    artifacts.push({ filePath: realFile, filename, kind, caption });
-  }
-  return artifacts;
-}
-
-export function buildArtifactSystemPrompt(workspacePath: string, manifestPath = sessionManifestPath(workspacePath)): string {
-  return [
-    '[Session Workspace]',
-    'This session has a dedicated workspace directory:', workspacePath,
-    'Put user-uploaded files here and write any generated user-facing files here unless the task clearly requires another location.',
-    '', '[Artifact Return]',
-    'If you want codeclaw to return files to the user, write this JSON manifest:', manifestPath,
-    '', 'Manifest format:',
-    '{"files":[{"path":"report.md","kind":"document","caption":"optional caption"}]}',
-    'Rules:', '- Use relative paths rooted at the session workspace.',
-    '- Use "photo" for png/jpg/jpeg/webp images. Use "document" for everything else.',
-    '- Do not point outside the workspace.', '- Omit the manifest entirely if there is nothing to return.',
-  ].join('\n');
-}
-
-export function buildArtifactPrompt(prompt: string, workspacePath: string, manifestPath = sessionManifestPath(workspacePath)): string {
-  return `${prompt.trim() || 'Please help with this request.'}\n\n${buildArtifactSystemPrompt(workspacePath, manifestPath)}`;
 }
 
 export function stageSessionFiles(opts: StageSessionFilesOpts): StageSessionFilesResult {
@@ -864,9 +780,9 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
   };
 
   const shellCmd = cmd.map(Q).join(' ');
-  agentLog(`[spawn] cmd: ${shellCmd}`);
-  agentLog(`[spawn] cwd: ${opts.workdir} timeout: ${opts.timeout}s session: ${opts.sessionId || '(new)'}`);
-  agentLog(`[spawn] prompt: "${opts.prompt.slice(0, 120)}"`);
+  agentLog(`[spawn] full command: cd ${Q(opts.workdir)} && ${shellCmd}`);
+  agentLog(`[spawn] timeout: ${opts.timeout}s session: ${opts.sessionId || '(new)'}`);
+  agentLog(`[spawn] prompt (stdin): "${opts.prompt.slice(0, 300)}${opts.prompt.length > 300 ? '…' : ''}"`);
 
   const proc = spawn(shellCmd, {
     cwd: opts.workdir,
@@ -939,7 +855,7 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
     inputTokens: s.inputTokens, outputTokens: s.outputTokens, cachedInputTokens: s.cachedInputTokens,
     cacheCreationInputTokens: s.cacheCreationInputTokens, contextWindow: s.contextWindow,
     ...computeContext(s), codexCumulative: s.codexCumulative, error, stopReason: s.stopReason,
-    incomplete, activity: s.activity.trim() || null, artifacts: [],
+    incomplete, activity: s.activity.trim() || null,
   };
 }
 
@@ -947,21 +863,17 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
 // Unified entry points (delegate to drivers via registry)
 // ---------------------------------------------------------------------------
 
-function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: SessionWorkspaceInfo; attachments: string[] } {
+function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: SessionWorkspaceInfo; attachments: string[]; stagedFiles: string[] } {
   const session = ensureSessionWorkspace({ agent: opts.agent, workdir: opts.workdir, sessionId: opts.sessionId, title: opts.prompt });
   const importedFiles = importFilesIntoWorkspace(session.workspacePath, opts.attachments || []);
   const attachmentRelPaths = dedupeStrings([...session.record.stagedFiles, ...importedFiles]);
+  // Capture staged files for MCP bridge before clearing
+  const stagedFiles = [...session.record.stagedFiles];
   session.record.stagedFiles = [];
   if (!session.record.title) session.record.title = summarizePromptTitle(opts.prompt) || importedFiles[0] || null;
   saveSessionRecord(opts.workdir, session.record);
-  removeFileIfExists(session.manifestPath);
 
   const attachmentPaths = attachmentRelPaths.map(relPath => path.join(session.workspacePath, relPath));
-  const artifactSystemPrompt = buildArtifactSystemPrompt(session.workspacePath, session.manifestPath);
-  // Codex inlines artifact instructions into the prompt; others use system prompt append
-  const prompt = opts.agent === 'codex'
-    ? buildArtifactPrompt(opts.prompt, session.workspacePath, session.manifestPath)
-    : opts.prompt;
 
   // For pending sessions, pass null sessionId to the CLI so it creates a new session
   const effectiveSessionId = isPendingSessionId(session.sessionId) ? null : session.sessionId;
@@ -969,15 +881,11 @@ function prepareStreamOpts(opts: StreamOpts): { prepared: StreamOpts; session: S
   return {
     session,
     attachments: attachmentPaths,
+    stagedFiles,
     prepared: {
       ...opts,
       sessionId: effectiveSessionId,
-      prompt,
       attachments: attachmentPaths.length ? attachmentPaths : undefined,
-      codexDeveloperInstructions: appendSystemPrompt(opts.codexDeveloperInstructions, artifactSystemPrompt),
-      claudeAppendSystemPrompt: appendSystemPrompt(opts.claudeAppendSystemPrompt, artifactSystemPrompt),
-      // gemini: pass artifact prompt via system prompt field (driver reads it)
-      geminiExtraArgs: opts.geminiExtraArgs,
     },
   };
 }
@@ -993,17 +901,18 @@ function finalizeStreamResult(result: StreamResult, workdir: string, prompt: str
   session.record.model = result.model || session.record.model;
   if (!session.record.title) session.record.title = summarizePromptTitle(prompt);
   saveSessionRecord(workdir, session.record);
-  const artifacts = collectArtifacts(session.workspacePath, session.manifestPath, msg => agentLog(msg));
-  return { ...result, sessionId: session.sessionId, workspacePath: session.workspacePath, artifacts };
+  return { ...result, sessionId: session.sessionId, workspacePath: session.workspacePath };
 }
 
 export async function doStream(opts: StreamOpts): Promise<StreamResult> {
   let session: SessionWorkspaceInfo;
   let prepared: StreamOpts;
+  let stagedFiles: string[];
   try {
     const prep = prepareStreamOpts(opts);
     session = prep.session;
     prepared = prep.prepared;
+    stagedFiles = prep.stagedFiles;
   } catch (e: any) {
     const message = e?.message || String(e);
     return {
@@ -1011,13 +920,41 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
       sessionId: opts.sessionId, workspacePath: null, model: opts.model, thinkingEffort: opts.thinkingEffort,
       elapsedS: 0, inputTokens: null, outputTokens: null, cachedInputTokens: null,
       cacheCreationInputTokens: null, contextWindow: null, contextUsedTokens: null, contextPercent: null,
-      codexCumulative: null, error: message, stopReason: null, incomplete: true, activity: null, artifacts: [],
+      codexCumulative: null, error: message, stopReason: null, incomplete: true, activity: null,
     };
   }
 
-  const driver = getDriver(prepared.agent);
-  const result = await driver.doStream(prepared);
-  return finalizeStreamResult(result, opts.workdir, opts.prompt, session);
+  // Start MCP bridge if sendFile callback is provided
+  let bridge: import('./mcp-bridge.js').McpBridgeHandle | null = null;
+  if (opts.mcpSendFile) {
+    try {
+      const { startMcpBridge } = await import('./mcp-bridge.js');
+      const sessionDir = path.dirname(session.workspacePath);
+      bridge = await startMcpBridge({
+        sessionDir,
+        workspacePath: session.workspacePath,
+        workdir: opts.workdir,
+        stagedFiles,
+        sendFile: opts.mcpSendFile,
+        agent: opts.agent,
+      });
+      prepared.mcpConfigPath = bridge.configPath;
+      agentLog(`[mcp] bridge started on ${bridge.configPath}`);
+    } catch (e: any) {
+      agentLog(`[mcp] bridge start failed: ${e.message} — proceeding without MCP`);
+    }
+  }
+
+  try {
+    const driver = getDriver(prepared.agent);
+    const result = await driver.doStream(prepared);
+    return finalizeStreamResult(result, opts.workdir, opts.prompt, session);
+  } finally {
+    if (bridge) {
+      await bridge.stop().catch(() => {});
+      agentLog('[mcp] bridge stopped');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
