@@ -47,6 +47,7 @@ export function buildDefaultMenuCommands(agentCount: number, skills: SkillInfo[]
   commands.push(
     { command: 'switch', description: 'Change workdir' },
     { command: 'models', description: 'Switch models' },
+    { command: 'stop', description: 'Stop current session' },
     { command: 'status', description: 'Show status' },
     { command: 'host', description: 'Host info' },
   );

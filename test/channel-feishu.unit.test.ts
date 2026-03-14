@@ -260,6 +260,20 @@ describe('FeishuChannel streaming cards', () => {
     expect(createCard).not.toHaveBeenCalled();
     expect(createCalls).toHaveLength(2);
   });
+
+  it('preserves reply threading when streaming cards fall back to regular replies', async () => {
+    const { ch, createCalls } = createTestChannel();
+    const createCard = vi.spyOn((ch as any).client.cardkit.v1.card, 'create');
+    createCard.mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 400'), {
+      config: { method: 'post', url: '/open-apis/cardkit/v1/cards' },
+      response: { data: { code: 200650, msg: 'permission denied' } },
+    }));
+
+    expect(await ch.sendStreamingCard('chat-1', '● codex · 0s', { replyTo: 'user-msg-1' })).toBe('msg-1');
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0].path).toEqual({ message_id: 'user-msg-1' });
+    expect(createCalls[0].data.msg_type).toBe('interactive');
+  });
 });
 
 describe('FeishuChannel files', () => {

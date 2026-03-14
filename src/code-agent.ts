@@ -100,6 +100,8 @@ export interface StreamOpts {
   mcpConfigPath?: string;
   /** Extra environment variables for the spawned agent process. */
   extraEnv?: Record<string, string>;
+  /** Abort the in-flight stream. */
+  abortSignal?: AbortSignal;
 }
 
 export interface StreamResult {
@@ -771,6 +773,7 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
   let stderr = '';
   let lineCount = 0;
   let timedOut = false;
+  let interrupted = false;
   const s = {
     sessionId: opts.sessionId, text: '', thinking: '', msgs: [] as string[], thinkParts: [] as string[],
     model: opts.model, thinkingEffort: opts.thinkingEffort, errors: null as string[] | null,
@@ -796,6 +799,15 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
     detached: process.platform !== 'win32',
   });
   agentLog(`[spawn] pid=${proc.pid}`);
+  const abortStream = () => {
+    if (interrupted || proc.killed) return;
+    interrupted = true;
+    s.stopReason = 'interrupted';
+    agentLog(`[abort] user interrupt, killing process tree pid=${proc.pid}`);
+    terminateProcessTree(proc, { signal: 'SIGTERM', forceSignal: 'SIGKILL', forceAfterMs: 5000 });
+  };
+  if (opts.abortSignal?.aborted) abortStream();
+  opts.abortSignal?.addEventListener('abort', abortStream, { once: true });
   try { proc.stdin!.write(opts._stdinOverride ?? opts.prompt); proc.stdin!.end(); } catch {}
   proc.stderr?.on('data', (c: Buffer) => { const chunk = c.toString(); stderr += chunk; agentLog(`[stderr] ${chunk.trim().slice(0, 200)}`); });
 
@@ -836,12 +848,14 @@ export async function run(cmd: string[], opts: StreamOpts, parseLine: (ev: any, 
     proc.on('close', code => { clearTimeout(hardTimer); agentLog(`[exit] code=${code} lines_parsed=${lineCount}`); resolve([code === 0, code]); });
     proc.on('error', e => { clearTimeout(hardTimer); agentLog(`[error] ${e.message}`); stderr += e.message; resolve([false, -1]); });
   });
+  opts.abortSignal?.removeEventListener('abort', abortStream);
 
   if (!s.text.trim() && s.msgs.length) s.text = s.msgs.join('\n\n');
   if (!s.thinking.trim() && s.thinkParts.length) s.thinking = s.thinkParts.join('\n\n');
 
-  const ok = procOk && !s.errors && !timedOut;
+  const ok = procOk && !s.errors && !timedOut && !interrupted;
   const error = s.errors?.map(e => e.trim()).filter(Boolean).join('; ').trim()
+    || (interrupted ? 'Interrupted by user.' : null)
     || (timedOut ? `Timed out after ${opts.timeout}s before the agent reported completion.` : null)
     || (!procOk ? (stderr.trim() || `Failed (exit=${code}).`) : null);
   const incomplete = !ok || s.stopReason === 'max_tokens' || s.stopReason === 'timeout';

@@ -14,7 +14,8 @@ import type { Bot, ChatId, Agent, SessionRuntime, ChatState, StreamResult } from
 import { fmtTokens, fmtUptime, fmtBytes } from './bot.js';
 import { getProjectSkillPaths } from './code-agent.js';
 import { getDriver } from './agent-driver.js';
-import { buildWelcomeIntro, buildDefaultMenuCommands, buildSkillCommandName, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
+import { buildWelcomeIntro, buildSkillCommandName, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
+import { buildBotMenuState } from './bot-orchestration.js';
 import { summarizePromptForStatus } from './bot-streaming.js';
 import { getSessionStatusForChat } from './session-status.js';
 import { VERSION } from './version.js';
@@ -42,10 +43,8 @@ export interface StartData {
 export function getStartData(bot: Bot, chatId: ChatId): StartData {
   const cs = bot.chat(chatId);
   const intro = buildWelcomeIntro(VERSION);
+  const commands = buildBotMenuState(bot).commands;
   const res = bot.fetchAgents();
-  const installedCount = res.agents.filter(a => a.installed).length;
-  const skillRes = bot.fetchSkills();
-  const commands = buildDefaultMenuCommands(installedCount, skillRes.skills);
   const agentDetails: AgentDetail[] = res.agents
     .filter(a => a.installed)
     .map(a => ({

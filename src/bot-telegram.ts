@@ -16,12 +16,18 @@ import {
   parseAllowedChatIds,
 } from './bot.js';
 import {
+  BOT_SHUTDOWN_FORCE_EXIT_MS,
+  SessionMessageRegistry,
+  buildBotMenuState,
+  buildKnownChatEnv,
+  buildSessionTaskId,
+} from './bot-orchestration.js';
+import {
   stageSessionFiles,
 } from './code-agent.js';
 import type { McpSendFileCallback } from './mcp-bridge.js';
 import { shutdownAllDrivers } from './agent-driver.js';
 import {
-  buildDefaultMenuCommands,
   SKILL_CMD_PREFIX,
 } from './bot-menu.js';
 import {
@@ -84,7 +90,6 @@ const SHUTDOWN_EXIT_CODE: Record<ShutdownSignal, number> = {
   SIGINT: 130,
   SIGTERM: 143,
 };
-const SHUTDOWN_FORCE_EXIT_MS = 3_000;
 
 // ---------------------------------------------------------------------------
 // TelegramBot
@@ -93,7 +98,7 @@ const SHUTDOWN_FORCE_EXIT_MS = 3_000;
 export class TelegramBot extends Bot {
   private token: string;
   private channel!: TelegramChannel;
-  private sessionMessages = new Map<number, Map<number, string>>();
+  private sessionMessages = new SessionMessageRegistry<number, number>();
   private nextTaskId = 1;
   private shutdownInFlight = false;
   private shutdownExitCode: number | null = null;
@@ -130,7 +135,7 @@ export class TelegramBot extends Bot {
   /** Register bot menu commands. Called automatically after connect. */
   async setupMenu() {
     if (!supportsChannelCapability((this as any).channel, 'commandMenu')) return;
-    const { commands, skillCount } = this.getCurrentMenuState();
+    const { commands, skillCount } = buildBotMenuState(this);
     await this.channel.setMenu(commands);
     this.log(`menu: ${commands.length} commands (${skillCount} skills)`);
   }
@@ -180,10 +185,8 @@ export class TelegramBot extends Bot {
   }
 
   private buildRestartEnv(): Record<string, string> {
-    const knownIds = new Set(this.allowedChatIds);
     const knownChats = this.channel.knownChats instanceof Set ? this.channel.knownChats : new Set<number>();
-    for (const cid of knownChats) knownIds.add(cid);
-    return knownIds.size ? { TELEGRAM_ALLOWED_CHAT_IDS: [...knownIds].join(',') } : {};
+    return buildKnownChatEnv(this.allowedChatIds, knownChats, 'TELEGRAM_ALLOWED_CHAT_IDS');
   }
 
   private beginShutdown(sig: ShutdownSignal) {
@@ -197,9 +200,9 @@ export class TelegramBot extends Bot {
 
     this.clearShutdownForceExitTimer();
     this.shutdownForceExitTimer = setTimeout(() => {
-      this.log(`shutdown still pending after ${Math.floor(SHUTDOWN_FORCE_EXIT_MS / 1000)}s, forcing exit`);
+      this.log(`shutdown still pending after ${Math.floor(BOT_SHUTDOWN_FORCE_EXIT_MS / 1000)}s, forcing exit`);
       process.exit(this.shutdownExitCode ?? 1);
-    }, SHUTDOWN_FORCE_EXIT_MS);
+    }, BOT_SHUTDOWN_FORCE_EXIT_MS);
     this.shutdownForceExitTimer.unref?.();
   }
 
@@ -218,65 +221,25 @@ export class TelegramBot extends Bot {
     process.exit(0);
   }
 
-  private getCurrentMenuState() {
-    const res = this.fetchAgents();
-    const installedCount = res.agents.filter(a => a.installed).length;
-    const skillRes = this.fetchSkills();
-    const commands = buildDefaultMenuCommands(installedCount, skillRes.skills);
-    return { commands, skillCount: skillRes.skills.length, skills: skillRes.skills };
-  }
-
   private createTaskId(session: SessionRuntime): string {
-    const seq = this.nextTaskId++;
-    return `${session.key}:${Date.now().toString(36)}:${seq.toString(36)}`;
+    return buildSessionTaskId(session, this.nextTaskId++);
   }
 
   private registerSessionMessage(chatId: number, messageId: number | null | undefined, session: SessionRuntime) {
-    if (session.workdir !== this.workdir) return;
-    if (typeof messageId !== 'number' || !Number.isFinite(messageId)) return;
-    let messages = this.sessionMessages.get(chatId);
-    if (!messages) {
-      messages = new Map<number, string>();
-      this.sessionMessages.set(chatId, messages);
-    }
-    messages.set(messageId, session.key);
-    while (messages.size > 1024) {
-      const oldest = messages.keys().next();
-      if (oldest.done) break;
-      messages.delete(oldest.value);
-    }
+    this.sessionMessages.register(chatId, messageId, session, this.workdir);
   }
 
   private registerSessionMessages(chatId: number, messageIds: Array<number | null | undefined>, session: SessionRuntime) {
-    for (const messageId of messageIds) this.registerSessionMessage(chatId, messageId, session);
+    this.sessionMessages.registerMany(chatId, messageIds, session, this.workdir);
   }
 
   private sessionFromMessage(chatId: number, messageId: number | null | undefined): SessionRuntime | null {
-    if (typeof messageId !== 'number' || !Number.isFinite(messageId)) return null;
-    const sessionKey = this.sessionMessages.get(chatId)?.get(messageId) || null;
+    const sessionKey = this.sessionMessages.resolve(chatId, messageId);
     return this.getSessionRuntimeByKey(sessionKey);
   }
 
   private ensureSession(chatId: number, title: string, files: string[]): SessionRuntime {
-    const cs = this.chat(chatId);
-    const selected = this.getSelectedSession(cs);
-    if (selected) return selected;
-
-    const staged = stageSessionFiles({
-      agent: cs.agent,
-      workdir: this.workdir,
-      files: [],
-      sessionId: null,
-      title: title || files[0] || 'New session',
-    });
-    const runtime = this.upsertSessionRuntime({
-      agent: cs.agent,
-      sessionId: staged.sessionId,
-      workspacePath: staged.workspacePath,
-      modelId: this.modelForAgent(cs.agent),
-    });
-    this.applySessionSelection(cs, runtime);
-    return runtime;
+    return this.ensureSessionForChat(chatId, title, files);
   }
 
   private resolveIncomingSession(ctx: TgContext, text: string, files: string[]): SessionRuntime {
@@ -383,6 +346,15 @@ export class TelegramBot extends Bot {
 
   private sessionsPageSize = 5;
 
+  private buildStopKeyboard(actionId: string | null) {
+    if (!actionId) return undefined;
+    return {
+      inline_keyboard: [[
+        { text: 'Stop', callback_data: `tsk:stop:${actionId}` },
+      ]],
+    };
+  }
+
   private async cmdSessions(ctx: TgContext) {
     await this.sendCommandView(ctx, await buildSessionsCommandView(this, ctx.chatId, 0, this.sessionsPageSize));
   }
@@ -465,6 +437,23 @@ export class TelegramBot extends Bot {
     void requestProcessRestart({ log: msg => this.log(msg) });
   }
 
+  private async cmdStop(ctx: TgContext) {
+    const session = this.selectedSession(ctx.chatId);
+    if (!session) {
+      await ctx.reply('No active session to stop.');
+      return;
+    }
+    const { interrupted, cancelledQueued } = this.stopTasksForSession(session.key);
+    if (!interrupted && cancelledQueued === 0) {
+      await ctx.reply('No running or queued work for the current session.');
+      return;
+    }
+    const parts: string[] = [];
+    if (interrupted) parts.push('interrupted the current run');
+    if (cancelledQueued > 0) parts.push(`cancelled ${cancelledQueued} queued ${cancelledQueued === 1 ? 'task' : 'tasks'}`);
+    await ctx.reply(`Stopped current session: ${parts.join(', ')}.`);
+  }
+
   // ---- streaming bridge -----------------------------------------------------
 
   private async handleMessage(msg: TgMessage, ctx: TgContext) {
@@ -480,6 +469,10 @@ export class TelegramBot extends Bot {
       const hadPendingWork = this.sessionHasPendingWork(session);
       const stageTask = this.queueSessionTask(session, async () => {
         try {
+          if (this.isSourceMessageWithdrawn(ctx.chatId, ctx.messageId)) {
+            this.log(`[handleMessage] skipped withdrawn file stage chat=${ctx.chatId} msg=${ctx.messageId}`);
+            return;
+          }
           const staged = stageSessionFiles({
             agent: session.agent,
             workdir: this.workdir,
@@ -512,20 +505,6 @@ export class TelegramBot extends Bot {
     const canEditMessages = supportsChannelCapability((this as any).channel, 'editMessages');
     const canSendTyping = supportsChannelCapability((this as any).channel, 'typingIndicators');
     this.log(`[handleMessage] queued chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} prompt="${prompt.slice(0, 100)}" files=${files.length}`);
-    let phId: number | null = null;
-    if (canEditMessages) {
-      const placeholderId = await ctx.reply(buildInitialPreviewHtml(session.agent), { parseMode: 'HTML', messageThreadId });
-      phId = typeof placeholderId === 'number' ? placeholderId : null;
-      if (phId != null) {
-        this.registerSessionMessage(ctx.chatId, phId, session);
-        this.log(`[handleMessage] placeholder sent msg_id=${phId}, task queued`);
-      } else {
-        this.log(`[handleMessage] placeholder unavailable for chat=${ctx.chatId}; continuing without live preview`);
-      }
-    } else {
-      this.log(`[handleMessage] skipping placeholder for chat=${ctx.chatId}; channel does not support message edits`);
-    }
-
     const taskId = this.createTaskId(session);
     this.beginTask({
       taskId,
@@ -536,10 +515,34 @@ export class TelegramBot extends Bot {
       startedAt: start,
       sourceMessageId: ctx.messageId,
     });
+    const stopKeyboard = this.buildStopKeyboard(this.actionIdForTask(taskId));
+    let phId: number | null = null;
+    if (canEditMessages) {
+      const placeholderId = await ctx.reply(buildInitialPreviewHtml(session.agent), { parseMode: 'HTML', messageThreadId, keyboard: stopKeyboard });
+      phId = typeof placeholderId === 'number' ? placeholderId : null;
+      if (phId != null) {
+        this.registerSessionMessage(ctx.chatId, phId, session);
+        this.log(`[handleMessage] placeholder sent msg_id=${phId}, task queued`);
+      } else {
+        this.log(`[handleMessage] placeholder unavailable for chat=${ctx.chatId}; continuing without live preview`);
+      }
+    } else {
+      this.log(`[handleMessage] skipping placeholder for chat=${ctx.chatId}; channel does not support message edits`);
+    }
+    this.registerTaskPlaceholders(taskId, [phId]);
 
     void this.queueSessionTask(session, async () => {
       let livePreview: LivePreview | null = null;
+      const abortController = new AbortController();
       try {
+        const task = this.markTaskRunning(taskId, () => abortController.abort());
+        if (!task || task.cancelled) {
+          if (phId != null) {
+            try { await this.channel.deleteMessage(ctx.chatId, phId); } catch {}
+          }
+          this.log(`[handleMessage] skipped cancelled queued task chat=${ctx.chatId} msg=${ctx.messageId}`);
+          return;
+        }
         if (phId != null || canSendTyping) {
           livePreview = new LivePreview({
             agent: session.agent,
@@ -552,6 +555,7 @@ export class TelegramBot extends Bot {
             canEditMessages,
             canSendTyping,
             messageThreadId,
+            keyboard: stopKeyboard,
             log: (message: string) => this.log(message),
           });
           livePreview.start();
@@ -562,7 +566,7 @@ export class TelegramBot extends Bot {
 
         const result = await this.runStream(prompt, session, files, (nextText, nextThinking, nextActivity = '', meta, plan) => {
           livePreview?.update(nextText, nextThinking, nextActivity, meta, plan);
-        }, undefined, mcpSendFile);
+        }, undefined, mcpSendFile, abortController.signal);
         await livePreview?.settle();
 
         this.log(
@@ -580,7 +584,7 @@ export class TelegramBot extends Bot {
         const errorHtml = `<b>Error</b>\n\n<code>${escapeHtml(msgText.slice(0, 500))}</code>`;
         if (phId != null) {
           try {
-            await this.channel.editMessage(ctx.chatId, phId, errorHtml, { parseMode: 'HTML' });
+            await this.channel.editMessage(ctx.chatId, phId, errorHtml, { parseMode: 'HTML', keyboard: { inline_keyboard: [] } });
             this.registerSessionMessage(ctx.chatId, phId, session);
           } catch {
             const sent = await this.channel.send(ctx.chatId, errorHtml, { parseMode: 'HTML', replyTo: ctx.messageId, messageThreadId }).catch(() => null);
@@ -650,7 +654,7 @@ export class TelegramBot extends Bot {
     const replacePreview = async (text: string) => {
       if (phId != null) {
         try {
-          await this.channel.editMessage(ctx.chatId, phId, text, { parseMode: 'HTML' });
+          await this.channel.editMessage(ctx.chatId, phId, text, { parseMode: 'HTML', keyboard: { inline_keyboard: [] } });
           return remember(phId);
         } catch {}
       }
@@ -734,7 +738,29 @@ export class TelegramBot extends Bot {
     return true;
   }
 
+  private async handleTaskStopCallback(data: string, ctx: TgCallbackContext): Promise<boolean> {
+    if (!data.startsWith('tsk:stop:')) return false;
+    const actionId = data.slice('tsk:stop:'.length).trim();
+    const result = this.stopTaskByActionId(actionId);
+    if (!result.task) {
+      await ctx.answerCallback('This task already finished.');
+      return true;
+    }
+    if (result.cancelled) {
+      try { await this.channel.deleteMessage(ctx.chatId, ctx.messageId); } catch {}
+      await ctx.answerCallback('Queued task cancelled.');
+      return true;
+    }
+    if (result.interrupted) {
+      await ctx.answerCallback('Stopping...');
+      return true;
+    }
+    await ctx.answerCallback('Nothing to stop.');
+    return true;
+  }
+
   async handleCallback(data: string, ctx: TgCallbackContext) {
+    if (await this.handleTaskStopCallback(data, ctx)) return;
     if (await this.handleSwitchNavigateCallback(data, ctx)) return;
     if (await this.handleSwitchSelectCallback(data, ctx)) return;
     if (await this.handleSessionsPageCallback(data, ctx)) return;
@@ -767,6 +793,7 @@ export class TelegramBot extends Bot {
         case 'agents':   await this.cmdAgents(ctx); return;
         case 'models':   await this.cmdModels(ctx); return;
         case 'skills':   await this.cmdSkills(ctx); return;
+        case 'stop':     await this.cmdStop(ctx); return;
         case 'status':   await this.cmdStatus(ctx); return;
         case 'host':     await this.cmdHost(ctx); return;
         case 'switch':   await this.cmdSwitch(ctx); return;

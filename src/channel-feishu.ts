@@ -89,6 +89,7 @@ export interface FeishuCallbackContext {
 }
 
 export type FeishuCallbackHandler = (data: string, ctx: FeishuCallbackContext) => Promise<any> | any;
+export type FeishuRecallHandler = (messageId: string, chatId: string, raw: any) => Promise<any> | any;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -345,6 +346,7 @@ class FeishuChannel extends Channel {
   private _hCommand: FeishuCommandHandler | null = null;
   private _hMessage: FeishuMessageHandler | null = null;
   private _hCardAction: FeishuCallbackHandler | null = null;
+  private _hRecall: FeishuRecallHandler | null = null;
   private _hError: FeishuErrorHandler | null = null;
 
   readonly knownChats = new Set<string>();
@@ -383,6 +385,7 @@ class FeishuChannel extends Channel {
   onCommand(h: FeishuCommandHandler)   { this._hCommand = h; }
   onMessage(h: FeishuMessageHandler)   { this._hMessage = h; }
   onCallback(h: FeishuCallbackHandler) { this._hCardAction = h; }
+  onMessageRecalled(h: FeishuRecallHandler) { this._hRecall = h; }
   onError(h: FeishuErrorHandler)       { this._hError = h; }
 
   // ========================================================================
@@ -487,6 +490,12 @@ class FeishuChannel extends Channel {
       'application.bot.menu_v6': (data: any) => {
         void this._dispatchMenuEvent(data).catch(e => {
           this._log(`[menu] error: ${e}`);
+          this._hError?.(e instanceof Error ? e : new Error(String(e)));
+        });
+      },
+      'im.message.recalled_v1': (data: any) => {
+        void this._dispatchMessageRecalled(data).catch(e => {
+          this._log(`[message-recalled] error: ${e}`);
           this._hError?.(e instanceof Error ? e : new Error(String(e)));
         });
       },
@@ -630,6 +639,16 @@ class FeishuChannel extends Channel {
     const from: FeishuFrom = { openId, userId: event.operator?.operator_id?.user_id };
     const ctx = this._makeCtx(chatId, '', from, 'p2p', event);
     await this._hCommand(eventKey, '', ctx);
+  }
+
+  private async _dispatchMessageRecalled(event: any) {
+    const chatId = String(event?.chat_id || '').trim();
+    const messageId = String(event?.message_id || '').trim();
+    if (!chatId || !messageId || !this._hRecall) return;
+    if (!this._isAllowed(chatId)) { this._log(`[message-recalled] blocked: chat=${chatId}`); return; }
+    this.knownChats.add(chatId);
+    this._log(`[recv] message_recalled chat=${chatId} msg=${messageId}`);
+    await this._hRecall(messageId, chatId, event);
   }
 
   /**
@@ -807,12 +826,31 @@ class FeishuChannel extends Channel {
    * While streaming is active, `editMessage()` transparently pushes content
    * via the CardKit API instead of PATCH. Call `endStreaming()` to finalize.
    */
-  async sendStreamingCard(chatId: string, initialContent: string, opts?: { replyTo?: string }): Promise<string | null> {
-    if (!this.cardKitEnabled) {
-      const text = initialContent || 'Generating...';
+  async sendStreamingCard(chatId: string, initialContent: string, opts?: { replyTo?: string; keyboard?: any }): Promise<string | null> {
+    const sendRegularCard = (text: string) => {
+      const markdown = text || 'Generating...';
+      const rows = keyboardToRows(opts?.keyboard);
       return opts?.replyTo
-        ? this.replyCard(opts.replyTo, { markdown: text })
-        : this.send(chatId, text);
+        ? this.replyCard(opts.replyTo, { markdown, rows })
+        : this.send(chatId, markdown, { keyboard: opts?.keyboard });
+    };
+
+    if (!this.cardKitEnabled) {
+      return sendRegularCard(initialContent);
+    }
+
+    const rows = keyboardToRows(opts?.keyboard);
+    const elements: any[] = [
+      { tag: 'markdown', content: initialContent || 'Generating...', element_id: 'status' },
+      { tag: 'markdown', content: '', element_id: 'content' },
+    ];
+    for (const row of rows) {
+      const actions = row.actions.filter(Boolean);
+      if (!actions.length) continue;
+      const element: any = { tag: 'action', actions };
+      const layout = row.layout || inferActionLayout(actions);
+      if (layout) element.layout = layout;
+      elements.push(element);
     }
 
     const cardData = {
@@ -826,10 +864,7 @@ class FeishuChannel extends Channel {
         },
       },
       body: {
-        elements: [
-          { tag: 'markdown', content: initialContent || 'Generating...', element_id: 'status' },
-          { tag: 'markdown', content: '', element_id: 'content' },
-        ],
+        elements,
       },
     };
 
@@ -848,7 +883,7 @@ class FeishuChannel extends Channel {
     } catch (e: any) {
       if (isCardKitCapabilityError(e)) this.disableCardKit(describeFeishuApiError(e));
       this._log(`[streaming] CardKit create failed: ${describeFeishuApiError(e)}, falling back to regular card`);
-      return this.send(chatId, initialContent);
+      return sendRegularCard(initialContent);
     }
 
     // Step 2: Send card as message (reply to user's message if replyTo is set)
@@ -875,7 +910,7 @@ class FeishuChannel extends Channel {
       return messageId;
     } catch (e: any) {
       this._log(`[streaming] send card message failed: ${e?.message || e}`);
-      return this.send(chatId, initialContent);
+      return sendRegularCard(initialContent);
     }
   }
 

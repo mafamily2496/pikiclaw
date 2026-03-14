@@ -653,7 +653,47 @@ function stripBoldMarkers(text: string): string {
 
 /** Strip anchor links [text](#id) → text (anchors don't work in Feishu cards). */
 function adaptLine(line: string): string {
-  return line.replace(/\[([^\]]+)\]\(#[^)]*\)/g, '$1');
+  const withoutAnchors = line.replace(/\[([^\]]+)\]\(#[^)]*\)/g, '$1');
+  const heading = withoutAnchors.match(/^(\s*)#{1,6}\s+(.+?)\s*#*\s*$/);
+  if (!heading) return withoutAnchors;
+
+  const indent = heading[1] || '';
+  const content = heading[2].trim();
+  return content ? `${indent}**${content}**` : '';
+}
+
+function normalizeFeishuMarkdown(lines: string[]): string {
+  const out: string[] = [];
+  let inCodeBlock = false;
+  let pendingBlankLine = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\s+$/g, '');
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
+      if (pendingBlankLine && out.length && !inCodeBlock) out.push('');
+      pendingBlankLine = false;
+      out.push(line);
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+
+    if (inCodeBlock) {
+      out.push(rawLine);
+      continue;
+    }
+
+    if (!line.trim()) {
+      if (out.length) pendingBlankLine = true;
+      continue;
+    }
+
+    if (pendingBlankLine && out.length) out.push('');
+    pendingBlankLine = false;
+    out.push(line);
+  }
+
+  return out.join('\n');
 }
 
 export function adaptMarkdownForFeishu(markdown: string): string {
@@ -715,5 +755,5 @@ export function adaptMarkdownForFeishu(markdown: string): string {
     }
   }
 
-  return out.join('\n');
+  return normalizeFeishuMarkdown(out);
 }

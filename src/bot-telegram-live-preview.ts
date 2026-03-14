@@ -12,7 +12,7 @@ const STREAM_STALLED_NOTICE_MS = 15_000;
 
 /** Minimal channel interface needed for live preview edits. */
 export interface PreviewChannel {
-  editMessage(chatId: ChatId, messageId: number | string, text: string, opts?: { parseMode?: string }): Promise<void>;
+  editMessage(chatId: ChatId, messageId: number | string, text: string, opts?: { parseMode?: string; keyboard?: any }): Promise<void>;
   sendTyping(chatId: ChatId, opts?: { messageThreadId?: number }): Promise<void>;
 }
 
@@ -44,6 +44,7 @@ export interface LivePreviewOptions {
   messageThreadId?: number;
   /** Parse mode string passed to editMessage (e.g. 'HTML', 'MarkdownV2'). */
   parseMode?: string;
+  keyboard?: any;
   log?: (message: string) => void;
 }
 
@@ -65,6 +66,7 @@ export class LivePreview {
   private readonly canSendTyping: boolean;
   private readonly messageThreadId?: number;
   private readonly parseMode: string;
+  private readonly keyboard: any;
   private readonly log: (message: string) => void;
 
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -94,6 +96,7 @@ export class LivePreview {
     this.canSendTyping = options.canSendTyping;
     this.messageThreadId = options.messageThreadId;
     this.parseMode = options.parseMode ?? 'HTML';
+    this.keyboard = options.keyboard;
     this.log = options.log ?? (() => {});
 
     this.initialText = this.renderer.renderInitial(this.agent);
@@ -223,7 +226,7 @@ export class LivePreview {
       .then(async () => {
         if (version !== this.previewVersion) return;
         try {
-          await this.channel.editMessage(this.chatId, placeholderMessageId, preview, { parseMode: this.parseMode });
+          await this.channel.editMessage(this.chatId, placeholderMessageId, preview, { parseMode: this.parseMode, keyboard: this.keyboard });
         } catch (error: any) {
           this.log(`stream edit err: ${error?.message || error}`);
         }

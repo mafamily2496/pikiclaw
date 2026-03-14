@@ -16,12 +16,18 @@ import {
   parseAllowedChatIds,
 } from './bot.js';
 import {
+  BOT_SHUTDOWN_FORCE_EXIT_MS,
+  SessionMessageRegistry,
+  buildBotMenuState,
+  buildKnownChatEnv,
+  buildSessionTaskId,
+} from './bot-orchestration.js';
+import {
   stageSessionFiles,
 } from './code-agent.js';
 import type { McpSendFileCallback } from './mcp-bridge.js';
 import { shutdownAllDrivers } from './agent-driver.js';
 import {
-  buildDefaultMenuCommands,
   SKILL_CMD_PREFIX,
 } from './bot-menu.js';
 import {
@@ -75,7 +81,6 @@ const SHUTDOWN_EXIT_CODE: Record<ShutdownSignal, number> = {
   SIGINT: 130,
   SIGTERM: 143,
 };
-const SHUTDOWN_FORCE_EXIT_MS = 3_000;
 
 function describeError(err: unknown): string {
   if (!(err instanceof Error)) return String(err ?? 'unknown error');
@@ -142,7 +147,7 @@ export class FeishuBot extends Bot {
   private channel!: FeishuChannel;
 
   /** Maps chatId → (messageId → sessionKey) for reply-chain session tracking. */
-  private sessionMessages = new Map<string, Map<string, string>>();
+  private sessionMessages = new SessionMessageRegistry<string, string>();
   private nextTaskId = 1;
   private shutdownInFlight = false;
   private shutdownExitCode: number | null = null;
@@ -184,12 +189,9 @@ export class FeishuBot extends Bot {
 
   async setupMenu() {
     if (!supportsChannelCapability(this.channel, 'commandMenu')) return;
-    const res = this.fetchAgents();
-    const installedCount = res.agents.filter(a => a.installed).length;
-    const skillRes = this.fetchSkills();
-    const commands = buildDefaultMenuCommands(installedCount, skillRes.skills);
+    const { commands, skillCount } = buildBotMenuState(this);
     await this.channel.setMenu(commands);
-    this.log(`menu: ${commands.length} commands (${skillRes.skills.length} skills)`);
+    this.log(`menu: ${commands.length} commands (${skillCount} skills)`);
   }
 
   protected override afterSwitchWorkdir(_oldPath: string, _newPath: string) {
@@ -227,9 +229,9 @@ export class FeishuBot extends Bot {
 
     if (this.shutdownForceExitTimer) clearTimeout(this.shutdownForceExitTimer);
     this.shutdownForceExitTimer = setTimeout(() => {
-      this.log(`shutdown still pending after ${Math.floor(SHUTDOWN_FORCE_EXIT_MS / 1000)}s, forcing exit`);
+      this.log(`shutdown still pending after ${Math.floor(BOT_SHUTDOWN_FORCE_EXIT_MS / 1000)}s, forcing exit`);
       process.exit(this.shutdownExitCode ?? 1);
-    }, SHUTDOWN_FORCE_EXIT_MS);
+    }, BOT_SHUTDOWN_FORCE_EXIT_MS);
     this.shutdownForceExitTimer.unref?.();
   }
 
@@ -240,65 +242,30 @@ export class FeishuBot extends Bot {
   }
 
   private buildRestartEnv(): Record<string, string> {
-    const knownIds = new Set(this.allowedChatIds);
-    for (const cid of this.channel.knownChats) knownIds.add(cid);
-    return knownIds.size ? { FEISHU_ALLOWED_CHAT_IDS: [...knownIds].join(',') } : {};
+    return buildKnownChatEnv(this.allowedChatIds, this.channel.knownChats, 'FEISHU_ALLOWED_CHAT_IDS');
   }
 
   // ---- session tracking -----------------------------------------------------
 
   private createTaskId(session: SessionRuntime): string {
-    const seq = this.nextTaskId++;
-    return `${session.key}:${Date.now().toString(36)}:${seq.toString(36)}`;
+    return buildSessionTaskId(session, this.nextTaskId++);
   }
 
   private registerSessionMessage(chatId: string, messageId: string | null | undefined, session: SessionRuntime) {
-    if (session.workdir !== this.workdir) return;
-    if (!messageId) return;
-    let messages = this.sessionMessages.get(chatId);
-    if (!messages) {
-      messages = new Map<string, string>();
-      this.sessionMessages.set(chatId, messages);
-    }
-    messages.set(messageId, session.key);
-    // Cap size
-    while (messages.size > 1024) {
-      const oldest = messages.keys().next();
-      if (oldest.done) break;
-      messages.delete(oldest.value);
-    }
+    this.sessionMessages.register(chatId, messageId, session, this.workdir);
   }
 
   private registerSessionMessages(chatId: string, messageIds: Array<string | null | undefined>, session: SessionRuntime) {
-    for (const messageId of messageIds) this.registerSessionMessage(chatId, messageId, session);
+    this.sessionMessages.registerMany(chatId, messageIds, session, this.workdir);
   }
 
   private sessionFromMessage(chatId: string, messageId: string | null | undefined): SessionRuntime | null {
-    if (!messageId) return null;
-    const sessionKey = this.sessionMessages.get(chatId)?.get(messageId) || null;
+    const sessionKey = this.sessionMessages.resolve(chatId, messageId);
     return this.getSessionRuntimeByKey(sessionKey);
   }
 
   private ensureSession(chatId: string, title: string, files: string[]): SessionRuntime {
-    const cs = this.chat(chatId);
-    const selected = this.getSelectedSession(cs);
-    if (selected) return selected;
-
-    const staged = stageSessionFiles({
-      agent: cs.agent,
-      workdir: this.workdir,
-      files: [],
-      sessionId: null,
-      title: title || files[0] || 'New session',
-    });
-    const runtime = this.upsertSessionRuntime({
-      agent: cs.agent,
-      sessionId: staged.sessionId,
-      workspacePath: staged.workspacePath,
-      modelId: this.modelForAgent(cs.agent),
-    });
-    this.applySessionSelection(cs, runtime);
-    return runtime;
+    return this.ensureSessionForChat(chatId, title, files);
   }
 
   private resolveIncomingSession(ctx: FeishuContext, text: string, files: string[]): SessionRuntime {
@@ -362,6 +329,19 @@ export class FeishuBot extends Bot {
   }
 
   private sessionsPageSize = 5;
+
+  private buildStopKeyboard(actionId: string | null) {
+    if (!actionId) return undefined;
+    return {
+      rows: [{
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: 'Stop' },
+          value: { action: `tsk:stop:${actionId}` },
+        }],
+      }],
+    };
+  }
 
   private async cmdSessions(ctx: FeishuContext, args: string) {
     const arg = args.trim().toLowerCase();
@@ -488,6 +468,23 @@ export class FeishuBot extends Bot {
     void requestProcessRestart({ log: msg => this.log(msg) });
   }
 
+  private async cmdStop(ctx: FeishuContext) {
+    const session = this.selectedSession(ctx.chatId);
+    if (!session) {
+      await ctx.reply('No active session to stop.');
+      return;
+    }
+    const { interrupted, cancelledQueued } = this.stopTasksForSession(session.key);
+    if (!interrupted && cancelledQueued === 0) {
+      await ctx.reply('No running or queued work for the current session.');
+      return;
+    }
+    const parts: string[] = [];
+    if (interrupted) parts.push('interrupted the current run');
+    if (cancelledQueued > 0) parts.push(`cancelled ${cancelledQueued} queued ${cancelledQueued === 1 ? 'task' : 'tasks'}`);
+    await ctx.reply(`Stopped current session: ${parts.join(', ')}.`);
+  }
+
   // ---- streaming bridge -----------------------------------------------------
 
   private async handleMessage(msg: FeishuMessage, ctx: FeishuContext) {
@@ -503,6 +500,10 @@ export class FeishuBot extends Bot {
       const hadPendingWork = this.sessionHasPendingWork(session);
       const stageTask = this.queueSessionTask(session, async () => {
         try {
+          if (this.isSourceMessageWithdrawn(ctx.chatId, ctx.messageId)) {
+            this.log(`[handleMessage] skipped withdrawn file stage chat=${ctx.chatId} msg=${ctx.messageId}`);
+            return;
+          }
           const staged = stageSessionFiles({
             agent: session.agent,
             workdir: this.workdir,
@@ -534,14 +535,6 @@ export class FeishuBot extends Bot {
       `[handleMessage] start chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} ` +
       `files=${files.length} prompt="${prompt.slice(0, 100)}"`,
     );
-
-    const model = session.modelId || this.modelForAgent(session.agent);
-    const effort = this.effortForAgent(session.agent);
-    const placeholderId = await this.channel.sendStreamingCard(ctx.chatId, buildInitialPreviewMarkdown(session.agent, model, effort), { replyTo: ctx.messageId || undefined });
-    if (placeholderId) {
-      this.registerSessionMessage(ctx.chatId, placeholderId, session);
-    }
-
     const taskId = this.createTaskId(session);
     this.beginTask({
       taskId,
@@ -550,12 +543,33 @@ export class FeishuBot extends Bot {
       sessionKey: session.key,
       prompt,
       startedAt: start,
-      sourceMessageId: ctx.messageId as any,
+      sourceMessageId: ctx.messageId,
     });
+    const stopKeyboard = this.buildStopKeyboard(this.actionIdForTask(taskId));
+
+    const model = session.modelId || this.modelForAgent(session.agent);
+    const effort = this.effortForAgent(session.agent);
+    const placeholderId = await this.channel.sendStreamingCard(ctx.chatId, buildInitialPreviewMarkdown(session.agent, model, effort), {
+      replyTo: ctx.messageId || undefined,
+      keyboard: stopKeyboard,
+    });
+    if (placeholderId) {
+      this.registerSessionMessage(ctx.chatId, placeholderId, session);
+    }
+    this.registerTaskPlaceholders(taskId, [placeholderId]);
 
     void this.queueSessionTask(session, async () => {
       let livePreview: LivePreview | null = null;
+      const abortController = new AbortController();
       try {
+        const task = this.markTaskRunning(taskId, () => abortController.abort());
+        if (!task || task.cancelled) {
+          if (placeholderId) {
+            try { await this.channel.deleteMessage(ctx.chatId, placeholderId); } catch {}
+          }
+          this.log(`[handleMessage] skipped cancelled queued task chat=${ctx.chatId} msg=${ctx.messageId}`);
+          return;
+        }
         if (placeholderId) {
           const renderer = this.channel.isStreamingCard(placeholderId)
             ? feishuStreamingPreviewRenderer
@@ -571,6 +585,7 @@ export class FeishuBot extends Bot {
             canEditMessages: supportsChannelCapability(this.channel, 'editMessages'),
             canSendTyping: false,
             parseMode: 'Markdown',
+            keyboard: stopKeyboard,
             log: (message: string) => this.log(message),
           });
           livePreview.start();
@@ -581,7 +596,7 @@ export class FeishuBot extends Bot {
 
         const result = await this.runStream(prompt, session, files, (nextText, nextThinking, nextActivity = '', meta, plan) => {
           livePreview?.update(nextText, nextThinking, nextActivity, meta, plan);
-        }, undefined, mcpSendFile);
+        }, undefined, mcpSendFile, abortController.signal);
         await livePreview?.settle();
 
         const finalReplyIds = await this.sendFinalReply(ctx, placeholderId, session.agent, result);
@@ -600,6 +615,9 @@ export class FeishuBot extends Bot {
         const errorText = `**Error**\n\n\`${msgText.slice(0, 500)}\``;
         if (placeholderId) {
           try {
+            if (this.channel.isStreamingCard(placeholderId)) {
+              await this.channel.endStreaming(placeholderId, 'Response interrupted.');
+            }
             await this.channel.editMessage(ctx.chatId, placeholderId, errorText);
           } catch {
             await this.channel.send(ctx.chatId, errorText).catch(() => null);
@@ -632,6 +650,9 @@ export class FeishuBot extends Bot {
       // Fits in one card — edit the placeholder
       if (placeholderId) {
         try {
+          if (this.channel.isStreamingCard(placeholderId)) {
+            await this.channel.endStreaming(placeholderId, 'Response complete.');
+          }
           await this.channel.editMessage(ctx.chatId, placeholderId, rendered.fullText);
           messageIds.push(placeholderId);
           return messageIds;
@@ -657,6 +678,9 @@ export class FeishuBot extends Bot {
       const firstText = `${rendered.headerText}${firstBody}${rendered.footerText}`;
       if (placeholderId) {
         try {
+          if (this.channel.isStreamingCard(placeholderId)) {
+            await this.channel.endStreaming(placeholderId, 'Response complete.');
+          }
           await this.channel.editMessage(ctx.chatId, placeholderId, firstText);
           messageIds.push(placeholderId);
         } catch {
@@ -707,6 +731,7 @@ export class FeishuBot extends Bot {
         case 'agents':   await this.cmdAgents(ctx, args); return;
         case 'models':   await this.cmdModels(ctx, args); return;
         case 'skills':   await this.cmdSkills(ctx); return;
+        case 'stop':     await this.cmdStop(ctx); return;
         case 'status':   await this.cmdStatus(ctx); return;
         case 'host':     await this.cmdHost(ctx); return;
         case 'switch':   await this.cmdSwitch(ctx, args); return;
@@ -753,6 +778,7 @@ export class FeishuBot extends Bot {
 
   private async handleCallback(data: string, ctx: FeishuCallbackContext) {
     try {
+      if (await this.handleTaskStopCallback(data, ctx)) return;
       if (await this.handleSwitchNavigateCallback(data, ctx)) return;
       if (await this.handleSwitchSelectCallback(data, ctx)) return;
 
@@ -765,6 +791,17 @@ export class FeishuBot extends Bot {
     } catch (e: any) {
       this.log(`callback error: ${e}`);
     }
+  }
+
+  private async handleTaskStopCallback(data: string, ctx: FeishuCallbackContext): Promise<boolean> {
+    if (!data.startsWith('tsk:stop:')) return false;
+    const actionId = data.slice('tsk:stop:'.length).trim();
+    const result = this.stopTaskByActionId(actionId);
+    if (!result.task) return true;
+    if (result.cancelled) {
+      try { await this.channel.deleteMessage(ctx.chatId, ctx.messageId); } catch {}
+    }
+    return true;
   }
 
   private async handleSwitchNavigateCallback(data: string, ctx: FeishuCallbackContext): Promise<boolean> {
@@ -806,6 +843,15 @@ export class FeishuBot extends Bot {
     }
   }
 
+  private async handleMessageRecalled(messageId: string, chatId: string) {
+    const task = this.withdrawQueuedTaskBySourceMessage(chatId, messageId);
+    if (!task) return;
+    for (const placeholderId of task.placeholderMessageIds || []) {
+      try { await this.channel.deleteMessage(chatId, String(placeholderId)); } catch {}
+    }
+    this.log(`[message-recalled] cancelled queued task chat=${chatId} msg=${messageId} session=${task.sessionKey}`);
+  }
+
   // ---- lifecycle ------------------------------------------------------------
 
   async run() {
@@ -843,6 +889,7 @@ export class FeishuBot extends Bot {
       this.channel.onCommand((cmd, args, ctx) => this.handleCommand(cmd, args, ctx));
       this.channel.onMessage((msg, ctx) => this.handleMessage(msg, ctx));
       this.channel.onCallback((data, ctx) => this.handleCallback(data, ctx));
+      this.channel.onMessageRecalled((messageId, chatId) => this.handleMessageRecalled(messageId, chatId));
       this.channel.onError(err => this.log(`error: ${err}`));
 
       this.startKeepAlive();

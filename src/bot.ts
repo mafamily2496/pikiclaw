@@ -10,7 +10,7 @@ import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import { getActiveUserConfig, onUserConfigChange, resolveUserWorkdir, setUserWorkdir } from './user-config.js';
 import {
-  doStream, getSessions, getSessionTail, getUsage, initializeProjectSkills, listAgents, listModels, listSkills,
+  doStream, getSessions, getSessionTail, getUsage, initializeProjectSkills, listAgents, listModels, listSkills, stageSessionFiles,
   type Agent, type CodexCumulativeUsage, type StreamOpts, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult,
   type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult,
   type SkillInfo, type SkillListResult, type AgentDetectOptions, isPendingSessionId,
@@ -440,12 +440,17 @@ export interface SessionRuntime {
 
 export interface RunningTask {
   taskId: string;
+  actionId?: string;
   chatId: ChatId;
   agent: Agent;
   sessionKey: string;
   prompt: string;
   startedAt: number;
-  sourceMessageId: number;
+  sourceMessageId: number | string;
+  status?: 'queued' | 'running';
+  cancelled?: boolean;
+  abort?: (() => void) | null;
+  placeholderMessageIds?: Array<number | string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +492,10 @@ export class Bot {
   private keepAlivePulseTimer: ReturnType<typeof setInterval> | null = null;
   private sessionChains = new Map<string, Promise<void>>();
   private userConfigUnsubscribe: (() => void) | null = null;
+  private taskKeysBySourceMessage = new Map<string, string>();
+  private taskKeysByActionId = new Map<string, string>();
+  private withdrawnSourceMessages = new Set<string>();
+  private nextTaskActionId = 1;
 
   constructor() {
     this.workdir = resolveUserWorkdir();
@@ -626,16 +635,51 @@ export class Bot {
     }
   }
 
+  protected ensureSessionForChat(chatId: ChatId, title: string, files: string[]): SessionRuntime {
+    const cs = this.chat(chatId);
+    const selected = this.getSelectedSession(cs);
+    if (selected) return selected;
+
+    const staged = stageSessionFiles({
+      agent: cs.agent,
+      workdir: this.workdir,
+      files: [],
+      sessionId: null,
+      title: title || files[0] || 'New session',
+    });
+    const runtime = this.upsertSessionRuntime({
+      agent: cs.agent,
+      sessionId: staged.sessionId,
+      workspacePath: staged.workspacePath,
+      modelId: this.modelForAgent(cs.agent),
+    });
+    this.applySessionSelection(cs, runtime);
+    return runtime;
+  }
+
   protected beginTask(task: RunningTask) {
-    this.activeTasks.set(task.taskId, task);
+    const nextTask: RunningTask = {
+      ...task,
+      actionId: task.actionId || `t${(this.nextTaskActionId++).toString(36)}`,
+      status: 'queued',
+      cancelled: false,
+      abort: null,
+      placeholderMessageIds: [...(task.placeholderMessageIds || [])],
+    };
+    this.activeTasks.set(nextTask.taskId, nextTask);
+    this.taskKeysBySourceMessage.set(this.sourceMessageKey(task.chatId, task.sourceMessageId), nextTask.taskId);
+    this.taskKeysByActionId.set(String(nextTask.actionId), nextTask.taskId);
     const session = this.getSessionRuntimeByKey(task.sessionKey, { allowAnyWorkdir: true });
-    session?.runningTaskIds.add(task.taskId);
+    session?.runningTaskIds.add(nextTask.taskId);
   }
 
   protected finishTask(taskId: string) {
     const task = this.activeTasks.get(taskId);
     if (!task) return;
     this.activeTasks.delete(taskId);
+    this.taskKeysBySourceMessage.delete(this.sourceMessageKey(task.chatId, task.sourceMessageId));
+    if (task.actionId) this.taskKeysByActionId.delete(String(task.actionId));
+    this.withdrawnSourceMessages.delete(this.sourceMessageKey(task.chatId, task.sourceMessageId));
     const session = this.getSessionRuntimeByKey(task.sessionKey, { allowAnyWorkdir: true });
     if (!session) return;
     session.runningTaskIds.delete(taskId);
@@ -650,10 +694,91 @@ export class Bot {
     let running: RunningTask | null = null;
     for (const taskId of session.runningTaskIds) {
       const task = this.activeTasks.get(taskId);
-      if (!task) continue;
+      if (!task || task.status !== 'running') continue;
       if (!running || task.startedAt < running.startedAt) running = task;
     }
     return running;
+  }
+
+  protected markTaskRunning(taskId: string, abort?: (() => void) | null): RunningTask | null {
+    const task = this.activeTasks.get(taskId);
+    if (!task) return null;
+    if (task.cancelled) return task;
+    task.status = 'running';
+    task.abort = abort || null;
+    return task;
+  }
+
+  protected registerTaskPlaceholders(taskId: string, messageIds: Array<number | string | null | undefined>) {
+    const task = this.activeTasks.get(taskId);
+    if (!task) return;
+    if (!task.placeholderMessageIds) task.placeholderMessageIds = [];
+    for (const messageId of messageIds) {
+      if (messageId == null) continue;
+      if (!task.placeholderMessageIds.includes(messageId)) task.placeholderMessageIds.push(messageId);
+    }
+  }
+
+  protected isSourceMessageWithdrawn(chatId: ChatId, sourceMessageId: number | string): boolean {
+    return this.withdrawnSourceMessages.has(this.sourceMessageKey(chatId, sourceMessageId));
+  }
+
+  protected actionIdForTask(taskId: string): string | null {
+    return this.activeTasks.get(taskId)?.actionId || null;
+  }
+
+  protected withdrawQueuedTaskBySourceMessage(chatId: ChatId, sourceMessageId: number | string): RunningTask | null {
+    const sourceKey = this.sourceMessageKey(chatId, sourceMessageId);
+    this.withdrawnSourceMessages.add(sourceKey);
+    const taskId = this.taskKeysBySourceMessage.get(sourceKey);
+    if (!taskId) return null;
+    const task = this.activeTasks.get(taskId);
+    if (!task || task.status !== 'queued') return null;
+    task.cancelled = true;
+    return task;
+  }
+
+  protected stopTasksForSession(sessionKey: string | null | undefined): { interrupted: boolean; cancelledQueued: number } {
+    const session = this.getSessionRuntimeByKey(sessionKey, { allowAnyWorkdir: true });
+    if (!session) return { interrupted: false, cancelledQueued: 0 };
+    let interrupted = false;
+    let cancelledQueued = 0;
+    for (const taskId of session.runningTaskIds) {
+      const task = this.activeTasks.get(taskId);
+      if (!task) continue;
+      if (task.status === 'queued') {
+        if (!task.cancelled) {
+          task.cancelled = true;
+          cancelledQueued++;
+        }
+        continue;
+      }
+      if (!interrupted && task.status === 'running') {
+        interrupted = true;
+        try { task.abort?.(); } catch {}
+      }
+    }
+    return { interrupted, cancelledQueued };
+  }
+
+  protected stopTaskByActionId(actionId: string): { task: RunningTask | null; interrupted: boolean; cancelled: boolean } {
+    const taskId = this.taskKeysByActionId.get(String(actionId));
+    if (!taskId) return { task: null, interrupted: false, cancelled: false };
+    const task = this.activeTasks.get(taskId) || null;
+    if (!task) return { task: null, interrupted: false, cancelled: false };
+    if (task.status === 'queued') {
+      task.cancelled = true;
+      return { task, interrupted: false, cancelled: true };
+    }
+    if (task.status === 'running') {
+      try { task.abort?.(); } catch {}
+      return { task, interrupted: true, cancelled: false };
+    }
+    return { task, interrupted: false, cancelled: false };
+  }
+
+  private sourceMessageKey(chatId: ChatId, sourceMessageId: number | string): string {
+    return `${String(chatId)}:${String(sourceMessageId)}`;
   }
 
   protected queueSessionTask<T>(session: SessionRuntime, task: () => Promise<T>): Promise<T> {
@@ -869,6 +994,7 @@ export class Bot {
     onText: (text: string, thinking: string, activity?: string, meta?: StreamPreviewMeta, plan?: StreamPreviewPlan | null) => void,
     systemPrompt?: string,
     mcpSendFile?: import('./mcp-bridge.js').McpSendFileCallback,
+    abortSignal?: AbortSignal,
   ): Promise<StreamResult> {
     const resolvedModel = cs.modelId || this.modelForAgent(cs.agent);
     const agentConfig = this.agentConfigs[cs.agent] || {};
@@ -902,6 +1028,7 @@ export class Bot {
       geminiExtraArgs: this.geminiExtraArgs.length ? this.geminiExtraArgs : undefined,
       // MCP bridge
       mcpSendFile,
+      abortSignal,
     };
     const result = await doStream(opts);
     this.stats.totalTurns++;

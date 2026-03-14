@@ -137,6 +137,7 @@ export class CodexAppServer {
     terminateProcessTree(this.proc, { signal: 'SIGTERM', forceSignal: 'SIGKILL', forceAfterMs: 2000 });
     this.proc = null;
     this.ready = false;
+    for (const cb of this.pending.values()) cb({ error: { message: 'app-server terminated' } });
     this.pending.clear();
     this.notificationHandlers.clear();
   }
@@ -310,7 +311,9 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
   const start = Date.now();
   const srv = new CodexAppServer();
   let timedOut = false;
+  let interrupted = false;
   let unsubscribeNotifications = () => {};
+  let settleTurnDone: (() => void) | null = null;
 
   try {
     const config: string[] = [];
@@ -389,12 +392,19 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     const input = buildCodexTurnInput(opts.prompt, opts.attachments || []);
 
     const turnDone = new Promise<void>((resolve) => {
+      let settled = false;
+      settleTurnDone = () => {
+        if (settled) return;
+        settled = true;
+        settleTurnDone = null;
+        resolve();
+      };
       const deadline = start + opts.timeout * 1000;
       const hardTimer = setTimeout(() => {
         timedOut = true;
         agentLog(`[codex-rpc] timeout: interrupting turn`);
         if (s.turnId && s.sessionId) srv.call('turn/interrupt', { threadId: s.sessionId, turnId: s.turnId }).catch(() => {});
-        resolve();
+        settleTurnDone?.();
       }, opts.timeout * 1000 + 5_000);
 
       const emit = () => {
@@ -501,7 +511,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
           if (turn.error) s.turnError = turn.error.message || turn.error.code || JSON.stringify(turn.error);
           s.turnId = turn.id ?? s.turnId;
           clearTimeout(hardTimer);
-          resolve();
+          settleTurnDone?.();
         }
 
         if (method === 'turn/started' && params.threadId === s.sessionId) s.turnId = params.turn?.id ?? null;
@@ -509,6 +519,20 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
       };
       unsubscribeNotifications = srv.onNotification(handleNotification);
     });
+    const abortStream = () => {
+      if (interrupted) return;
+      interrupted = true;
+      s.turnStatus = s.turnStatus || 'interrupted';
+      s.turnError = s.turnError || 'Interrupted by user.';
+      agentLog(`[codex-rpc] abort requested thread=${s.sessionId || '?'} turn=${s.turnId || '?'}`);
+      if (s.turnId && s.sessionId) {
+        srv.call('turn/interrupt', { threadId: s.sessionId, turnId: s.turnId }).catch(() => {});
+      }
+      srv.kill();
+      settleTurnDone?.();
+    };
+    if (opts.abortSignal?.aborted) abortStream();
+    opts.abortSignal?.addEventListener('abort', abortStream, { once: true });
 
     // Log equivalent CLI command for reproducibility
     const cliParts = ['codex'];
@@ -529,6 +553,7 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     });
 
     if (turnResp.error) {
+      opts.abortSignal?.removeEventListener('abort', abortStream);
       unsubscribeNotifications();
       const errMsg = turnResp.error.message || 'turn/start failed';
       agentLog(`[codex-rpc] turn/start error: ${errMsg}`);
@@ -545,16 +570,18 @@ export async function doCodexStream(opts: StreamOpts): Promise<StreamResult> {
     s.turnId = turnResp.result?.turn?.id ?? null;
 
     await turnDone;
+    opts.abortSignal?.removeEventListener('abort', abortStream);
     unsubscribeNotifications();
 
     if (!s.text.trim() && s.msgs.length) s.text = s.msgs.join('\n\n');
     if (!s.thinking.trim() && s.thinkParts.length) s.thinking = s.thinkParts.join('\n\n');
 
-    const ok = s.turnStatus === 'completed' && !timedOut;
+    const ok = s.turnStatus === 'completed' && !timedOut && !interrupted;
     const error = s.turnError
+      || (interrupted ? 'Interrupted by user.' : null)
       || (timedOut ? `Timed out after ${opts.timeout}s waiting for turn completion.` : null)
       || (!ok ? `Turn ${s.turnStatus || 'unknown'}.` : null);
-    const stopReason = timedOut ? 'timeout' : (s.turnStatus === 'interrupted' ? 'interrupted' : null);
+    const stopReason = timedOut ? 'timeout' : ((interrupted || s.turnStatus === 'interrupted') ? 'interrupted' : null);
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     agentLog(`[codex-rpc] result: ok=${ok} elapsed=${elapsed}s text=${s.text.length}chars session=${s.sessionId} status=${s.turnStatus}`);
 

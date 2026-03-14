@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildStreamingBodyMarkdown, buildStreamPreviewMarkdown } from '../src/bot-feishu-render.ts';
+import { adaptMarkdownForFeishu, buildStreamingBodyMarkdown, buildStreamPreviewMarkdown } from '../src/bot-feishu-render.ts';
 
 describe('Feishu streaming preview render', () => {
   const input = {
@@ -35,5 +35,30 @@ describe('Feishu streaming preview render', () => {
     expect(markdown).toContain('**Activity**');
     expect(markdown).toContain('Final answer in progress.');
     expect(markdown).toContain('● codex · 42% · 12s');
+  });
+});
+
+describe('adaptMarkdownForFeishu', () => {
+  it('normalizes headings, tables, anchors, and extra blank lines', () => {
+    const markdown = adaptMarkdownForFeishu(`
+
+# Title
+
+| Name | Value |
+| --- | --- |
+| foo | bar |
+
+### Details
+
+[Jump](#details)
+`);
+
+    expect(markdown.startsWith('\n')).toBe(false);
+    expect(markdown).toContain('**Title**');
+    expect(markdown).toContain('**foo** bar');
+    expect(markdown).toContain('**Details**');
+    expect(markdown).toContain('Jump');
+    expect(markdown).not.toContain('[Jump](#details)');
+    expect(markdown).not.toContain('\n\n\n');
   });
 });
