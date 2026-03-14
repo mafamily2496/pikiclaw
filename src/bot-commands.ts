@@ -11,12 +11,13 @@
 
 import path from 'node:path';
 import type { Bot, ChatId, Agent, SessionRuntime, ChatState, StreamResult } from './bot.js';
-import { VERSION, fmtTokens, fmtUptime, fmtBytes } from './bot.js';
+import { fmtTokens, fmtUptime, fmtBytes } from './bot.js';
 import { getProjectSkillPaths } from './code-agent.js';
 import { getDriver } from './agent-driver.js';
 import { buildWelcomeIntro, buildDefaultMenuCommands, buildSkillCommandName, indexSkillsByCommand, SKILL_CMD_PREFIX } from './bot-menu.js';
 import { summarizePromptForStatus } from './bot-streaming.js';
 import { getSessionStatusForChat } from './session-status.js';
+import { VERSION } from './version.js';
 
 // ---------------------------------------------------------------------------
 // Welcome / Start

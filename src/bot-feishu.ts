@@ -11,7 +11,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  Bot, VERSION, normalizeAgent, type Agent, type SessionRuntime, type StreamResult,
+  Bot, normalizeAgent, type Agent, type SessionRuntime, type StreamResult,
   fmtTokens, buildPrompt,
   parseAllowedChatIds,
 } from './bot.js';
@@ -66,6 +66,7 @@ import {
 import { FeishuChannel, type FeishuContext, type FeishuCallbackContext, type FeishuMessage } from './channel-feishu.js';
 import { splitText, supportsChannelCapability } from './channel-base.js';
 import { getActiveUserConfig } from './user-config.js';
+import { VERSION } from './version.js';
 
 type ShutdownSignal = 'SIGINT' | 'SIGTERM';
 

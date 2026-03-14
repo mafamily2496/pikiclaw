@@ -5,7 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { VERSION, envBool } from './bot.js';
+import { envBool } from './bot.js';
 import { TelegramBot } from './bot-telegram.js';
 import { hasConfiguredChannelToken, resolveConfiguredChannels } from './cli-channels.js';
 import { listAgents } from './code-agent.js';
@@ -21,6 +21,7 @@ import {
 } from './process-control.js';
 import { runSetupWizard } from './setup-wizard.js';
 import { applyUserConfig, loadUserConfig, startUserConfigSync, type ChannelName, type UserConfig } from './user-config.js';
+import { VERSION } from './version.js';
 
 /* ── Daemon (watchdog) mode ─────────────────────────────────────────── */
 

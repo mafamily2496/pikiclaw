@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
-  Bot, VERSION, type Agent, type SessionRuntime, type StreamResult,
+  Bot, type Agent, type SessionRuntime, type StreamResult,
   fmtTokens, fmtUptime, fmtBytes, buildPrompt,
   parseAllowedChatIds,
 } from './bot.js';
@@ -68,6 +68,7 @@ import {
 import { TelegramChannel, type TgContext, type TgCallbackContext, type TgMessage } from './channel-telegram.js';
 import { splitText, supportsChannelCapability } from './channel-base.js';
 import { getActiveUserConfig } from './user-config.js';
+import { VERSION } from './version.js';
 
 
 /** Telegram HTML renderer for LivePreview. */

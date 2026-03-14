@@ -10,11 +10,24 @@ cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
 # ── 1. Bump patch version ────────────────────────────────────────────────────
 
-OLD_VERSION=$(node -p "require('./package.json').version")
-IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
+# Prefer the highest known release tag over package.json so stale local version
+# files do not collide with an already-published tag.
+git fetch --tags origin --quiet || true
+
+PACKAGE_VERSION=$(node -p "require('./package.json').version")
+LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1 || true)
+LATEST_TAG_VERSION=${LATEST_TAG#v}
+BASE_VERSION=$(node -e "
+  const versions = process.argv.slice(1).filter(Boolean);
+  const parsed = versions.map((value) => value.split('.').map(Number));
+  parsed.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
+  const [major, minor, patch] = parsed.at(-1);
+  process.stdout.write(\`\${major}.\${minor}.\${patch}\`);
+" "$PACKAGE_VERSION" "$LATEST_TAG_VERSION")
+IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
 NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
 
-echo "▸ Bumping version: $OLD_VERSION → $NEW_VERSION"
+echo "▸ Bumping version: $BASE_VERSION → $NEW_VERSION"
 
 # Update package.json
 node -e "
@@ -27,10 +40,7 @@ node -e "
 # Keep the lockfile version in sync so CI's npm ci installs the release version.
 npm install --package-lock-only --ignore-scripts
 
-# Update VERSION constant in src/bot.ts
-sed -i '' "s/export const VERSION = '${OLD_VERSION}'/export const VERSION = '${NEW_VERSION}'/" src/bot.ts
-
-echo "  ✓ package.json, package-lock.json, and src/bot.ts updated"
+echo "  ✓ package.json and package-lock.json updated"
 
 # ── 2. Build & local install ─────────────────────────────────────────────────
 

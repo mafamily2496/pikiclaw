@@ -14,7 +14,7 @@ import { loadUserConfig, saveUserConfig, applyUserConfig, resolveUserWorkdir, se
 import { listAgents, getSessionTail, getSessions, listModels, type AgentDetectOptions, type SessionInfo, type SessionListResult, type UsageResult } from './code-agent.js';
 import type { Agent } from './code-agent.js';
 import { getDriver } from './agent-driver.js';
-import { VERSION, type Bot } from './bot.js';
+import type { Bot } from './bot.js';
 import { validateFeishuConfig, validateTelegramConfig } from './config-validation.js';
 import { getDashboardHtml } from './dashboard-ui.js';
 import { shouldCacheChannelStates } from './channel-states.js';
@@ -25,6 +25,7 @@ import {
   requestProcessRestart,
 } from './process-control.js';
 import { getSessionStatusForBot } from './session-status.js';
+import { VERSION } from './version.js';
 
 // ---------------------------------------------------------------------------
 // Types

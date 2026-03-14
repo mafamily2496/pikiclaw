@@ -8,10 +8,11 @@
  *   npm run command -- codex-models
  */
 
-import { VERSION, ensureGitignore, formatThinkingForDisplay } from './bot.js';
+import { ensureGitignore, formatThinkingForDisplay } from './bot.js';
 import { initializeProjectSkills, listAgents, listModels, listSkills, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
 import type { Agent, StreamOpts } from './code-agent.js';
 import { loadUserConfig, resolveUserWorkdir } from './user-config.js';
+import { VERSION } from './version.js';
 
 function parseArgs(argv: string[]) {
   const args: Record<string, any> = {
