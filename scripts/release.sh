@@ -26,6 +26,7 @@ BASE_VERSION=$(node -e "
 " "$PACKAGE_VERSION" "$LATEST_TAG_VERSION")
 IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
 NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+NEW_TAG="v${NEW_VERSION}"
 
 echo "▸ Bumping version: $BASE_VERSION → $NEW_VERSION"
 
@@ -63,16 +64,29 @@ echo "  ✓ Verified: $INSTALLED"
 echo "▸ Committing…"
 git add -A
 git commit -m "chore: release v${NEW_VERSION}"
-git tag "v${NEW_VERSION}"
+git tag "$NEW_TAG"
 
 echo "▸ Pushing…"
-git push origin main --tags
+git push origin main "$NEW_TAG"
 
 # ── 4. Wait for CI ───────────────────────────────────────────────────────────
 
 echo "▸ Waiting for Release workflow…"
-gh run list --workflow=release.yml --limit 1 --json databaseId,status -q '.[0].databaseId' \
-  | xargs -I{} gh run watch {} --exit-status
+RUN_ID=""
+for _ in $(seq 1 30); do
+  RUN_ID=$(gh run list --workflow=release.yml --branch "$NEW_TAG" --limit 1 --json databaseId -q '.[0].databaseId')
+  if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+    break
+  fi
+  sleep 2
+done
+
+if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+  echo "✗ Could not find Release workflow run for ${NEW_TAG}" >&2
+  exit 1
+fi
+
+gh run watch "$RUN_ID" --exit-status
 
 echo ""
 echo "✓ v${NEW_VERSION} released successfully!"
