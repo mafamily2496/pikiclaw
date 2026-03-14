@@ -22,6 +22,7 @@ function createTestChannel() {
 
   const createCalls: any[] = [];
   const patchCalls: any[] = [];
+  const requestCalls: any[] = [];
 
   (ch as any).client = {
     im: {
@@ -40,10 +41,16 @@ function createTestChannel() {
       file: { create: vi.fn() },
       messageResource: { get: vi.fn() },
     },
-    request: vi.fn(async () => ({ data: {} })),
+    request: vi.fn(async (payload: any) => {
+      requestCalls.push(payload);
+      if (payload?.method === 'POST' && payload?.url === '/open-apis/cardkit/v1/cards') {
+        return { data: { card_id: `card-${requestCalls.length}` } };
+      }
+      return { data: {} };
+    }),
   };
 
-  return { ch, createCalls, patchCalls };
+  return { ch, createCalls, patchCalls, requestCalls };
 }
 
 afterEach(() => {
@@ -141,6 +148,48 @@ describe('FeishuChannel cards', () => {
       expect(wsClose).toHaveBeenCalled();
       expect(sleepSpy).toHaveBeenCalled();
     }
+  });
+});
+
+describe('FeishuChannel streaming cards', () => {
+  it('streams append-only body content and falls back to regular edits when content rewrites', async () => {
+    const { ch, createCalls, patchCalls, requestCalls } = createTestChannel();
+
+    expect(await ch.sendStreamingCard('chat-1', '● codex · 0s')).toBe('msg-1');
+
+    const createCardReq = requestCalls.find(call => call.method === 'POST' && call.url === '/open-apis/cardkit/v1/cards');
+    expect(createCardReq).toBeTruthy();
+
+    const cardJson = JSON.parse(createCardReq.data.data);
+    expect(cardJson.body.elements).toEqual([
+      { tag: 'markdown', content: '● codex · 0s', element_id: 'status' },
+      { tag: 'markdown', content: '', element_id: 'content' },
+    ]);
+
+    expect(createCalls).toHaveLength(1);
+    expect(JSON.parse(createCalls[0].data.content)).toEqual({ type: 'card', data: { card_id: 'card-1' } });
+
+    await ch.editMessage('chat-1', 'msg-1', 'hello');
+    const pushReq = requestCalls.find(call =>
+      call.method === 'PUT' &&
+      call.url === '/open-apis/cardkit/v1/cards/card-1/elements/content/content',
+    );
+    expect(pushReq?.data).toEqual({ content: 'hello', sequence: 2 });
+
+    await ch.editMessage('chat-1', 'msg-1', 'rewritten output');
+
+    const endReq = requestCalls.find(call =>
+      call.method === 'PATCH' &&
+      call.url === '/open-apis/cardkit/v1/cards/card-1/settings',
+    );
+    expect(endReq?.data.sequence).toBe(3);
+    const updateReq = requestCalls.find(call =>
+      call.method === 'PUT' &&
+      call.url === '/open-apis/cardkit/v1/cards/card-1' &&
+      call.data?.card?.type === 'card_json',
+    );
+    expect(updateReq).toBeTruthy();
+    expect(patchCalls).toHaveLength(0);
   });
 });
 

@@ -247,6 +247,20 @@ function buildCard(markdown: string, opts?: { title?: string; template?: FeishuC
   });
 }
 
+function buildCardKitMarkdownData(markdown: string): string {
+  const content = markdown.length > FEISHU_CARD_MAX
+    ? `${markdown.slice(0, FEISHU_CARD_MAX)}\n\n...(truncated)`
+    : markdown;
+  return JSON.stringify({
+    schema: '2.0',
+    body: {
+      elements: [
+        { tag: 'markdown', content },
+      ],
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // FeishuChannel
 // ---------------------------------------------------------------------------
@@ -277,8 +291,8 @@ class FeishuChannel extends Channel {
   private running = false;
   private messageChains = new Map<string, Promise<void>>();
 
-  /** Tracks CardKit streaming cards: messageId → { cardId, sequence } */
-  private cardStates = new Map<string, { cardId: string; sequence: number }>();
+  /** Tracks CardKit-backed cards: messageId → { cardId, sequence, lastContent, streaming } */
+  private cardStates = new Map<string, { cardId: string; sequence: number; lastContent: string; streaming: boolean }>();
 
   /** Maps open_id → chat_id for resolving menu event context. */
   private _openIdToChat = new Map<string, string>();
@@ -692,21 +706,36 @@ class FeishuChannel extends Channel {
   async editMessage(chatId: number | string, msgId: number | string, text: string, opts: SendOpts = {}): Promise<void> {
     if (!text.trim()) return;
 
-    // If this message has a CardKit streaming card, push content via CardKit API
     const cardState = this.cardStates.get(String(msgId));
-    if (cardState) {
-      cardState.sequence++;
-      const content = text.length > FEISHU_CARD_MAX ? text.slice(-FEISHU_CARD_MAX) : text;
-      this._logOutgoing('stream-push', `card=${cardState.cardId} seq=${cardState.sequence} chars=${content.length}`);
-      try {
-        await this.client.request({
-          method: 'PUT',
-          url: `/open-apis/cardkit/v1/cards/${cardState.cardId}/elements/content/content`,
-          data: { content, sequence: cardState.sequence },
-        });
-      } catch (e: any) {
-        this._log(`[edit] CardKit push error: ${e?.message || e}`);
+    if (cardState?.streaming) {
+      if (cardState.lastContent && !text.startsWith(cardState.lastContent)) {
+        this._log(`[edit] CardKit preview lost append-only shape for msg=${msgId}; switching to regular card edits`);
+        await this.endStreaming(String(msgId), 'Streaming preview stabilized.');
+        await this.updateCardKitMessage(String(msgId), text);
+        return;
+      } else if (text.length > FEISHU_CARD_MAX) {
+        this._log(`[edit] CardKit preview length cap reached for msg=${msgId}; switching to regular card edits`);
+        await this.endStreaming(String(msgId), 'Preview truncated.');
+        await this.updateCardKitMessage(String(msgId), text);
+        return;
+      } else {
+        cardState.sequence++;
+        cardState.lastContent = text;
+        this._logOutgoing('stream-push', `card=${cardState.cardId} seq=${cardState.sequence} chars=${text.length}`);
+        try {
+          await this.client.request({
+            method: 'PUT',
+            url: `/open-apis/cardkit/v1/cards/${cardState.cardId}/elements/content/content`,
+            data: { content: text, sequence: cardState.sequence },
+          });
+        } catch (e: any) {
+          this._log(`[edit] CardKit push error: ${e?.message || e}`);
+        }
+        return;
       }
+    }
+    if (cardState) {
+      await this.updateCardKitMessage(String(msgId), text);
       return;
     }
 
@@ -719,6 +748,7 @@ class FeishuChannel extends Channel {
   }
 
   async deleteMessage(_chatId: number | string, msgId: number | string): Promise<void> {
+    this.cardStates.delete(String(msgId));
     try {
       await this.client.im.message.delete({
         path: { message_id: String(msgId) },
@@ -754,7 +784,8 @@ class FeishuChannel extends Channel {
       },
       body: {
         elements: [
-          { tag: 'markdown', content: initialContent || 'Thinking...', element_id: 'content' },
+          { tag: 'markdown', content: initialContent || 'Generating...', element_id: 'status' },
+          { tag: 'markdown', content: '', element_id: 'content' },
         ],
       },
     };
@@ -798,7 +829,7 @@ class FeishuChannel extends Channel {
       if (!messageId) throw new Error('no message_id returned');
 
       // Track streaming state — editMessage() will use CardKit for this messageId
-      this.cardStates.set(messageId, { cardId, sequence: 1 });
+      this.cardStates.set(messageId, { cardId, sequence: 1, lastContent: '', streaming: true });
       return messageId;
     } catch (e: any) {
       this._log(`[streaming] send card message failed: ${e?.message || e}`);
@@ -808,12 +839,12 @@ class FeishuChannel extends Channel {
 
   /** Check if a message is currently a streaming card (CardKit v2). */
   isStreamingCard(messageId: string): boolean {
-    return this.cardStates.has(messageId);
+    return this.cardStates.get(messageId)?.streaming === true;
   }
 
   /**
-   * End streaming mode on a card and finalize it.
-   * After this, `editMessage()` falls through to the regular PATCH path.
+   * End streaming mode on a CardKit card.
+   * Subsequent edits still use CardKit full-card updates for reliability.
    */
   async endStreaming(messageId: string, summary?: string): Promise<void> {
     const state = this.cardStates.get(messageId);
@@ -840,9 +871,28 @@ class FeishuChannel extends Channel {
     } catch (e: any) {
       this._log(`[streaming] end streaming error: ${e?.message || e}`);
     }
+    state.streaming = false;
+    state.lastContent = '';
+  }
 
-    // Remove tracking — subsequent editMessage calls use regular PATCH
-    this.cardStates.delete(messageId);
+  private async updateCardKitMessage(messageId: string, text: string): Promise<void> {
+    const state = this.cardStates.get(messageId);
+    if (!state) throw new Error(`CardKit state missing for message ${messageId}`);
+
+    state.sequence++;
+    state.lastContent = text;
+    this._logOutgoing('card-update', `card=${state.cardId} seq=${state.sequence} chars=${text.length}`);
+    await this.client.request({
+      method: 'PUT',
+      url: `/open-apis/cardkit/v1/cards/${state.cardId}`,
+      data: {
+        card: {
+          type: 'card_json',
+          data: buildCardKitMarkdownData(text),
+        },
+        sequence: state.sequence,
+      },
+    });
   }
 
   // ========================================================================

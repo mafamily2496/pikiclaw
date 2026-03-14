@@ -199,6 +199,12 @@ export function buildInitialPreviewMarkdown(agent: Agent): string {
   return formatPreviewFooter(agent, 0);
 }
 
+export function buildStreamingBodyMarkdown(input: StreamPreviewRenderInput): string {
+  // CardKit streaming content works best when each update is append-only.
+  // Stream only the assistant/body text here; status stays in a separate card element.
+  return input.bodyText;
+}
+
 export function buildStreamPreviewMarkdown(input: StreamPreviewRenderInput): string {
   const maxBody = 2400;
   const display = input.bodyText.trim();
@@ -236,6 +242,11 @@ export function buildStreamPreviewMarkdown(input: StreamPreviewRenderInput): str
 export const feishuPreviewRenderer: LivePreviewRenderer = {
   renderInitial: buildInitialPreviewMarkdown,
   renderStream: buildStreamPreviewMarkdown,
+};
+
+export const feishuStreamingPreviewRenderer: LivePreviewRenderer = {
+  renderInitial: () => '',
+  renderStream: buildStreamingBodyMarkdown,
 };
 
 // ---------------------------------------------------------------------------

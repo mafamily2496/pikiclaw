@@ -52,6 +52,7 @@ import {
 } from './process-control.js';
 import {
   feishuPreviewRenderer,
+  feishuStreamingPreviewRenderer,
   buildInitialPreviewMarkdown,
   buildFinalReplyRender,
   renderCommandNotice,
@@ -491,11 +492,11 @@ export class FeishuBot extends Bot {
     const start = Date.now();
     this.log(`[handleMessage] queued chat=${ctx.chatId} agent=${session.agent} session=${session.sessionId || '(new)'} prompt="${prompt.slice(0, 100)}" files=${files.length}`);
 
-    // Send streaming card (CardKit typewriter effect) or fall back to regular card
     const placeholderId = await this.channel.sendStreamingCard(ctx.chatId, buildInitialPreviewMarkdown(session.agent), { replyTo: ctx.messageId || undefined });
+    const useStreamingPreview = !!placeholderId && this.channel.isStreamingCard(placeholderId);
     if (placeholderId) {
       this.registerSessionMessage(ctx.chatId, placeholderId, session);
-      this.log(`[handleMessage] streaming card sent msg_id=${placeholderId}`);
+      this.log(`[handleMessage] ${useStreamingPreview ? 'streaming' : 'preview'} card sent msg_id=${placeholderId}`);
     }
 
     const taskId = this.createTaskId(session);
@@ -518,8 +519,8 @@ export class FeishuBot extends Bot {
             chatId: ctx.chatId,
             placeholderMessageId: placeholderId,
             channel: this.channel,
-            renderer: feishuPreviewRenderer,
-            streamEditIntervalMs: 300,  // CardKit streaming cards handle frequent updates well
+            renderer: useStreamingPreview ? feishuStreamingPreviewRenderer : feishuPreviewRenderer,
+            streamEditIntervalMs: useStreamingPreview ? 350 : 700,
             startTimeMs: start,
             canEditMessages: supportsChannelCapability(this.channel, 'editMessages'),
             canSendTyping: false,
@@ -542,9 +543,6 @@ export class FeishuBot extends Bot {
           `tokens=in:${fmtTokens(result.inputTokens)}/out:${fmtTokens(result.outputTokens)}`,
         );
 
-        // For streaming cards: push final content via CardKit before ending stream,
-        // then send any overflow chunks as new messages.
-        // Regular cards: edit placeholder with final content as before.
         const wasStreaming = placeholderId && this.channel.isStreamingCard(placeholderId);
         let finalReplyIds: string[];
         if (wasStreaming) {
@@ -561,11 +559,10 @@ export class FeishuBot extends Bot {
         const errorText = `**Error**\n\n\`${msgText.slice(0, 500)}\``;
         if (placeholderId) {
           try {
-            await this.channel.editMessage(ctx.chatId, placeholderId, errorText);
-            // End streaming if this was a streaming card
             if (this.channel.isStreamingCard(placeholderId)) {
               await this.channel.endStreaming(placeholderId, 'Error');
             }
+            await this.channel.editMessage(ctx.chatId, placeholderId, errorText);
           } catch {
             await this.channel.send(ctx.chatId, errorText).catch(() => null);
           }
@@ -584,10 +581,8 @@ export class FeishuBot extends Bot {
   }
 
   /**
-   * Finalize a streaming card: push final content via CardKit, end streaming,
-   * then send any overflow chunks as new messages.
-   * This avoids the "schemaV2 card can not change schemaV1" error that occurs
-   * when trying to PATCH a CardKit v2 card with a v1 interactive card.
+   * Finalize a streaming card by closing CardKit streaming mode first, then
+   * replacing the card body with the complete final render.
    */
   private async finalizeStreamingCard(
     ctx: FeishuContext,
@@ -617,12 +612,9 @@ export class FeishuBot extends Bot {
       }
     }
 
-    // Push final content while card is still in streaming mode (CardKit v2 API)
-    await this.channel.editMessage(ctx.chatId, placeholderId, firstText);
-
-    // Finalize the streaming card
     const summary = result.message.slice(0, 80).replace(/\s+/g, ' ').trim() || 'Response complete.';
     await this.channel.endStreaming(placeholderId, summary);
+    await this.channel.editMessage(ctx.chatId, placeholderId, firstText);
 
     // Send overflow chunks as new messages
     if (remaining.trim()) {
