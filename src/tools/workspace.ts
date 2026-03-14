@@ -8,16 +8,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import os from 'node:os';
 import type { McpToolModule, ToolContext, ToolResult } from './types.js';
 import { toolResult, toolLog } from './types.js';
-
-interface SendFileCallbackResult {
-  ok: boolean;
-  error?: string;
-  statusCode?: number;
-  statusMessage?: string;
-  bodyPreview?: string;
-}
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -45,11 +38,11 @@ const tools: McpToolModule['tools'] = [
       properties: {
         path: {
           type: 'string',
-          description: 'Absolute, workspace-relative, or workdir-relative path.',
+          description: 'Path to send. Supports absolute paths, @workspace/..., @workdir/..., @tmp/..., workspace-relative paths, and unique bare filenames.',
         },
         caption: {
           type: 'string',
-          description: 'Optional caption.',
+          description: 'Caption.',
         },
         kind: {
           type: 'string',
@@ -57,7 +50,7 @@ const tools: McpToolModule['tools'] = [
           description: 'Optional file kind.',
         },
       },
-      required: ['path'],
+      required: ['path', 'caption'],
     },
   },
 ];
@@ -81,8 +74,14 @@ function handleListFiles(args: Record<string, unknown>, ctx: ToolContext): ToolR
 
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const workspaceRelDir = path.relative(ctx.workspace, dir);
     const files = entries.map(e => {
       const entry: Record<string, unknown> = { name: e.name, type: e.isDirectory() ? 'directory' : 'file' };
+      const relPath = workspaceRelDir && workspaceRelDir !== '' && workspaceRelDir !== '.'
+        ? path.posix.join(toPosix(workspaceRelDir), e.name)
+        : e.name;
+      entry.path = relPath;
+      entry.alias = `@workspace/${relPath}`;
       if (e.isFile()) {
         try { entry.size = fs.statSync(path.join(dir, e.name)).size; } catch {}
       }
@@ -91,7 +90,24 @@ function handleListFiles(args: Record<string, unknown>, ctx: ToolContext): ToolR
     toolLog('im_list_files', `OK ${files.length} entries`);
     return toolResult(JSON.stringify({
       workspacePath: ctx.workspace,
-      stagedFiles: ctx.stagedFiles,
+      workdirPath: ctx.workdir || null,
+      tempPath: os.tmpdir(),
+      pathAliases: {
+        workspaceRoot: '@workspace',
+        workdirRoot: ctx.workdir ? '@workdir' : null,
+        tempRoot: '@tmp',
+        notes: [
+          'Use @workspace/... for files in the session workspace.',
+          ctx.workdir ? 'Use @workdir/... for files in the agent workdir.' : null,
+          'Use @tmp/... for screenshots and other temp files.',
+          'A bare filename also works if it uniquely matches a staged file or /tmp file.',
+        ].filter(Boolean),
+      },
+      stagedFiles: ctx.stagedFiles.map(relPath => ({
+        path: relPath,
+        alias: `@workspace/${toPosix(relPath)}`,
+        basename: path.basename(relPath),
+      })),
       files,
     }, null, 2));
   } catch (e: any) {
@@ -102,29 +118,28 @@ function handleListFiles(args: Record<string, unknown>, ctx: ToolContext): ToolR
 
 async function handleSendFile(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const filePath = typeof args?.path === 'string' ? args.path.trim() : '';
+  const caption = typeof args?.caption === 'string' ? args.caption.trim() : '';
   const kind = typeof args?.kind === 'string' ? args.kind : undefined;
+  toolLog('im_send_file', `path=${filePath} kind=${kind || 'auto'}`);
   if (!filePath) { toolLog('im_send_file', 'ERROR missing path'); return toolResult('Error: "path" is required', true); }
+  if (!caption) { toolLog('im_send_file', 'ERROR missing caption'); return toolResult('Error: "caption" is required', true); }
   if (!ctx.callbackUrl) { toolLog('im_send_file', 'ERROR no callback URL'); return toolResult('Error: MCP callback URL is not configured', true); }
-  const callbackTarget = describeSendFileTarget(ctx.callbackUrl);
-  toolLog('im_send_file', `path=${filePath} kind=${kind || 'auto'} callback=${callbackTarget}`);
 
   try {
     const result = await callbackSendFile(ctx.callbackUrl, filePath, {
-      caption: typeof args?.caption === 'string' ? args.caption : undefined,
+      caption,
       kind,
     });
     if (result.ok) {
       toolLog('im_send_file', `OK sent ${filePath}`);
       return toolResult(`File sent successfully: ${filePath}`);
     } else {
-      const detail = formatSendFileFailure(result);
-      toolLog('im_send_file', `FAILED ${detail}`);
-      return toolResult(`Failed to send file: ${detail}`, true);
+      toolLog('im_send_file', `FAILED ${result.error || 'unknown error'}`);
+      return toolResult(`Failed to send file: ${result.error || 'unknown error'}`, true);
     }
   } catch (e: any) {
-    const message = e instanceof Error ? e.message : String(e);
-    toolLog('im_send_file', `ERROR callback=${callbackTarget} ${message}`);
-    return toolResult(`Error sending file: ${message}`, true);
+    toolLog('im_send_file', `ERROR ${e.message}`);
+    return toolResult(`Error sending file: ${e.message}`, true);
   }
 }
 
@@ -136,7 +151,7 @@ function callbackSendFile(
   callbackUrl: string,
   filePath: string,
   opts: { caption?: string; kind?: string },
-): Promise<SendFileCallbackResult> {
+): Promise<{ ok: boolean; error?: string }> {
   const body = JSON.stringify({ path: filePath, ...opts });
   const url = new URL('/send-file', callbackUrl);
 
@@ -148,48 +163,9 @@ function callbackSendFile(
       let data = '';
       res.on('data', (chunk: Buffer) => { data += chunk; });
       res.on('end', () => {
-        const statusCode = res.statusCode;
-        const statusMessage = res.statusMessage || undefined;
-        const bodyPreview = data ? previewText(data) : undefined;
-
-        let parsed: Record<string, unknown> | null = null;
-        try {
-          parsed = data ? JSON.parse(data) as Record<string, unknown> : null;
-        } catch {}
-
-        if (statusCode && statusCode >= 400) {
-          const parsedError = typeof parsed?.error === 'string' ? parsed.error : null;
-          resolve({
-            ok: false,
-            error: parsedError || describeHttpFailure(statusCode, statusMessage, bodyPreview),
-            statusCode,
-            statusMessage,
-            bodyPreview,
-          });
-          return;
-        }
-
-        if (parsed && typeof parsed.ok === 'boolean') {
-          resolve({
-            ok: parsed.ok,
-            error: typeof parsed.error === 'string' ? parsed.error : undefined,
-            statusCode,
-            statusMessage,
-            bodyPreview,
-          });
-          return;
-        }
-
-        resolve({
-          ok: false,
-          error: describeHttpFailure(statusCode, statusMessage, bodyPreview, 'invalid callback response'),
-          statusCode,
-          statusMessage,
-          bodyPreview,
-        });
+        try { resolve(JSON.parse(data)); } catch { resolve({ ok: false, error: 'invalid callback response' }); }
       });
     });
-    req.setTimeout(30_000, () => req.destroy(new Error('send-file callback timed out after 30s')));
     req.on('error', e => reject(e));
     req.write(body);
     req.end();
@@ -204,32 +180,8 @@ function safeRealpath(p: string): string | null {
   try { return fs.realpathSync(p); } catch { return null; }
 }
 
-function previewText(text: string, max = 400): string {
-  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  return normalized.length <= max ? normalized : `${normalized.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
-}
-
-function describeSendFileTarget(callbackUrl: string): string {
-  try {
-    const url = new URL('/send-file', callbackUrl);
-    return `${url.origin}${url.pathname}`;
-  } catch {
-    return callbackUrl;
-  }
-}
-
-function describeHttpFailure(statusCode?: number, statusMessage?: string, bodyPreview?: string, fallback = 'callback request failed'): string {
-  const status = statusCode ? `HTTP ${statusCode}${statusMessage ? ` ${statusMessage}` : ''}` : fallback;
-  return bodyPreview ? `${status}; body=${bodyPreview}` : status;
-}
-
-function formatSendFileFailure(result: SendFileCallbackResult): string {
-  const base = result.error?.trim() || describeHttpFailure(result.statusCode, result.statusMessage, result.bodyPreview, 'unknown error');
-  if (result.bodyPreview && !base.includes(result.bodyPreview)) {
-    return `${base}; body=${result.bodyPreview}`;
-  }
-  return base;
+function toPosix(p: string): string {
+  return p.split(path.sep).join(path.posix.sep);
 }
 
 // ---------------------------------------------------------------------------

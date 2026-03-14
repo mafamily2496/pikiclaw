@@ -31,6 +31,7 @@ export interface McpToolModule {
 /** Context passed to tool handlers by the MCP server. */
 export interface ToolContext {
   workspace: string;
+  workdir?: string;
   stagedFiles: string[];
   callbackUrl: string;
 }

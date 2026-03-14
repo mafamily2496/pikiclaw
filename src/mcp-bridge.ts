@@ -40,6 +40,8 @@ export type McpSendFileCallback = (
 export interface McpBridgeHandle {
   /** Path to the generated MCP config JSON — pass to agent CLI via --mcp-config. */
   configPath: string;
+  /** Whether the MCP server emitted any tool-related activity during the stream. */
+  hadActivity: () => boolean;
   /** Gracefully stop the callback server and clean up config file. */
   stop: () => Promise<void>;
 }
@@ -57,6 +59,8 @@ export interface McpBridgeOpts {
   sendFile: McpSendFileCallback;
   /** Agent type — determines how MCP server is registered. */
   agent?: string;
+  /** Optional log sink for MCP tool activity. */
+  onLog?: (message: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,30 +144,90 @@ function isInsideAllowedRoot(realFile: string, allowedRoots: string[]): boolean 
 export function resolveSendFilePath(
   inputPath: string,
   workspacePath: string,
+  stagedFiles: string[] = [],
   workdir?: string,
-): string | null {
+): { path: string | null; error?: string } {
   const requested = String(inputPath || '').trim();
-  if (!requested) return null;
-  if (path.isAbsolute(requested)) return requested;
+  if (!requested) return { path: null, error: 'path is required' };
+  if (path.isAbsolute(requested)) return { path: requested };
+
+  const roots = {
+    workspace: path.resolve(workspacePath),
+    workdir: workdir ? path.resolve(workdir) : '',
+    tmp: path.resolve(os.tmpdir()),
+  };
+
+  const aliasPrefixes: Array<{ prefix: string; root: string }> = [
+    { prefix: '@workspace/', root: roots.workspace },
+    { prefix: 'workspace:', root: roots.workspace },
+    { prefix: 'ws:', root: roots.workspace },
+    ...(roots.workdir ? [
+      { prefix: '@workdir/', root: roots.workdir },
+      { prefix: 'workdir:', root: roots.workdir },
+      { prefix: 'wd:', root: roots.workdir },
+    ] : []),
+    { prefix: '@tmp/', root: roots.tmp },
+    { prefix: 'tmp:', root: roots.tmp },
+  ];
+
+  for (const { prefix, root } of aliasPrefixes) {
+    if (!requested.startsWith(prefix)) continue;
+    const suffix = requested.slice(prefix.length).trim();
+    return { path: suffix ? path.resolve(root, suffix) : root };
+  }
 
   const candidates = [
-    path.resolve(workspacePath, requested),
-    ...(workdir ? [path.resolve(workdir, requested)] : []),
+    path.resolve(roots.workspace, requested),
+    ...(roots.workdir ? [path.resolve(roots.workdir, requested)] : []),
   ];
 
   for (const candidate of candidates) {
     try {
       fs.realpathSync(candidate);
-      return candidate;
+      return { path: candidate };
     } catch {
       // Try next candidate.
     }
   }
-  return candidates[0] || null;
+
+  if (!requested.includes('/') && !requested.includes(path.sep)) {
+    const basenameMatches = new Map<string, string>();
+    const dedupedMatches: string[] = [];
+    const addMatch = (candidate: string) => {
+      const key = path.resolve(candidate);
+      if (basenameMatches.has(key)) return;
+      basenameMatches.set(key, key);
+      dedupedMatches.push(key);
+    };
+
+    try {
+      const tmpCandidate = path.join(roots.tmp, requested);
+      if (fs.existsSync(tmpCandidate)) addMatch(tmpCandidate);
+    } catch {}
+
+    for (const relPath of stagedFiles) {
+      if (path.basename(relPath) !== requested) continue;
+      addMatch(path.join(roots.workspace, relPath));
+    }
+
+    if (dedupedMatches.length === 1) return { path: dedupedMatches[0] };
+    if (dedupedMatches.length > 1) {
+      return {
+        path: null,
+        error: `ambiguous file name "${requested}"; use @workspace/..., @workdir/..., or @tmp/...`,
+      };
+    }
+  }
+
+  return {
+    path: candidates[0] || null,
+    error: `file not found: ${requested}; try @workspace/..., @workdir/..., @tmp/..., or a unique filename`,
+  };
 }
 
 export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHandle> {
   const { sessionDir, workspacePath, stagedFiles, sendFile } = opts;
+  let hadActivity = false;
 
   // Build allowed roots: workspace + workdir + /tmp
   const allowedRoots = [workspacePath];
@@ -172,7 +236,7 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
 
   // ── HTTP callback server ──
   const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/send-file') {
+    if (req.method !== 'POST' || (req.url !== '/send-file' && req.url !== '/log')) {
       res.writeHead(404);
       res.end();
       return;
@@ -189,6 +253,18 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
     req.on('end', async () => {
       clearTimeout(bodyTimer);
       try {
+        if (req.url === '/log') {
+          const data = JSON.parse(body || '{}');
+          const message = typeof data.message === 'string' ? data.message.trim() : '';
+          if (message) {
+            hadActivity = true;
+            opts.onLog?.(message);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
         const data = JSON.parse(body);
         const relPath = String(data.path || '').trim();
         if (!relPath) {
@@ -198,11 +274,12 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
         }
 
         // Resolve and validate path
-        const absPath = resolveSendFilePath(relPath, workspacePath, opts.workdir);
+        const resolved = resolveSendFilePath(relPath, workspacePath, stagedFiles, opts.workdir);
+        const absPath = resolved.path;
         let realFile: string;
         try { realFile = fs.realpathSync(String(absPath || '')); } catch {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: `file not found: ${relPath}` }));
+          res.end(JSON.stringify({ ok: false, error: resolved.error || `file not found: ${relPath}` }));
           return;
         }
         if (!isInsideAllowedRoot(realFile, allowedRoots)) {
@@ -231,6 +308,7 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
           : 'document';
 
         const caption = typeof data.caption === 'string' ? data.caption.trim().slice(0, 1024) || undefined : undefined;
+        hadActivity = true;
 
         const result = await Promise.race([
           sendFile(realFile, { caption, kind }),
@@ -261,8 +339,10 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
   const { command, args } = resolveMcpServerCommand();
   const envVars = {
     MCP_WORKSPACE_PATH: workspacePath,
+    MCP_WORKDIR: opts.workdir || '',
     MCP_STAGED_FILES: JSON.stringify(stagedFiles),
     MCP_CALLBACK_URL: `http://127.0.0.1:${port}`,
+    MCP_LOG_URL: `http://127.0.0.1:${port}/log`,
   };
 
   let configPath = '';
@@ -296,6 +376,7 @@ export async function startMcpBridge(opts: McpBridgeOpts): Promise<McpBridgeHand
 
   return {
     configPath,
+    hadActivity: () => hadActivity,
     stop: async () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
       if (codexRegistered) {

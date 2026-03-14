@@ -1,242 +1,232 @@
 # Integrating a New IM Platform
 
-This guide explains how to add a new IM platform (e.g., Feishu/Lark, Discord, WhatsApp) to pikiclaw.
+This guide reflects the current `pikiclaw` architecture, where Telegram and Feishu already share the same core bot pipeline.
 
-## Architecture Overview
+## What Already Exists
 
-```
-cli.ts                          Entry point, dispatches to channel-specific bot
-  │
-  ├── bot-commands.ts           Shared command data layer (getStartData, getSessionsPageData, ...)
-  ├── bot-handler.ts            Generic message handling pipeline (MessagePipeline interface)
-  ├── bot.ts (Bot)              Base class: config, state, sessions, streaming, keep-alive
-  ├── code-agent.ts             AI agent abstraction (Claude/Codex CLI)
-  │
-  ├── bot-telegram.ts           Telegram: orchestration (thin glue)
-  ├── bot-telegram-render.ts    Telegram: HTML rendering
-  ├── channel-telegram.ts       Telegram: Bot API transport
-  │
-  ├── bot-feishu.ts             Feishu: (you create this)
-  ├── bot-feishu-render.ts      Feishu: (you create this)
-  └── channel-feishu.ts         Feishu: (you create this)
-```
+You do not need to reimplement:
 
-## What You Need to Implement
+- session state
+- agent dispatch
+- live stream orchestration
+- command data fetching
+- session/model/skill selection logic
+- MCP-backed file return
 
-### 1. Channel Transport — `channel-feishu.ts`
+Those pieces already live in shared modules.
 
-Extend the `Channel` base class from `channel-base.ts`:
+## The Layers You Plug Into
 
-```typescript
-import { Channel, type BotInfo, type SendOpts } from './channel-base.js';
-
-export class FeishuChannel extends Channel {
-  override readonly capabilities = {
-    editMessages: true,       // Feishu supports card updates
-    typingIndicators: false,  // No typing indicators
-    commandMenu: false,       // No native command menu
-    callbackActions: true,    // Card button callbacks
-    messageReactions: true,
-    fileUpload: true,
-    fileDownload: true,
-    threads: false,
-  };
-
-  async connect(): Promise<BotInfo> { /* Get tenant access token, return bot info */ }
-  async listen(): Promise<void>     { /* WebSocket or webhook event loop */ }
-  disconnect(): void                { /* Cleanup */ }
-
-  async send(chatId, text, opts?): Promise<string | null>    { /* Send message */ }
-  async editMessage(chatId, msgId, text, opts?): Promise<void> { /* Update card */ }
-  async deleteMessage(chatId, msgId): Promise<void>            { /* Delete message */ }
-  async sendTyping(chatId): Promise<void>                      { /* No-op for Feishu */ }
-
-  // Feishu-specific hooks
-  onMessage(handler) { /* ... */ }
-  onCommand(handler) { /* ... */ }
-  onCallback(handler) { /* ... */ }
-}
+```text
+cli.ts
+  -> bot-xxx.ts
+     -> bot-commands.ts
+     -> bot-command-ui.ts
+     -> bot-handler.ts
+     -> bot-telegram-live-preview.ts
+  -> channel-xxx.ts
 ```
 
-### 2. Renderer — `bot-feishu-render.ts`
+## Files to Add
 
-Convert structured data from `bot-commands.ts` into Feishu-specific format (Markdown, interactive cards, etc.):
+### 1. `channel-xxx.ts`
 
-```typescript
-import type { StartData, SessionsPageData, AgentsListData, StatusData } from './bot-commands.js';
-import type { LivePreviewRenderer } from './bot-telegram-live-preview.js';
-import type { StreamPreviewRenderInput } from './bot-telegram-render.js';
+Implement the transport by extending `Channel` from `src/channel-base.ts`.
 
-// Render /start command
-export function renderStart(d: StartData): string {
-  return [
-    `**${d.title}** v${d.version}`,
-    d.subtitle,
-    '',
-    `**Agent:** ${d.agent}`,
-    `**Workdir:** \`${d.workdir}\``,
-  ].join('\n');
-}
+Responsibilities:
 
-// Render /sessions list as Feishu interactive card
-export function renderSessionsPage(d: SessionsPageData): FeishuCard { /* ... */ }
+- connect and authenticate
+- receive messages / commands / callbacks
+- send, edit, delete messages
+- upload and download files
+- expose channel capability flags
 
-// Render /status
-export function renderStatus(d: StatusData): string { /* ... */ }
+Your transport should not know about sessions, agents, or skills.
 
-// LivePreview renderer (Markdown for Feishu)
-export const feishuPreviewRenderer: LivePreviewRenderer = {
-  renderInitial(agent) { return `● ${agent} · 0s`; },
-  renderStream(input) {
-    // Build Markdown preview from input.bodyText, input.thinking, etc.
-    return `${input.bodyText}\n\n● ${input.agent} · ${Math.round(input.elapsedMs / 1000)}s`;
-  },
-};
-```
+### 2. `bot-xxx-render.ts`
 
-### 3. Bot Glue — `bot-feishu.ts`
+Render shared data into platform-specific output.
 
-The thin orchestration layer. Use the shared data layer and generic pipeline:
+Typical responsibilities:
 
-```typescript
-import { Bot, type Agent, type SessionRuntime } from './bot.js';
-import {
-  getStartData, getSessionsPageData, getAgentsListData,
-  getModelsListData, getStatusDataAsync, getHostDataSync,
-  resolveSkillPrompt, modelMatchesSelection,
-} from './bot-commands.js';
+- `/start` formatting
+- `/status` formatting
+- host/runtime formatting
+- command selection cards or keyboards
+- live preview rendering
+- final reply rendering
+
+You can use:
+
+- `bot-commands.ts` for structured data
+- `bot-command-ui.ts` for shared session/agent/model/skill views
+- `bot-telegram-live-preview.ts` for throttled preview updates
+
+### 3. `bot-xxx.ts`
+
+Create the thin orchestration layer.
+
+Typical responsibilities:
+
+- wire channel handlers
+- route slash commands
+- call `handleIncomingMessage()` for free-text messages
+- bind IM-specific file send callbacks for MCP bridge delivery
+- create the platform renderer + preview controller
+
+### 4. `cli.ts`
+
+Register the new channel in the channel launcher.
+
+## Shared Modules You Should Reuse
+
+### `bot-commands.ts`
+
+Use this for data, not rendering.
+
+Key functions:
+
+- `getStartData()`
+- `getStatusDataAsync()`
+- `getHostDataSync()`
+- `getSessionsPageData()`
+- `getModelsListData()`
+- `getSkillsListData()`
+- `resolveSkillPrompt()`
+
+### `bot-command-ui.ts`
+
+Use this when the channel needs session/agent/model/skill selection UIs.
+
+Key helpers:
+
+- `buildSessionsCommandView()`
+- `buildAgentsCommandView()`
+- `buildModelsCommandView()`
+- `buildSkillsCommandView()`
+- `decodeCommandAction()`
+- `executeCommandAction()`
+
+This prevents each IM integration from inventing its own selection logic.
+
+### `bot-handler.ts`
+
+This is the standard message pipeline:
+
+1. resolve session
+2. create placeholder
+3. create live preview
+4. stream agent output
+5. send final reply
+6. deliver artifacts / MCP file sends
+
+Your platform implementation mostly supplies hooks for those steps.
+
+### `bot-telegram-live-preview.ts`
+
+Despite the filename, `LivePreview` is channel-agnostic.
+
+You provide:
+
+- `renderInitial(agent)`
+- `renderStream(input)`
+
+and the controller handles edit throttling and heartbeat timing.
+
+## Minimal Bot Skeleton
+
+```ts
+import { Bot } from './bot.js';
 import { handleIncomingMessage, type MessagePipeline } from './bot-handler.js';
 import { LivePreview } from './bot-telegram-live-preview.js';
-import { feishuPreviewRenderer, renderStart, renderStatus } from './bot-feishu-render.js';
-import { FeishuChannel } from './channel-feishu.js';
+import { getStartData, getStatusDataAsync } from './bot-commands.js';
+import { XxxChannel } from './channel-xxx.js';
+import { renderStart, renderStatus, xxxPreviewRenderer } from './bot-xxx-render.js';
 
-export class FeishuBot extends Bot {
-  private channel!: FeishuChannel;
+export class XxxBot extends Bot {
+  private channel!: XxxChannel;
 
-  // --- Commands use shared data layer + Feishu renderer ---
-
-  private async cmdStart(ctx: FeishuContext) {
+  private async cmdStart(ctx: XxxContext) {
     const data = getStartData(this, ctx.chatId);
     await ctx.reply(renderStart(data));
   }
 
-  private async cmdStatus(ctx: FeishuContext) {
+  private async cmdStatus(ctx: XxxContext) {
     const data = await getStatusDataAsync(this, ctx.chatId);
     await ctx.reply(renderStatus(data));
   }
 
-  // --- Messages use the generic pipeline ---
-
-  private async handleMessage(text: string, files: string[], ctx: FeishuContext) {
-    await handleIncomingMessage({
-      bot: this,
-      pipeline: this.createPipeline(),
-      ctx,
-      text,
-      files,
-      createTaskId: (session) => `${session.key}:${Date.now().toString(36)}`,
-      beginTask: (task) => this.beginTask(task as any),
-      finishTask: (taskId) => this.finishTask(taskId),
-      queueSessionTask: (session, task) => this.queueSessionTask(session, task),
-      syncSelectedChats: (session) => this.syncSelectedChats(session),
-      log: (msg) => this.log(msg),
-    });
-  }
-
-  private createPipeline(): MessagePipeline<FeishuContext> {
+  private createPipeline(): MessagePipeline<XxxContext> {
     return {
-      getChatId: (ctx) => ctx.chatId,
-      getMessageId: (ctx) => ctx.messageId,
+      getChatId: ctx => ctx.chatId,
+      getMessageId: ctx => ctx.messageId,
       resolveSession: (ctx, text, files) => this.resolveIncomingSession(ctx, text, files),
       createPlaceholder: async (ctx, session) => {
-        const msgId = await this.channel.send(ctx.chatId, feishuPreviewRenderer.renderInitial(session.agent));
-        return msgId ? { messageId: msgId } : null;
+        const messageId = await this.channel.send(ctx.chatId, xxxPreviewRenderer.renderInitial(session.agent));
+        return messageId ? { messageId } : null;
       },
-      createLivePreview: (ctx, handle, session) => {
-        return new LivePreview({
-          agent: session.agent,
-          chatId: ctx.chatId,
-          placeholderMessageId: handle.messageId,
-          channel: this.channel,
-          renderer: feishuPreviewRenderer,
-          streamEditIntervalMs: 800,
-          startTimeMs: Date.now(),
-          canEditMessages: true,
-          canSendTyping: false,
-          parseMode: 'Markdown',
-          log: (msg) => this.log(msg),
-        });
+      createLivePreview: (ctx, placeholder, session) => new LivePreview({
+        agent: session.agent,
+        chatId: ctx.chatId,
+        placeholderMessageId: placeholder.messageId,
+        channel: this.channel,
+        renderer: xxxPreviewRenderer,
+        startTimeMs: Date.now(),
+        canEditMessages: true,
+        canSendTyping: false,
+        parseMode: 'Markdown',
+        log: msg => this.log(msg),
+      }),
+      createMcpSendFile: (ctx) => this.createMcpSendFileCallback(ctx),
+      sendFinalReply: async (ctx, placeholder, session, result) => {
+        // platform-specific final formatting
       },
-      sendFinalReply: async (ctx, placeholder, session, result) => { /* ... */ },
-      sendArtifacts: async (ctx, placeholder, artifacts) => { /* ... */ },
-      onError: async (ctx, placeholder, session, error) => { /* ... */ },
+      sendArtifacts: async (ctx, placeholder, artifacts) => {
+        // optional
+      },
+      onError: async (ctx, placeholder, session, error) => {
+        // platform-specific error reply
+      },
     };
   }
-
-  async run() {
-    this.channel = new FeishuChannel({ appId: '...', appSecret: '...' });
-    await this.channel.connect();
-    this.channel.onCommand((cmd, args, ctx) => this.handleCommand(cmd, args, ctx));
-    this.channel.onMessage((msg, ctx) => this.handleMessage(msg.text, msg.files, ctx));
-    this.startKeepAlive();
-    await this.channel.listen();
-  }
 }
 ```
 
-### 4. CLI Registration — `cli.ts`
+## Channel Checklist
 
-Add the dispatch case:
+- `channel-xxx.ts` implements `Channel`
+- `bot-xxx-render.ts` renders command and stream output
+- `bot-xxx.ts` uses shared pipeline
+- `cli.ts` launches the new bot
+- `user-config.ts` stores any new credentials
+- `config-validation.ts` validates those credentials if needed
+- `onboarding.ts` / `dashboard.ts` expose setup state if needed
+- unit tests cover transport and rendering
 
-```typescript
-case 'feishu':
-  const { FeishuBot } = await import('./bot-feishu.js');
-  await new FeishuBot().run();
-  break;
-```
+## Capability Questions To Answer Early
 
-## Shared Components Reference
+Before you implement a new channel, decide:
 
-### `bot-commands.ts` — Data Layer
+- Can messages be edited after send?
+- Are callback buttons supported?
+- Is file upload available?
+- Is file download available?
+- Are threads supported?
+- Is there a native command menu?
+- Is there a typing indicator?
 
-| Function | Returns | Used for |
-|----------|---------|----------|
-| `getStartData(bot, chatId)` | `StartData` | /start command |
-| `getSessionsPageData(bot, chatId, page)` | `SessionsPageData` | /sessions list |
-| `getAgentsListData(bot, chatId)` | `AgentsListData` | /agents list |
-| `getModelsListData(bot, chatId)` | `ModelsListData` | /models list |
-| `getStatusDataAsync(bot, chatId)` | `StatusData` | /status command |
-| `getHostDataSync(bot)` | `HostData` | /host command |
-| `resolveSkillPrompt(bot, chatId, cmd, args)` | `{ prompt, skillName }` | Skill routing |
-| `modelMatchesSelection(agent, sel, cur)` | `boolean` | Model comparison |
+These answers drive the `ChannelCapabilities` flags and influence how previews and command UIs should behave.
 
-### `bot-handler.ts` — Message Pipeline
+## Good Reference Implementations
 
-Implement `MessagePipeline<TCtx>` and call `handleIncomingMessage()` for the full message lifecycle.
+- Telegram reference:
+  - `src/channel-telegram.ts`
+  - `src/bot-telegram.ts`
+  - `src/bot-telegram-render.ts`
 
-### `bot-telegram-live-preview.ts` — LivePreview
+- Feishu reference:
+  - `src/channel-feishu.ts`
+  - `src/bot-feishu.ts`
+  - `src/bot-feishu-render.ts`
 
-The `LivePreview` class is channel-agnostic. Inject a `LivePreviewRenderer`:
-
-```typescript
-interface LivePreviewRenderer {
-  renderInitial(agent: Agent): string;
-  renderStream(input: StreamPreviewRenderInput): string;
-}
-```
-
-### `bot.ts` — Base Class
-
-`Bot` provides: config, `chat(chatId)`, `runStream()`, session management, keep-alive, `switchWorkdir()`.
-
-`ChatId` is `number | string` — works for all platforms.
-
-## Checklist for New IM Integration
-
-- [ ] `channel-xxx.ts` — Transport layer extending `Channel`
-- [ ] `bot-xxx-render.ts` — Platform-specific rendering consuming data from `bot-commands.ts`
-- [ ] `bot-xxx.ts` — Thin glue layer extending `Bot`, wiring commands + pipeline
-- [ ] `cli.ts` — Add `case 'xxx':` dispatch
-- [ ] `user-config.ts` — Add channel-specific config fields if needed
-- [ ] `onboarding.ts` — Add setup checks for the new channel
-- [ ] Tests — Unit tests for render + channel, integration test for bot
+Feishu is the better reference if your target platform prefers cards over plain text.

@@ -156,6 +156,23 @@ function isRetryableUploadError(err: unknown): boolean {
   ].some(token => text.includes(token));
 }
 
+function requireMessageId(resp: any, action: string): string {
+  const messageId = resp?.data?.message_id;
+  if (messageId) return String(messageId);
+  const code = resp?.code;
+  const msg = resp?.msg || resp?.message || 'no message_id returned';
+  throw new Error(`${action} failed: code=${code ?? '?'} msg=${msg}`);
+}
+
+function buildPostContent(paragraphs: Array<Array<Record<string, unknown>>>, title = ''): string {
+  return JSON.stringify({
+    zh_cn: {
+      title,
+      content: paragraphs,
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Card builder helper
 // ---------------------------------------------------------------------------
@@ -621,7 +638,7 @@ class FeishuChannel extends Channel {
         content: JSON.stringify(card),
       },
     });
-    return resp?.data?.message_id ?? null;
+    return requireMessageId(resp, 'send interactive card');
   }
 
   async send(chatId: number | string, text: string, opts: SendOpts = {}): Promise<string | null> {
@@ -646,7 +663,7 @@ class FeishuChannel extends Channel {
         content: JSON.stringify(card),
       },
     });
-    return resp?.data?.message_id ?? null;
+    return requireMessageId(resp, 'reply interactive card');
   }
 
   async editCard(chatId: number | string, msgId: number | string, view: FeishuCardView): Promise<void> {
@@ -842,7 +859,22 @@ class FeishuChannel extends Channel {
         content: JSON.stringify({ text }),
       },
     });
-    return resp?.data?.message_id ?? null;
+    return requireMessageId(resp, 'send text');
+  }
+
+  async sendPost(chatId: string, content: string, opts: { replyTo?: number | string } = {}): Promise<string | null> {
+    const replyTo = opts.replyTo ? String(opts.replyTo) : undefined;
+    this._logOutgoing('sendPost', `${replyTo ? `reply_to=${replyTo}` : `chat=${chatId}`} chars=${content.length}`);
+    const resp = replyTo
+      ? await this.client.im.message.reply({
+        path: { message_id: replyTo },
+        data: { msg_type: 'post', content },
+      })
+      : await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'post', content },
+      });
+    return requireMessageId(resp, 'send post');
   }
 
   /** Upload an image and return the image_key. */
@@ -890,17 +922,24 @@ class FeishuChannel extends Channel {
     const content = fs.readFileSync(filePath);
     const filename = path.basename(filePath);
     const isPhoto = opts.asPhoto ?? PHOTO_EXTS.has(path.extname(filename).toLowerCase());
-
+    const caption = typeof opts.caption === 'string' ? opts.caption.trim() : '';
     const replyTo = opts.replyTo ? String(opts.replyTo) : undefined;
 
     if (isPhoto) {
       try {
         const imageKey = await this.uploadImage(content);
+        if (caption) {
+          return await this.sendPost(String(chatId), buildPostContent([
+            [{ tag: 'img', image_key: imageKey }],
+            [{ tag: 'text', text: caption }],
+          ]), { replyTo });
+        }
         const msgContent = JSON.stringify({ image_key: imageKey });
+        this._logOutgoing('sendImage', `${replyTo ? `reply_to=${replyTo}` : `chat=${chatId}`} file=${filename}`);
         const resp = replyTo
           ? await this.client.im.message.reply({ path: { message_id: replyTo }, data: { msg_type: 'image', content: msgContent } })
           : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: String(chatId), msg_type: 'image', content: msgContent } });
-        return resp?.data?.message_id ?? null;
+        return requireMessageId(resp, 'send image');
       } catch (err) {
         if (isRetryableUploadError(err)) throw err;
         this._log(`[send] image upload rejected file=${filename}: ${describeError(err)}; retrying as file`);
@@ -909,10 +948,11 @@ class FeishuChannel extends Channel {
 
     const fileKey = await this.uploadFile(content, filename);
     const msgContent = JSON.stringify({ file_key: fileKey });
+    this._logOutgoing('sendFile', `${replyTo ? `reply_to=${replyTo}` : `chat=${chatId}`} file=${filename}`);
     const resp = replyTo
       ? await this.client.im.message.reply({ path: { message_id: replyTo }, data: { msg_type: 'file', content: msgContent } })
       : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: String(chatId), msg_type: 'file', content: msgContent } });
-    return resp?.data?.message_id ?? null;
+    return requireMessageId(resp, 'send file');
   }
 
   // ========================================================================

@@ -1,128 +1,114 @@
 # Pikiclaw
 
-IM-driven bridge for AI coding agents (Codex, Codex CLI). Users send messages via IM, pikiclaw streams them to a local agent and returns results.
+IM-driven bridge for local coding agents. Users talk in Telegram or Feishu, pikiclaw runs the task on the local machine, streams progress back, and returns files or screenshots when needed.
 
 ## Project Structure
 
-```
+```text
 src/
-  cli.ts                        Entry point, arg parsing, channel dispatch
-  bot.ts                        Base class: config, state, sessions, streaming, keep-alive
-  bot-commands.ts               Channel-agnostic command data layer (returns structured data, no rendering)
-  bot-handler.ts                Generic message handling pipeline (MessagePipeline interface)
-  bot-menu.ts                   Menu command definitions, skill indexing
-  bot-streaming.ts              Stream preview utilities, activity parsing
-  code-agent.ts                 AI agent abstraction (Codex/Codex CLI spawning, JSONL parsing)
+  cli.ts                        Entry point: daemon mode, dashboard, channel launch
+  cli-channels.ts               Channel resolution from config/env
 
-  channel-base.ts               Abstract Channel class, ChannelCapabilities
-  channel-telegram.ts           Telegram Bot API transport
+  bot.ts                        Shared bot runtime and session state
+  bot-commands.ts               Shared command data layer
+  bot-command-ui.ts             Shared command selection views and action execution
+  bot-handler.ts                Generic message pipeline
+  bot-menu.ts                   Menu commands and skill command naming
+  bot-streaming.ts              Stream preview parsing
 
-  bot-telegram.ts               Telegram bot orchestration (commands, callbacks, lifecycle)
-  bot-telegram-render.ts        Telegram HTML rendering
-  bot-telegram-live-preview.ts  LivePreview controller (channel-agnostic with renderer injection)
-  bot-telegram-directory.ts     Telegram workdir browser UI
+  bot-telegram.ts               Telegram orchestration
+  bot-telegram-render.ts        Telegram rendering
+  bot-telegram-live-preview.ts  Channel-agnostic live preview controller
+  bot-telegram-directory.ts     Telegram workdir browser helpers
 
-  user-config.ts                User config persistence (~/.config/pikiclaw/config.json)
-  onboarding.ts                 Setup checks and guide
-  setup-wizard.ts               Interactive setup wizard
-  run.ts                        Standalone CLI commands
+  bot-feishu.ts                 Feishu orchestration
+  bot-feishu-render.ts          Feishu rendering
+
+  channel-base.ts               Abstract transport + capabilities
+  channel-telegram.ts           Telegram transport
+  channel-feishu.ts             Feishu transport
+
+  agent-driver.ts               AgentDriver interface and registry
+  code-agent.ts                 Shared agent layer and session workspace management
+  driver-claude.ts              Claude driver
+  driver-codex.ts               Codex driver
+  driver-gemini.ts              Gemini driver
+
+  mcp-bridge.ts                 Per-stream MCP bridge
+  mcp-session-server.ts         Stdio MCP server launched by agent CLIs
+  tools/
+    workspace.ts                im_list_files / im_send_file
+    capture.ts                  take_screenshot
+    gui.ts                      Reserved GUI tool module
+    types.ts                    MCP tool types
+
+  dashboard.ts                  Web dashboard server and API
+  dashboard-ui.ts               Dashboard frontend bundle
+  session-status.ts             Runtime session status helpers
+  channel-states.ts             Channel validation cache
+  config-validation.ts          Credential validation helpers
+
+  user-config.ts                ~/.pikiclaw/setting.json persistence
+  onboarding.ts                 Setup state and doctor output
+  setup-wizard.ts               Interactive terminal wizard
+  process-control.ts            Restart/watchdog/process utilities
+  run.ts                        Standalone local inspection commands
 ```
 
 ## Architecture Layers
 
-```
-cli.ts → bot-{platform}.ts → bot.ts → code-agent.ts
-              ↓                 ↑
-         channel-{platform}.ts  bot-commands.ts (shared data)
-              ↓                 bot-handler.ts  (shared pipeline)
-         channel-base.ts
-```
+```text
+cli.ts
+  -> dashboard.ts + bot-{platform}.ts
+  -> bot.ts
+  -> code-agent.ts
+  -> driver registry
 
-- **bot.ts (Bot)** — Channel-agnostic base. Manages config, `ChatId` (number | string), session state, `runStream()`, keep-alive. All IM bots extend this.
-- **bot-commands.ts** — Pure data functions: `getStartData()`, `getSessionsPageData()`, `getAgentsListData()`, `getModelsListData()`, `getStatusDataAsync()`, `getHostDataSync()`, `resolveSkillPrompt()`. Returns structured objects, no rendering.
-- **bot-handler.ts** — `MessagePipeline<TCtx>` interface + `handleIncomingMessage()` orchestration. Session resolution → placeholder → live preview → stream → final reply → artifacts.
-- **bot-telegram-live-preview.ts** — `LivePreview` class accepts a `LivePreviewRenderer` interface. Channel-agnostic timing/throttling; rendering is injected per platform.
-- **channel-base.ts** — Abstract `Channel` with `ChannelCapabilities` flags. Each platform implements `connect()`, `listen()`, `disconnect()`, `send()`, `editMessage()`, etc.
-
-## Adding a New IM Platform
-
-Create 3 files + 1 dispatch line:
-
-### 1. `channel-{name}.ts` — Transport
-```typescript
-import { Channel } from './channel-base.js';
-export class XxxChannel extends Channel {
-  // implement connect(), listen(), disconnect(), send(), editMessage(), ...
-  // define capabilities (editMessages, fileUpload, etc.)
-  // add platform-specific hooks: onMessage(), onCommand(), onCallback()
-}
+bot-{platform}.ts
+  -> bot-commands.ts
+  -> bot-command-ui.ts
+  -> bot-handler.ts
+  -> channel-{platform}.ts
 ```
 
-### 2. `bot-{name}-render.ts` — Rendering
-```typescript
-import type { StartData, SessionsPageData, StatusData } from './bot-commands.js';
-import type { LivePreviewRenderer } from './bot-telegram-live-preview.js';
+- `bot.ts` is the shared runtime: workdir, agent/model config, sessions, `runStream()`, keep-alive.
+- `bot-commands.ts` returns structured command data with no rendering.
+- `bot-command-ui.ts` builds shared UI models for sessions, agents, models, and skills.
+- `bot-handler.ts` runs the generic stream lifecycle, including MCP-backed file send callbacks.
+- `code-agent.ts` manages session workspaces, staged files, skills, MCP bridge setup, and driver dispatch.
+- `agent-driver.ts` keeps agent integration pluggable.
 
-export function renderStart(d: StartData): string { /* platform markup */ }
-export function renderStatus(d: StatusData): string { /* platform markup */ }
+## Current Capabilities
 
-export const xxxPreviewRenderer: LivePreviewRenderer = {
-  renderInitial(agent) { return `... ${agent} ...`; },
-  renderStream(input) { return `... ${input.bodyText} ...`; },
-};
-```
+- Channels: Telegram and Feishu
+- Agents: Claude Code, Codex CLI, Gemini CLI
+- Project skills: `.pikiclaw/skills` plus `.claude/commands` compatibility
+- Session-scoped MCP tools:
+  - `im_list_files`
+  - `im_send_file`
+  - `take_screenshot`
+- Dashboard-based setup and monitoring
 
-### 3. `bot-{name}.ts` — Thin Glue Layer
-```typescript
-import { Bot } from './bot.js';
-import { getStartData, getStatusDataAsync, ... } from './bot-commands.js';
-import { handleIncomingMessage } from './bot-handler.js';
-import { LivePreview } from './bot-telegram-live-preview.js';
+## Important Notes
 
-export class XxxBot extends Bot {
-  // Commands: call bot-commands.ts for data, pass to renderer
-  // Messages: implement MessagePipeline, call handleIncomingMessage()
-  // Lifecycle: connect channel, register hooks, listen
-}
-```
-
-### 4. `cli.ts` — Register dispatch
-```typescript
-case 'xxx':
-  const { XxxBot } = await import('./bot-xxx.js');
-  await new XxxBot().run();
-  break;
-```
-
-See [INTEGRATION.md](INTEGRATION.md) for detailed examples.
-
-## Key Types
-
-- `ChatId = number | string` — Telegram uses number, Feishu/Discord use string
-- `Agent = 'Codex' | 'codex'` — AI backend
-- `SessionRuntime` — Live session state (key, workdir, agent, sessionId, runningTaskIds)
-- `StreamResult` — Agent response (message, thinking, tokens, artifacts, sessionId)
-- `MessagePipeline<TCtx>` — Per-platform message handling hooks
+- Persistent config lives in `~/.pikiclaw/setting.json`
+- The dashboard is the main config surface; env vars still work, but docs and code assume config-first
+- MCP tools are currently injected per stream, not as a top-level global tool registry
+- `src/tools/gui.ts` is a placeholder extension point and does not yet expose real GUI tools
 
 ## Testing Rules
 
-- **Unit tests** (`test/*.unit.test.ts`): Can use mocks. Run with `npx vitest run`.
-- **E2E tests** (`test/e2e/*.e2e.test.ts`): Must NOT use mocks. Hit real CLIs with real API calls. Use `describe.skipIf(!HAS_CLAUDE)` / `describe.skipIf(!HAS_CODEX)`.
-- Framework: Vitest.
+- Unit tests: `npm test`
+- Live E2E: `npm run test:e2e`
+- E2E tests should not mock the external system being tested
 
 ## Common Commands
 
 ```bash
-npm run build          # TypeScript compile
-npm test               # Run unit tests
-npx vitest run <file>  # Run specific test
-npx pikiclaw --doctor  # Check setup
-npx pikiclaw --setup   # Interactive setup wizard
+npm run dev
+npm run build
+npm test
+npm run test:e2e
+npx pikiclaw@latest --doctor
+npx pikiclaw@latest --setup
 ```
-
-## Environment Variables
-
-**Channel-agnostic:** `DEFAULT_AGENT`, `PIKICLAW_WORKDIR`, `PIKICLAW_TIMEOUT`, `PIKICLAW_ALLOWED_IDS`
-**Telegram:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`
-**Codex agent:** `CLAUDE_MODEL`, `CLAUDE_PERMISSION_MODE`, `CLAUDE_EXTRA_ARGS`
-**Codex agent:** `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, `CODEX_FULL_ACCESS`, `CODEX_EXTRA_ARGS`

@@ -1,297 +1,234 @@
 # Architecture
 
+This document describes the current `pikiclaw` architecture as of the multi-channel, multi-agent, MCP-enabled implementation.
+
 ## File Structure
 
-```
+```text
 src/
-  cli.ts                 CLI entry point: arg parsing, env mapping, channel dispatch
-  bot.ts                 Shared bot base: config, state, data methods, streaming, keep-alive
-  bot-menu.ts            Telegram menu composition: welcome copy + skill command mapping
-  bot-streaming.ts       Stream preview summarizers: prompt cleanup, plan/activity summaries
-  bot-commands.ts        Channel-agnostic command data layer (structured data, no rendering)
-  bot-handler.ts         Channel-agnostic message handling pipeline (MessagePipeline interface)
-  bot-telegram.ts        Telegram bot orchestration: commands, callbacks, lifecycle
-  bot-telegram-render.ts Telegram HTML/render helpers: markdown, status/final reply formatting
-  bot-telegram-directory.ts Telegram workdir browser state + inline keyboards
-  bot-telegram-live-preview.ts Telegram live preview controller: throttled edits + typing pulses
-  channel-base.ts        Transport abstraction: lifecycle + outgoing primitives + capability helpers
-  channel-telegram.ts    Telegram transport: API, polling, file download, message dispatch
-  agent-driver.ts        AgentDriver interface + registry (registerDriver / getDriver / allDrivers)
-  code-agent.ts          Shared agent layer: types, session management, artifact helpers, CLI spawn
-  driver-claude.ts       Claude CLI driver: stream, sessions, tail, models, usage
-  driver-codex.ts        Codex CLI driver: app-server RPC, stream, sessions, tail, models, usage
-  driver-gemini.ts       Gemini CLI driver: stream, sessions, tail, models, usage (skeleton)
+  cli.ts                        Main entry: daemon mode, dashboard bootstrap, channel launch
+  cli-channels.ts               Resolve configured channels from setting.json / env
+
+  bot.ts                        Shared bot base: config, sessions, runStream(), keep-alive
+  bot-commands.ts               Channel-agnostic command data
+  bot-command-ui.ts             Shared command selection model + action executor
+  bot-handler.ts                Generic message pipeline with live preview + MCP hook
+  bot-menu.ts                   Menu command definitions and skill command mapping
+  bot-streaming.ts              Stream preview parsing helpers
+
+  bot-telegram.ts               Telegram orchestration
+  bot-telegram-render.ts        Telegram rendering helpers
+  bot-telegram-live-preview.ts  Channel-agnostic live preview controller
+  bot-telegram-directory.ts     Telegram workdir browser state
+
+  bot-feishu.ts                 Feishu orchestration
+  bot-feishu-render.ts          Feishu rendering helpers
+
+  channel-base.ts               Transport abstraction and capability flags
+  channel-telegram.ts           Telegram transport
+  channel-feishu.ts             Feishu transport
+
+  agent-driver.ts               AgentDriver interface + registry
+  code-agent.ts                 Shared agent layer and session workspace management
+  driver-claude.ts              Claude Code driver
+  driver-codex.ts               Codex CLI driver
+  driver-gemini.ts              Gemini CLI driver
+
+  mcp-bridge.ts                 Per-stream MCP bridge orchestration
+  mcp-session-server.ts         Stdio MCP server launched by agent CLIs
+  tools/
+    workspace.ts                im_list_files / im_send_file
+    capture.ts                  take_screenshot
+    gui.ts                      Reserved GUI tool module
+    types.ts                    MCP tool types and helpers
+
+  dashboard.ts                  Web dashboard server and API
+  dashboard-ui.ts               Bundled dashboard frontend
+  session-status.ts             Runtime session status helpers
+  channel-states.ts             Channel validation caching
+  config-validation.ts          Telegram / Feishu credential checks
+
+  process-control.ts            Restart, watchdog, process tree termination
+  user-config.ts                ~/.pikiclaw/setting.json load/save/sync
+  onboarding.ts                 Doctor/setup state and messaging
+  setup-wizard.ts               Interactive terminal setup
+  run.ts                        Standalone local inspection commands
 ```
 
-## Layering
+## Runtime Layers
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  cli.ts                                                      │
-│  Parse args → resolve channel → map env → dispatch bot       │
-├──────────────────────────────────────────────────────────────┤
-│  bot.ts  (shared base, channel-agnostic)                     │
-│  ├ Config         workdir, agent, model, timeout             │
-│  ├ State          chats, activeTasks, stats                  │
-│  ├ Data methods   getStatusData(), getHostData()             │
-│  ├ Actions        switchWorkdir(), runStream()               │
-│  ├ Data access    fetchSessions(), fetchAgents()             │
-│  ├ Session state  resetChatConversation(), adoptSession()    │
-│  ├ Keep-alive     caffeinate / systemd-inhibit               │
-│  └ Helpers        fmtTokens, fmtUptime, thinkLabel, ...     │
-├──────────────────────────────────────────────────────────────┤
-│  bot-telegram.ts  (Telegram orchestration, extends Bot)      │
-│  ├ Commands       cmdStart/Status/Host/Sessions/Switch/Agents│
-│  ├ Callbacks      sw:/sess:/ag:/mod: routing                 │
-│  ├ Artifacts      upload after final reply                   │
-│  └ Lifecycle      run() → connect, drain, menu, poll, signal│
-├──────────────────────────────────────────────────────────────┤
-│  bot-telegram-render.ts  (Telegram rendering helpers)        │
-│  ├ HTML           escapeHtml(), mdToTgHtml()                 │
-│  ├ Status/menu    formatMenuLines(), formatProviderUsageLines│
-│  ├ Preview        buildInitialPreviewHtml(), buildStreamPreviewHtml() │
-│  └ Final reply    buildFinalReplyRender()                    │
-├──────────────────────────────────────────────────────────────┤
-│  bot-telegram-directory.ts  (Telegram workdir browser)       │
-│  ├ Registry       compact callback-data path registry        │
-│  ├ View           buildSwitchWorkdirView()                   │
-│  └ Lookup         resolveRegisteredPath()                    │
-├──────────────────────────────────────────────────────────────┤
-│  bot-telegram-live-preview.ts  (stream UI controller)        │
-│  ├ Timing         throttle edits + stalled heartbeats        │
-│  ├ Feedback       typing pulse lifecycle                     │
-│  ├ State          latest text / thinking / activity / plan   │
-│  └ Flush          settle() / dispose()                       │
-├──────────────────────────────────────────────────────────────┤
-│  channel-base.ts  (transport abstraction)                    │
-│  ├ Channel        connect / listen / disconnect              │
-│  ├ Outgoing       send / editMessage / deleteMessage         │
-│  └ Helpers        splitText, sleep, supportsChannelCapability│
-├──────────────────────────────────────────────────────────────┤
-│  channel-telegram.ts  (Telegram transport, extends Channel)  │
-│  ├ Telegram API   getMe, getUpdates, sendMessage, ...        │
-│  ├ Dispatch       command/message/callback routing to hooks  │
-│  ├ File download  photo/document → local path                │
-│  ├ File upload    sendPhoto/sendDocument/sendFile routing    │
-│  ├ Group filter   @mention / reply-to-bot detection          │
-│  └ Smart behavior parseMode fallback, message splitting      │
-├──────────────────────────────────────────────────────────────┤
-│  agent-driver.ts  (driver interface + registry)                │
-│  ├ AgentDriver    interface: doStream, getSessions, etc.      │
-│  ├ registerDriver register a driver implementation            │
-│  ├ getDriver      look up driver by id, throw if unknown      │
-│  └ allDrivers     list all registered drivers                 │
-├──────────────────────────────────────────────────────────────┤
-│  code-agent.ts  (shared agent layer)                          │
-│  ├ Types          StreamOpts, StreamResult, SessionInfo, ...  │
-│  ├ Session mgmt   workspace creation, index, staging, migrate │
-│  ├ Artifacts      collectArtifacts, buildArtifactPrompt       │
-│  ├ CLI spawn      run() — shared spawn+readline framework     │
-│  └ Dispatch       doStream/getSessions/... → getDriver(agent) │
-├──────────────────────────────────────────────────────────────┤
-│  driver-claude.ts / driver-codex.ts / driver-gemini.ts        │
-│  Each implements AgentDriver:                                 │
-│  ├ doStream       agent-specific streaming logic              │
-│  ├ getSessions    session listing from local index            │
-│  ├ getSessionTail read conversation history                   │
-│  ├ listModels     discover available models                   │
-│  ├ getUsage       rate limit / usage telemetry                │
-│  └ shutdown       cleanup (e.g. codex app-server)             │
-└──────────────────────────────────────────────────────────────┘
+```text
+CLI / Dashboard
+  cli.ts
+    ├ startDashboard()
+    ├ loadUserConfig() / applyUserConfig()
+    └ launch channel bot(s)
+
+Shared Bot Layer
+  bot.ts
+    ├ chat/session state
+    ├ workdir + model resolution
+    ├ runStream()
+    └ keep-alive / restart integration
+
+Channel Bot Layer
+  bot-telegram.ts / bot-feishu.ts
+    ├ commands -> bot-commands.ts + renderer
+    ├ callbacks -> bot-command-ui.ts
+    └ messages -> bot-handler.ts pipeline
+
+Transport Layer
+  channel-telegram.ts / channel-feishu.ts
+    └ send, edit, delete, callbacks, uploads, downloads
+
+Agent Layer
+  code-agent.ts
+    ├ per-session workspace creation
+    ├ staged files / skill discovery
+    ├ MCP bridge setup
+    └ dispatch to AgentDriver
+
+Driver Layer
+  driver-claude.ts / driver-codex.ts / driver-gemini.ts
+    └ CLI-specific stream/session/model/usage behavior
+
+Tool Layer
+  mcp-session-server.ts
+    └ src/tools/*
 ```
 
-## Design Principles
+## Core Design
 
-**Data / render split** — bot.ts provides data methods (`getStatusData`, `getHostData`,
-`fetchSessions`, `fetchAgents`), while Telegram HTML and preview assembly live in
-`bot-telegram-render.ts`. Adding a new IM means writing bot-xxx.ts plus renderer/view
-helpers for that channel, not re-embedding shared state logic.
+### 1. Shared logic first, channel rendering second
 
-**Channel = transport only** — channel-telegram.ts handles Telegram API communication
-(polling, sending, file download/upload routing, message dispatch). It knows nothing
-about commands, sessions, or agents. It is independently testable.
+Business logic lives in shared modules:
 
-**Bot = business logic** — bot.ts holds shared state and session mutation helpers.
-bot-telegram.ts is now primarily orchestration: command/callback routing, channel calls,
-and composition of smaller Telegram-specific helpers.
+- `bot.ts` owns runtime state
+- `bot-commands.ts` returns structured command data
+- `bot-command-ui.ts` builds shared selection UIs for sessions, agents, models, and skills
+- `bot-handler.ts` runs the generic message lifecycle
 
-**Stream UI controller** — live preview timing, typing pulses, and throttled edits are
-stateful UI concerns, so they live in `bot-telegram-live-preview.ts` instead of being
-inlined inside `handleMessage()`.
+Telegram and Feishu mostly differ in:
 
-**Env var scoping** — bot.ts only reads channel-agnostic env vars (`PIKICLAW_*`).
-Channel-specific env vars (`TELEGRAM_*`, `FEISHU_*`) are read in the corresponding
-bot-xxx.ts constructor.
+- transport details
+- rendering format
+- callback payload format
+- channel capabilities
 
-## Adding a New AI Agent (CLI)
+This keeps new IM integrations thin.
 
-To integrate a new CLI agent (e.g. `aider`, `cursor`, `gemini`):
+### 2. Agent support is registry-based
 
-### 1. Create the driver file
+`agent-driver.ts` exposes a small `AgentDriver` interface:
 
-Create `src/driver-xxx.ts`. Implement the `AgentDriver` interface and call `registerDriver()`:
+- `detect()`
+- `doStream()`
+- `getSessions()`
+- `getSessionTail()`
+- `listModels()`
+- `getUsage()`
+- `shutdown()`
 
-```typescript
-// src/driver-xxx.ts
-import { registerDriver, type AgentDriver } from './agent-driver.js';
-import {
-  type AgentInfo, type StreamOpts, type StreamResult,
-  type SessionListResult, type SessionTailOpts, type SessionTailResult,
-  type ModelListOpts, type ModelListResult,
-  type UsageOpts, type UsageResult,
-  run, detectAgentBin, listPikiclawSessions, emptyUsage,
-} from './code-agent.js';
+`code-agent.ts` imports all drivers for side effects, and all higher-level bot code talks to the registry instead of talking to a specific CLI directly.
 
-function xxxCmd(o: StreamOpts): string[] {
-  const args = ['xxx-cli'];
-  if (o.xxxModel) args.push('--model', o.xxxModel);
-  if (o.sessionId) args.push('--resume', o.sessionId);
-  return args;
-}
+### 3. Session workspaces are first-class
 
-function xxxParse(ev: any, s: any) {
-  // Parse the CLI's JSON stream events into s.text, s.thinking, s.sessionId, etc.
-  // See driver-claude.ts (claudeParse) for a line-by-line parsing example.
-}
+Each conversation runs against a pikiclaw-managed session workspace. That workspace is used for:
 
-class XxxDriver implements AgentDriver {
-  readonly id = 'xxx';
-  readonly cmd = 'xxx-cli';
-  readonly thinkLabel = 'Thinking';
+- staged attachments
+- session metadata and indexes
+- project skill discovery
+- MCP tool visibility
 
-  detect(): AgentInfo { return detectAgentBin('xxx-cli', 'xxx'); }
+This is why file return, screenshots, and project-scoped tools can work consistently across agents.
 
-  async doStream(opts: StreamOpts): Promise<StreamResult> {
-    // Option A: CLI spawn (like Claude) — use the shared run() framework
-    return run(xxxCmd(opts), opts, xxxParse);
-    // Option B: RPC/WebSocket — see driver-codex.ts for an app-server example
-  }
+### 4. MCP is injected per stream
 
-  async getSessions(workdir: string, limit?: number): Promise<SessionListResult> {
-    // Session workspace is managed by code-agent.ts; just read the local index
-    const sessions = listPikiclawSessions(workdir, 'xxx', limit).map(r => ({
-      sessionId: r.engineSessionId, localSessionId: r.localSessionId,
-      engineSessionId: r.engineSessionId, agent: 'xxx' as const,
-      workdir: r.workdir, workspacePath: r.workspacePath,
-      model: r.model, createdAt: r.createdAt, title: r.title,
-      running: Date.now() - Date.parse(r.updatedAt) < 10_000,
-    }));
-    return { ok: true, sessions, error: null };
-  }
+When a stream starts and an IM callback is available:
 
-  async getSessionTail(_opts: SessionTailOpts): Promise<SessionTailResult> {
-    return { ok: true, messages: [], error: null }; // implement when protocol is known
-  }
+1. `code-agent.ts` starts `mcp-bridge.ts`
+2. the bridge launches a localhost callback server
+3. the bridge prepares agent-specific MCP registration
+4. the agent CLI launches `mcp-session-server.ts`
+5. MCP tools call back into the parent process
+6. pikiclaw sends files or logs activity back to the IM chat in real time
 
-  async listModels(_opts: ModelListOpts): Promise<ModelListResult> {
-    return { agent: 'xxx', models: [{ id: 'xxx-default', alias: null }], sources: [], note: null };
-  }
+This keeps the tool lifecycle tightly scoped to the active run.
 
-  getUsage(_opts: UsageOpts): UsageResult {
-    return emptyUsage('xxx', 'Usage not yet implemented.');
-  }
+### 5. Dashboard is config + runtime surface
 
-  shutdown() {}
-}
+The dashboard is not just a setup page. It is the main local control plane for:
 
-registerDriver(new XxxDriver());
+- channel validation
+- agent detection and model discovery
+- session browsing
+- workdir switching
+- runtime bot status
+- macOS permission checks
+
+All persistent config lives in `~/.pikiclaw/setting.json`.
+
+## Main Message Flow
+
+```text
+Incoming IM message
+  -> channel transport normalizes text/files/context
+  -> bot-xxx.ts resolves command vs free text
+  -> free text goes to handleIncomingMessage()
+  -> placeholder message is created
+  -> LivePreview updates the placeholder while streaming
+  -> Bot.runStream() prepares agent options + MCP bridge
+  -> AgentDriver streams output
+  -> final reply is rendered
+  -> artifacts / send_file callbacks are delivered back to IM
 ```
 
-### 2. Register the driver
+## Current MCP Tool Surface
 
-Add a single import line in `src/code-agent.ts`:
+Registered by `mcp-session-server.ts`:
 
-```typescript
-import './driver-xxx.js';
-```
+- `im_list_files`
+- `im_send_file`
+- `take_screenshot`
 
-This triggers `registerDriver()` at startup. All dispatch points (`doStream`, `getSessions`,
-`getSessionTail`, `listModels`, `getUsage`, `listAgents`) automatically pick up the new agent.
+`src/tools/gui.ts` exists as the future extension point for interactive GUI tools, but currently exports no live tools.
 
-### 3. Add bot config
+## Adding a New Agent
 
-In `src/bot.ts`, add a config entry in the `agentConfigs` initializer:
+1. Create `src/driver-xxx.ts` implementing `AgentDriver`
+2. Import it from `src/code-agent.ts`
+3. Add model / extra-args config handling in `bot.ts` if needed
+4. Add unit tests and, if possible, live E2E coverage
 
-```typescript
-this.agentConfigs = {
-  // ... existing entries
-  xxx: {
-    model: (process.env.XXX_MODEL || 'xxx-default').trim(),
-    extraArgs: shellSplit(process.env.XXX_EXTRA_ARGS || ''),
-  },
-};
-```
+What you usually do not need to touch:
 
-### 4. Add StreamOpts fields (if needed)
+- `bot-telegram.ts`
+- `bot-feishu.ts`
+- `bot-commands.ts`
+- `bot-command-ui.ts`
 
-If the agent needs custom options beyond `model` and `extraArgs`, add optional fields to
-`StreamOpts` in `code-agent.ts`:
-
-```typescript
-export interface StreamOpts {
-  // ... existing fields
-  xxxModel?: string;
-  xxxExtraArgs?: string[];
-}
-```
-
-And populate them in `Bot.runStream()`:
-
-```typescript
-xxxModel: cs.agent === 'xxx' ? resolvedModel : (this.agentConfigs.xxx?.model || ''),
-```
-
-### What you don't need to touch
-
-- **Other driver files** — driver-claude.ts, driver-codex.ts are unchanged
-- **bot-telegram.ts** — commands, callbacks, live preview all work automatically
-- **bot-commands.ts** — agent listing, model switching, usage display work via registry
-- **Tests** — existing tests remain unaffected; add `driver-xxx.unit.test.ts` for yours
-
-### Key shared infrastructure
-
-| Function / Module | What it provides |
-|---|---|
-| `run(cmd, opts, parseLine)` | Spawn CLI, readline stdout, timeout, parse JSON events |
-| `detectAgentBin(cmd, id)` | `which` + `--version` detection |
-| `listPikiclawSessions(workdir, agent)` | Read local session index |
-| `findPikiclawSessionByLocalId(...)` | Lookup by local ID |
-| `collectArtifacts(workspacePath)` | Read return manifest, validate files |
-| `buildArtifactSystemPrompt(...)` | Artifact return instructions for system prompt |
-| `buildStreamPreviewMeta(s)` | Token usage → preview metadata |
-| `pushRecentActivity(lines, line)` | Activity feed accumulation |
-| `emptyUsage(agent, error)` | Empty usage result |
+Those layers already consume the driver registry generically.
 
 ## Adding a New IM Channel
 
-1. Create `channel-xxx.ts` extending `Channel` from channel-base.ts
-2. Create `bot-xxx.ts` extending `Bot` from bot.ts
-   - Render commands using `this.getStatusData()`, `this.getHostData()`, etc.
-   - Implement channel-specific interaction (cards, buttons, menus)
-   - Read channel-specific env vars in constructor
-3. Add dispatch case in `cli.ts`
+1. Implement `channel-xxx.ts`
+2. Implement `bot-xxx-render.ts`
+3. Implement `bot-xxx.ts`
+4. Register it from `cli.ts`
+5. Extend validation / setup surfaces if the channel has its own credentials
 
-## Bot Commands
+See [INTEGRATION.md](INTEGRATION.md) for the channel integration guide.
 
-| Command     | Description                          |
-|-------------|--------------------------------------|
-| `/start`    | Welcome + command list               |
-| `/sessions` | List / switch sessions (inline keys) |
-| `/agents`   | List / switch AI agents              |
-| `/status`   | Bot status, uptime, provider usage, token usage |
-| `/host`     | Host machine info (CPU, memory, disk, battery) |
-| `/switch`   | Browse and change working directory   |
-| `/restart`  | Restart with latest version via non-interactive `npx --yes` |
+## Adding a New MCP Tool
 
-Direct messages (no command prefix) are forwarded to the current AI agent.
+1. Create or extend a module in `src/tools/`
+2. Export `tools` definitions and a `handle()` implementation
+3. Register the module in `mcp-session-server.ts`
+4. Keep tool results text-based and JSON-serializable
+5. If the tool needs IM side effects, use the callback URL path exposed by the bridge
 
-## Test Files
+## Related Docs
 
-| File                              | Tests                              | API calls? |
-|-----------------------------------|------------------------------------|------------|
-| `test/e2e/pikiclaw.e2e.test.ts`       | Bot commands + callbacks (real fs)  | No         |
-| `test/e2e/channel-telegram.e2e.test.ts` | Telegram channel (real API)       | Yes        |
-| `test/channel-telegram.unit.test.ts` | Telegram channel (mocked)        | No         |
-| `test/e2e/code-agent.e2e.test.ts`     | Real claude/codex CLI              | Yes        |
-| `test/code-agent.unit.test.ts`    | Stream parsing (fake scripts)      | No         |
-| `test/e2e/restart.e2e.test.ts`        | Restart: PID change (standalone)   | Yes        |
+- [README.md](README.md)
+- [INTEGRATION.md](INTEGRATION.md)
+- [TESTING.md](TESTING.md)

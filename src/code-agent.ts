@@ -926,12 +926,10 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
 
   // Start MCP bridge if sendFile callback is provided
   let bridge: import('./mcp-bridge.js').McpBridgeHandle | null = null;
-  let mcpLogPath: string | null = null;
   if (opts.mcpSendFile) {
     try {
       const { startMcpBridge } = await import('./mcp-bridge.js');
       const sessionDir = path.dirname(session.workspacePath);
-      mcpLogPath = path.join(sessionDir, 'mcp-server.log');
       bridge = await startMcpBridge({
         sessionDir,
         workspacePath: session.workspacePath,
@@ -939,10 +937,11 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
         stagedFiles,
         sendFile: opts.mcpSendFile,
         agent: opts.agent,
+        onLog: (message: string) => agentLog(`[mcp] ${message}`),
       });
       prepared.mcpConfigPath = bridge.configPath;
-      agentLog(`[mcp] bridge started on ${bridge.configPath}`);
-      agentLog(`[mcp] server log file: ${mcpLogPath}`);
+      if (bridge.configPath) agentLog(`[mcp] bridge started on ${bridge.configPath}`);
+      else agentLog('[mcp] bridge registered with codex');
       try { agentLog(`[mcp] config content:\n${fs.readFileSync(bridge.configPath, 'utf-8')}`); } catch {};
     } catch (e: any) {
       agentLog(`[mcp] bridge start failed: ${e.message} — proceeding without MCP`);
@@ -956,11 +955,7 @@ export async function doStream(opts: StreamOpts): Promise<StreamResult> {
   } finally {
     if (bridge) {
       await bridge.stop().catch(() => {});
-      if (mcpLogPath && fs.existsSync(mcpLogPath)) {
-        const tail = readTailLines(mcpLogPath, 16 * 1024).slice(-20).join('\n').trim();
-        if (tail) agentLog(`[mcp] server log tail:\n${tail}`);
-      }
-      agentLog('[mcp] bridge stopped');
+      if (bridge.hadActivity()) agentLog('[mcp] bridge stopped');
     }
   }
 }
