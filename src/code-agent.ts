@@ -1124,20 +1124,56 @@ function ensureDirSymlink(linkPath: string, targetDir: string) {
   fs.symlinkSync(desiredTarget, linkPath, 'dir');
 }
 
+function resetDir(dirPath: string) {
+  try { fs.rmSync(dirPath, { recursive: true, force: true }); } catch {}
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function copyMergedTree(
+  sourceRoot: string,
+  targetRoot: string,
+  opts: { log?: (message: string) => void } = {},
+) {
+  for (const relPath of listRelativeFiles(sourceRoot)) {
+    const sourcePath = path.join(sourceRoot, relPath);
+    const targetPath = path.join(targetRoot, relPath);
+    if (hasFile(targetPath)) {
+      opts.log?.(`skills merge skipped existing file: ${relPath}`);
+      continue;
+    }
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(sourcePath, targetPath);
+  }
+}
+
 export function initializeProjectSkills(workdir: string, opts: { log?: (message: string) => void } = {}): void {
   const canonicalRoot = path.join(workdir, '.pikiclaw', 'skills');
   const claudeRoot = path.join(workdir, '.claude', 'skills');
+  const agentsRoot = path.join(workdir, '.agents', 'skills');
+  const mergeRoot = path.join(workdir, '.pikiclaw', '.skills-merge-tmp');
+  const sourceRoots = [canonicalRoot, claudeRoot, agentsRoot];
+  const seenSourceReals = new Set<string>();
 
-  // Only create .pikiclaw/skills → .claude/skills symlink.
-  // Never modify files under .claude or .agents.
-  if (hasDir(claudeRoot)) {
-    ensureDirSymlink(canonicalRoot, claudeRoot);
-    opts.log?.(`skills linked: .pikiclaw/skills → .claude/skills workdir=${workdir}`);
-  } else {
-    // Remove stale symlink before creating real directory
-    try { if (fs.lstatSync(canonicalRoot).isSymbolicLink()) fs.unlinkSync(canonicalRoot); } catch {}
-    fs.mkdirSync(canonicalRoot, { recursive: true });
+  resetDir(mergeRoot);
+
+  // Merge order defines precedence: existing canonical content wins first,
+  // then legacy Claude skills, then legacy agents skills.
+  for (const sourceRoot of sourceRoots) {
+    if (!hasDir(sourceRoot)) continue;
+    const realSource = realPathOrNull(sourceRoot);
+    if (realSource && seenSourceReals.has(realSource)) continue;
+    if (realSource) seenSourceReals.add(realSource);
+    copyMergedTree(sourceRoot, mergeRoot, opts);
   }
+
+  resetDir(canonicalRoot);
+  copyMergedTree(mergeRoot, canonicalRoot, opts);
+  try { fs.rmSync(mergeRoot, { recursive: true, force: true }); } catch {}
+
+  for (const linkRoot of [claudeRoot, agentsRoot]) {
+    ensureDirSymlink(linkRoot, canonicalRoot);
+  }
+  opts.log?.(`skills merged into .pikiclaw/skills and linked to .claude/.agents workdir=${workdir}`);
 }
 
 export function getProjectSkillPaths(workdir: string, skillName: string): ProjectSkillPaths {

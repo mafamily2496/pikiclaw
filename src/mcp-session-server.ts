@@ -20,7 +20,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { McpToolModule, ToolContext } from './tools/types.js';
 import { workspaceTools } from './tools/workspace.js';
-import { captureTools } from './tools/capture.js';
 import { guiTools } from './tools/gui.js';
 
 // ---------------------------------------------------------------------------
@@ -62,7 +61,7 @@ log(`started workspace=${ctx.workspace} stagedFiles=${ctx.stagedFiles.length} ca
 // Tool registry — collect all tool modules
 // ---------------------------------------------------------------------------
 
-const TOOL_MODULES: McpToolModule[] = [workspaceTools, captureTools, guiTools];
+const TOOL_MODULES: McpToolModule[] = [workspaceTools, guiTools];
 
 const ALL_TOOLS = TOOL_MODULES.flatMap(m => m.tools);
 

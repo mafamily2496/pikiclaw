@@ -4,5 +4,6 @@ node_modules/
 dist/
 dashboard/dist/
 *.tgz
-.agents
-.pikiclaw/
+.pikiclaw/*
+!.pikiclaw/skills/
+!.pikiclaw/skills/**

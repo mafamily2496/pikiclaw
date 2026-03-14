@@ -40,6 +40,19 @@ pikiclaw 的思路不同：**只挑最好的，然后把它们组合到极致。
        └──────── 流式进度 / 文件 / 截图 ←──────────┘
 ```
 
+pikiclaw 不是另一个终端包装器，也不是另一个云端 IDE。
+
+它更像一个让官方 coding agent 变得**可远程调度、可持续运行、可回传结果**的本地执行中枢。
+
+当你需要：
+
+- 在手机上发一句话就能派活
+- 任务必须跑在你自己的电脑、现有代码库和本地工具链里
+- 想在 Claude Code / Codex CLI / Gemini CLI 之间自由切换
+- 希望进度、截图、文件自动回到聊天
+
+pikiclaw 会比“守在终端里”“SSH + tmux”或“单厂商云端 agent”更顺。
+
 ---
 
 ## Quick Start
@@ -48,7 +61,7 @@ pikiclaw 的思路不同：**只挑最好的，然后把它们组合到极致。
 
 - Node.js 18+
 - 本机已安装 [`claude`](https://docs.anthropic.com/en/docs/claude-code)、[`codex`](https://github.com/openai/codex) 或 [`gemini`](https://github.com/google-gemini/gemini-cli) 中的任意一个
-- 一个 [Telegram Bot Token](https://t.me/BotFather) 或[飞书应用](https://open.feishu.cn)凭证
+- 一个 [Telegram Bot Token](https://t.me/BotFather) 或 [飞书应用](https://open.feishu.cn) 凭证
 
 ### 一行启动
 
@@ -87,10 +100,10 @@ npx pikiclaw@latest --setup
 
 ### IM Channels
 
-| 渠道 | 消息编辑 | 文件上传 | 回调按钮 | 表情回应 | 消息线程 |
-|------|---------|---------|---------|---------|---------|
-| **Telegram** | ✅ | ✅ | ✅ | — | — |
-| **飞书** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 渠道 | 消息编辑 | 文件收发 | 回调按钮 | 命令菜单 | 场景 |
+|------|---------|---------|---------|---------|------|
+| **Telegram** | ✅ | ✅ | ✅ | ✅ | 全球 / 个人 |
+| **飞书** | ✅ | ✅ | ✅ | ✅ | 国内 / 团队 |
 
 两个渠道可以**同时启动**。
 
@@ -99,16 +112,15 @@ npx pikiclaw@latest --setup
 | 能力 | 说明 |
 |------|------|
 | 实时流式输出 | Agent 工作时消息持续更新 |
-| Thinking / Reasoning | 实时查看 Agent 的思考和推理过程 |
+| Thinking / Reasoning / Plan | 实时查看 Agent 的思考、推理和计划步骤 |
 | Token 追踪 | 输入/输出/缓存统计，上下文使用率实时显示 |
-| 产物回传 | 截图、日志、生成文件自动发回 |
-| 长程防休眠 | 系统级防休眠，小时级任务不中断 |
-| 守护进程 | 崩溃自动重启，指数退避（3s → 60s） |
+| 产物回传 | 截图、日志、生成文件自动发回聊天 |
+| 长程任务保障 | 系统级防休眠 + 守护进程 + 异常自愈 |
 | 长文本处理 | 超长输出自动拆分或打包为 `.md` |
 | 多会话管理 | 随时切换、恢复历史会话 |
 | 图片/文件输入 | 截图、PDF、文档直接发给 Agent |
 | 项目 Skills | `.pikiclaw/skills/` 自定义技能，兼容 `.claude/commands/` |
-| 安全模式 | 危险操作推送确认卡片，白名单访问控制 |
+| 安全模式 | 白名单访问控制，支持切换更安全的 agent 权限模式 |
 | Web Dashboard | 可视化配置、会话浏览、主机监控 |
 
 ---
@@ -134,30 +146,31 @@ npx pikiclaw@latest --setup
 
 | | 终端直接跑 | SSH + tmux | 云端 Agent | **pikiclaw** |
 |---|---|---|---|---|
-| 执行环境 | ✅ 本地 | ✅ 本地 | ❌ 沙盒 | ✅ 本地 |
+| 执行环境 | ✅ 本地 | ✅ 本地 | ⚠️ 通常是远端或沙盒 | ✅ 本地 |
 | 走开后还能跑 | ❌ 合盖就断 | ⚠️ 要配 tmux | ✅ | ✅ 防休眠 + 守护进程 |
 | 手机可控 | ❌ | ⚠️ 打字痛苦 | ✅ | ✅ IM 原生 |
-| 实时看进度 | ✅ 终端 | ⚠️ 得连上去看 | ❌ 多数是黑盒 | ✅ 流式推到聊天 |
+| 实时看进度 | ✅ 终端 | ⚠️ 得连上去看 | ⚠️ 依平台而定 | ✅ 流式推到聊天 |
 | 结果自动回传 | ❌ | ❌ | ⚠️ 看平台 | ✅ 截图/文件/长文本 |
-| 配置门槛 | 无 | SSH/穿透/tmux | 注册/付费 | `npx` 一行 |
+| 配置门槛 | 无 | SSH/穿透/tmux | 注册并适应平台工作流 | `npx` 一行 |
 
-### pikiclaw vs. 同类项目
+### pikiclaw vs. OpenClaw / 官方入口
 
-| | **pikiclaw** | OpenClaw | cc-connect |
+| 维度 | **pikiclaw** | OpenClaw | 官方入口（Claude / Codex / Gemini） |
 |---|---|---|---|
-| **理念** | **精选最好的工具，组合到极致** | 开源自主 AI 智能体生态 | 多渠道多端连接器 |
-| **Agent** | Claude Code / Codex / Gemini CLI（官方出品） | 内置 Agent（自接模型） | 多种本地 CLI |
-| **IM** | Telegram + 飞书（深度打磨） | Web / 移动端 | Slack / Discord / LINE 等 |
-| **长程任务** | ✅ 防休眠 · 守护进程 · 异常自愈 | ❌ 偏即时任务 | ❌ 偏短对话 |
-| **产物回传** | ✅ 截图 · 文件 · 长文本打包 | ⚠️ 依赖客户端 | ⚠️ 基础附件 |
-| **流式体验** | ✅ IM 内实时流式 | ✅ | ⚠️ 看桥接能力 |
-| **上手成本** | **一行 `npx`** | 需部署后端 | 需安装服务端 |
+| 产品层 | IM 驱动的本地 agent 控制平面 | 通用个人 AI 助手 / 多渠道生态 | 单一厂商的原生 agent 入口 |
+| Agent 策略 | 复用官方 CLI，吃到各家最新能力 | 自带 runtime / agent stack | 只服务自家模型 |
+| 执行环境 | 你的电脑 | 个人设备网络 / 本地节点 | 本地 CLI 或厂商云 |
+| 渠道策略 | Telegram + 飞书深度打磨 | 广覆盖 | Web / App / Slack / CLI 为主 |
+| 锁定程度 | 低，可随时切换引擎 | 中 | 高 |
+| 最强场景 | 远程 coding、长任务、本地自动化 | 全能个人助手 | 原生模型体验、企业集成 |
 
 ---
 
 ## Use Cases
 
 pikiclaw 不限于编程。你的 Agent 能做什么，pikiclaw 就能远程调度什么。
+
+它尤其适合那些**必须在你自己的环境里执行**、同时又希望**进度和结果直接回到 IM** 的任务。
 
 **工程重构** — "把整个项目从 JS 迁移到 TS，跑测试直到全部通过。搞定告诉我。"
 
@@ -298,7 +311,7 @@ npx pikiclaw@latest --doctor              # 检查环境
 ## Development
 
 ```bash
-git clone https://github.com/nicepkg/pikiclaw.git
+git clone https://github.com/xiaotonng/pikiclaw.git
 cd pikiclaw
 npm install
 echo "TELEGRAM_BOT_TOKEN=your_token" > .env

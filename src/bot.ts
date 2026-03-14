@@ -20,7 +20,7 @@ import { terminateProcessTree } from './process-control.js';
 
 export { type Agent, type CodexCumulativeUsage, type StreamResult, type StreamPreviewMeta, type StreamPreviewPlan, type SessionInfo, type UsageResult, type ModelInfo, type ModelListResult, type TailMessage, type SessionTailResult, type SkillInfo, type SkillListResult };
 export type ChatId = number | string;
-export const VERSION = '0.2.36';
+export const VERSION = '0.2.37';
 const MACOS_USER_ACTIVITY_PULSE_INTERVAL_MS = 20_000;
 const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 
@@ -29,18 +29,20 @@ const MACOS_USER_ACTIVITY_PULSE_TIMEOUT_S = 30;
 // ---------------------------------------------------------------------------
 
 /**
- * If `dir` has a .gitignore, ensure `.pikiclaw/` is ignored so it doesn't
- * pollute the project. Never modify .claude or .agents gitignore entries.
+ * If `dir` has a .gitignore, ignore managed `.pikiclaw` state without hiding
+ * `.pikiclaw/skills`, which may be committed as project skills.
  */
-function ensureGitignore(dir: string) {
+export function ensureGitignore(dir: string) {
   try {
     const gi = path.join(dir, '.gitignore');
     if (!fs.existsSync(gi)) return;
-    const managedLines = ['.pikiclaw/'];
-    const legacyLines = new Set([
+    const managedLines = [
       '.pikiclaw/*',
       '!.pikiclaw/skills/',
       '!.pikiclaw/skills/**',
+    ];
+    const legacyLines = new Set([
+      '.pikiclaw/',
       '.claude/skills/',
       '.agents/skills/',
     ]);

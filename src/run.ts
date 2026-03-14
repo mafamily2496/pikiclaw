@@ -8,7 +8,7 @@
  *   npm run command -- codex-models
  */
 
-import { VERSION, formatThinkingForDisplay } from './bot.js';
+import { VERSION, ensureGitignore, formatThinkingForDisplay } from './bot.js';
 import { initializeProjectSkills, listAgents, listModels, listSkills, getUsage, doStream, getSessions, getSessionTail } from './code-agent.js';
 import type { Agent, StreamOpts } from './code-agent.js';
 import { loadUserConfig, resolveUserWorkdir } from './user-config.js';
@@ -79,6 +79,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const userConfig = loadUserConfig();
   const workdir = resolveUserWorkdir({ workdir: args.workdir, config: userConfig });
+  ensureGitignore(workdir);
   initializeProjectSkills(workdir);
 
   if (args.help || !args.command) {

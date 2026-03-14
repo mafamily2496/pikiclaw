@@ -42,7 +42,7 @@ describe('project skills', () => {
     ]);
   });
 
-  it('builds a stable skills view and prefers claude native skill execution when available', () => {
+  it('builds a stable skills view and prefers canonical skill metadata while keeping claude native execution', () => {
     const workdir = makeTmpDir('pikiclaw-claude-skill-');
     writeSkill(path.join(workdir, '.pikiclaw', 'skills'), 'install', '---\nlabel: Install\ndescription: shared\n---\n');
     writeSkill(path.join(workdir, '.claude', 'skills'), 'install', '---\nlabel: Install\ndescription: claude\n---\n');
@@ -56,7 +56,7 @@ describe('project skills', () => {
       {
         name: 'install',
         label: 'Install',
-        description: 'claude',
+        description: 'shared',
         command: 'sk_install',
         source: 'skills',
       },
@@ -85,22 +85,27 @@ describe('project skills', () => {
     });
   });
 
-  it('links .pikiclaw/skills to .claude/skills without modifying original dirs', () => {
+  it('merges legacy skill roots into .pikiclaw/skills and links .claude/.agents back to canonical', () => {
     const workdir = makeTmpDir('pikiclaw-migrate-skill-');
+    writeSkill(path.join(workdir, '.pikiclaw', 'skills'), 'ship', '---\nlabel: Ship\ndescription: shared\n---\n');
+    writeFile(path.join(workdir, '.pikiclaw', 'skills', 'ship', 'references', 'shared.txt'), 'shared\n');
     writeSkill(path.join(workdir, '.claude', 'skills'), 'ship', '---\nlabel: Ship\ndescription: claude\n---\n');
     writeFile(path.join(workdir, '.claude', 'skills', 'ship', 'references', 'claude.txt'), 'preserved\n');
     writeSkill(path.join(workdir, '.agents', 'skills'), 'package', '---\nlabel: Package\ndescription: agents\n---\n');
 
     initializeProjectSkills(workdir);
 
-    // .pikiclaw/skills is a symlink to .claude/skills
-    expect(fs.lstatSync(path.join(workdir, '.pikiclaw', 'skills')).isSymbolicLink()).toBe(true);
-    expect(fs.realpathSync(path.join(workdir, '.pikiclaw', 'skills'))).toBe(fs.realpathSync(path.join(workdir, '.claude', 'skills')));
-    // Reading through .pikiclaw/skills gives .claude/skills content
-    expect(fs.readFileSync(path.join(workdir, '.pikiclaw', 'skills', 'ship', 'SKILL.md'), 'utf8')).toContain('description: claude');
+    // .pikiclaw/skills becomes the canonical real directory
+    expect(fs.lstatSync(path.join(workdir, '.pikiclaw', 'skills')).isSymbolicLink()).toBe(false);
+    // Canonical content keeps existing shared files and merges in legacy ones
+    expect(fs.readFileSync(path.join(workdir, '.pikiclaw', 'skills', 'ship', 'SKILL.md'), 'utf8')).toContain('description: shared');
+    expect(fs.existsSync(path.join(workdir, '.pikiclaw', 'skills', 'ship', 'references', 'shared.txt'))).toBe(true);
     expect(fs.existsSync(path.join(workdir, '.pikiclaw', 'skills', 'ship', 'references', 'claude.txt'))).toBe(true);
-    // .claude and .agents are NOT modified (no symlinks replacing them)
-    expect(fs.lstatSync(path.join(workdir, '.claude', 'skills')).isSymbolicLink()).toBe(false);
-    expect(fs.lstatSync(path.join(workdir, '.agents', 'skills')).isSymbolicLink()).toBe(false);
+    expect(fs.existsSync(path.join(workdir, '.pikiclaw', 'skills', 'package', 'SKILL.md'))).toBe(true);
+    // .claude and .agents both become symlinks to canonical
+    expect(fs.lstatSync(path.join(workdir, '.claude', 'skills')).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(path.join(workdir, '.agents', 'skills')).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(path.join(workdir, '.claude', 'skills'))).toBe(fs.realpathSync(path.join(workdir, '.pikiclaw', 'skills')));
+    expect(fs.realpathSync(path.join(workdir, '.agents', 'skills'))).toBe(fs.realpathSync(path.join(workdir, '.pikiclaw', 'skills')));
   });
 });

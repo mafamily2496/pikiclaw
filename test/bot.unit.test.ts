@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/code-agent.ts', async importOriginal => {
@@ -91,4 +93,22 @@ describe('Bot.runStream', () => {
     expect(cs.codexCumulative).toBeUndefined();
   });
 
+});
+
+describe('Bot gitignore management', () => {
+  it('keeps .pikiclaw/skills tracked while ignoring managed runtime state', () => {
+    const workdir = makeTmpDir('bot-unit-gitignore-');
+    fs.writeFileSync(path.join(workdir, '.gitignore'), '.env\n.pikiclaw/\n');
+    process.env.PIKICLAW_WORKDIR = workdir;
+
+    new Bot();
+
+    expect(fs.readFileSync(path.join(workdir, '.gitignore'), 'utf8')).toBe([
+      '.env',
+      '.pikiclaw/*',
+      '!.pikiclaw/skills/',
+      '!.pikiclaw/skills/**',
+      '',
+    ].join('\n'));
+  });
 });
